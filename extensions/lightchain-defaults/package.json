@@ -1,0 +1,20 @@
+{
+	"name": "lightchain-defaults",
+	"displayName": "Lightchain Studio Defaults",
+	"description": "Default settings for Lightchain Studio: privacy-first, no telemetry, no auto-update, clean startup.",
+	"version": "1.0.0",
+	"publisher": "lightchain",
+	"license": "MIT",
+	"engines": {
+		"vscode": "*"
+	},
+	"contributes": {
+		"configurationDefaults": {
+			"workbench.tips.enabled": false,
+			"workbench.enableExperiments": false,
+			"workbench.welcomePage.walkthroughs.openOnInstall": false,
+			"workbench.editor.empty.hint": "hidden",
+			"chat.commandCenter.enabled": false
+		}
+	}
+}

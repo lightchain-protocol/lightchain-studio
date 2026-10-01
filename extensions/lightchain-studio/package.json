@@ -1,0 +1,442 @@
+{
+	"name": "lightchain-studio",
+	"displayName": "Lightchain Studio",
+	"description": "Lightchain core: deployed programs, wallet, Lightchain AI and the Lightchain marketplace.",
+	"version": "0.1.0",
+	"publisher": "lightchain",
+	"license": "MIT",
+	"engines": {
+		"vscode": "*"
+	},
+	"main": "./dist/extension.js",
+	"activationEvents": [
+		"onStartupFinished",
+		"workspaceContains:foundry.toml"
+	],
+	"capabilities": {
+		"untrustedWorkspaces": {
+			"supported": "limited",
+			"description": "Deployed programs and wallet work in Restricted Mode; nothing from the workspace is executed."
+		},
+		"virtualWorkspaces": true
+	},
+	"contributes": {
+		"viewsContainers": {
+			"secondarySidebar": [
+				{
+					"id": "lightchain",
+					"title": "Lightchain",
+					"icon": "media/lightchain.svg"
+				}
+			]
+		},
+		"views": {
+			"lightchain": [
+				{
+					"id": "lightchain.deployedPrograms",
+					"name": "Deployed Programs",
+					"icon": "media/lightchain.svg",
+					"initialSize": 1
+				},
+				{
+					"id": "lightchain.ai",
+					"type": "webview",
+					"name": "Lightchain AI",
+					"icon": "media/lightchain.svg",
+					"initialSize": 2
+				}
+			],
+			"extensions": [
+				{
+					"id": "lightchain.marketplace",
+					"name": "Lightchain Marketplace"
+				}
+			]
+		},
+		"viewsWelcome": [
+			{
+				"view": "lightchain.deployedPrograms",
+				"contents": "No deployed programs on this network yet.\nPrograms appear here from your Foundry deployments (broadcast/), from contracts created by your deployer address, or added by hand.\n[Add Contract](command:lightchain.programs.add)\n[Set Deployer Address](command:lightchain.programs.setDeployer)"
+			}
+		],
+		"commands": [
+			{
+				"command": "lightchain.network.useMainnet",
+				"title": "Switch to Mainnet",
+				"category": "Lightchain",
+				"icon": "$(arrow-swap)"
+			},
+			{
+				"command": "lightchain.network.useTestnet",
+				"title": "Switch to Testnet",
+				"category": "Lightchain",
+				"icon": "$(arrow-swap)"
+			},
+			{
+				"command": "lightchain.programs.refresh",
+				"title": "Refresh Deployed Programs",
+				"category": "Lightchain",
+				"icon": "$(refresh)"
+			},
+			{
+				"command": "lightchain.programs.add",
+				"title": "Add Contract",
+				"category": "Lightchain",
+				"icon": "$(add)"
+			},
+			{
+				"command": "lightchain.programs.setDeployer",
+				"title": "Set Deployer Address",
+				"category": "Lightchain",
+				"icon": "$(account)"
+			},
+			{
+				"command": "lightchain.programs.openInExplorer",
+				"title": "Open in Lightscan",
+				"category": "Lightchain",
+				"icon": "$(link-external)"
+			},
+			{
+				"command": "lightchain.programs.copyAddress",
+				"title": "Copy Address",
+				"category": "Lightchain",
+				"icon": "$(copy)"
+			},
+			{
+				"command": "lightchain.programs.findReferences",
+				"title": "Find in Project",
+				"category": "Lightchain",
+				"icon": "$(search)"
+			},
+			{
+				"command": "lightchain.programs.remove",
+				"title": "Remove",
+				"category": "Lightchain",
+				"icon": "$(trash)"
+			},
+			{
+				"command": "lightchain.wallet.menu",
+				"title": "Wallet",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.wallet.create",
+				"title": "Create Account",
+				"category": "Lightchain Wallet"
+			},
+			{
+				"command": "lightchain.wallet.import",
+				"title": "Import Private Key",
+				"category": "Lightchain Wallet"
+			},
+			{
+				"command": "lightchain.wallet.select",
+				"title": "Select Account",
+				"category": "Lightchain Wallet"
+			},
+			{
+				"command": "lightchain.wallet.copyAddress",
+				"title": "Copy Active Address",
+				"category": "Lightchain Wallet"
+			},
+			{
+				"command": "lightchain.wallet.exportKey",
+				"title": "Export Private Key",
+				"category": "Lightchain Wallet"
+			},
+			{
+				"command": "lightchain.wallet.remove",
+				"title": "Remove Account",
+				"category": "Lightchain Wallet"
+			},
+			{
+				"command": "lightchain.marketplace.refresh",
+				"title": "Refresh Lightchain Marketplace",
+				"category": "Lightchain",
+				"icon": "$(refresh)"
+			},
+			{
+				"command": "lightchain.marketplace.install",
+				"title": "Install",
+				"category": "Lightchain",
+				"icon": "$(cloud-download)"
+			},
+			{
+				"command": "lightchain.marketplace.open",
+				"title": "Show Extension",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.start.open",
+				"title": "Start Page",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.project.new",
+				"title": "New Lightchain Project",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.wallet.connectBrowser",
+				"title": "Connect Browser Wallet",
+				"category": "Lightchain Wallet"
+			},
+			{
+				"command": "lightchain.wallet.disconnect",
+				"title": "Disconnect Wallet",
+				"category": "Lightchain Wallet"
+			},
+			{
+				"command": "lightchain.credits.topUp",
+				"title": "Top Up Credits",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.credits.withdraw",
+				"title": "Withdraw Credits",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.foundry.build",
+				"title": "Build",
+				"category": "Lightchain",
+				"icon": "$(tools)"
+			},
+			{
+				"command": "lightchain.foundry.test",
+				"title": "Test",
+				"category": "Lightchain",
+				"icon": "$(beaker)"
+			},
+			{
+				"command": "lightchain.foundry.deploy",
+				"title": "Deploy Script",
+				"category": "Lightchain",
+				"icon": "$(rocket)"
+			},
+			{
+				"command": "lightchain.wallet.openPage",
+				"title": "Open Wallet Page",
+				"category": "Lightchain Wallet"
+			},
+			{
+				"command": "lightchain.programs.interact",
+				"title": "Interact",
+				"category": "Lightchain",
+				"icon": "$(symbol-method)"
+			},
+			{
+				"command": "lightchain.wallet.importMnemonic",
+				"title": "Import Recovery Phrase",
+				"category": "Lightchain Wallet"
+			},
+			{
+				"command": "lightchain.wallet.exportKeystore",
+				"title": "Export to Foundry Keystore",
+				"category": "Lightchain Wallet"
+			}
+		],
+		"menus": {
+			"view/title": [
+				{
+					"command": "lightchain.foundry.deploy",
+					"when": "view == lightchain.deployedPrograms",
+					"group": "navigation@0"
+				},
+				{
+					"command": "lightchain.network.useMainnet",
+					"when": "view == lightchain.deployedPrograms && lightchain.network == testnet",
+					"group": "navigation@1"
+				},
+				{
+					"command": "lightchain.network.useTestnet",
+					"when": "view == lightchain.deployedPrograms && lightchain.network == mainnet",
+					"group": "navigation@1"
+				},
+				{
+					"command": "lightchain.programs.add",
+					"when": "view == lightchain.deployedPrograms",
+					"group": "navigation@2"
+				},
+				{
+					"command": "lightchain.programs.refresh",
+					"when": "view == lightchain.deployedPrograms",
+					"group": "navigation@3"
+				},
+				{
+					"command": "lightchain.programs.setDeployer",
+					"when": "view == lightchain.deployedPrograms",
+					"group": "more@1"
+				},
+				{
+					"command": "lightchain.marketplace.refresh",
+					"when": "view == lightchain.marketplace",
+					"group": "navigation"
+				}
+			],
+			"view/item/context": [
+				{
+					"command": "lightchain.programs.interact",
+					"when": "view == lightchain.deployedPrograms && viewItem =~ /^program/",
+					"group": "inline@0"
+				},
+				{
+					"command": "lightchain.programs.openInExplorer",
+					"when": "view == lightchain.deployedPrograms && viewItem =~ /^program/",
+					"group": "inline@1"
+				},
+				{
+					"command": "lightchain.programs.copyAddress",
+					"when": "view == lightchain.deployedPrograms && viewItem =~ /^program/",
+					"group": "inline@2"
+				},
+				{
+					"command": "lightchain.programs.findReferences",
+					"when": "view == lightchain.deployedPrograms && viewItem =~ /^program/",
+					"group": "1_actions@1"
+				},
+				{
+					"command": "lightchain.programs.remove",
+					"when": "view == lightchain.deployedPrograms && viewItem == program.manual",
+					"group": "2_remove@1"
+				},
+				{
+					"command": "lightchain.marketplace.install",
+					"when": "view == lightchain.marketplace && viewItem == marketplace.notInstalled",
+					"group": "inline"
+				}
+			],
+			"commandPalette": [
+				{
+					"command": "lightchain.programs.openInExplorer",
+					"when": "false"
+				},
+				{
+					"command": "lightchain.programs.copyAddress",
+					"when": "false"
+				},
+				{
+					"command": "lightchain.programs.findReferences",
+					"when": "false"
+				},
+				{
+					"command": "lightchain.programs.remove",
+					"when": "false"
+				},
+				{
+					"command": "lightchain.marketplace.install",
+					"when": "false"
+				},
+				{
+					"command": "lightchain.marketplace.open",
+					"when": "false"
+				},
+				{
+					"command": "lightchain.programs.interact",
+					"when": "false"
+				}
+			],
+			"editor/title": [
+				{
+					"command": "lightchain.foundry.deploy",
+					"when": "resourceFilename =~ /\\.s\\.sol$/",
+					"group": "navigation"
+				}
+			],
+			"explorer/context": [
+				{
+					"command": "lightchain.foundry.deploy",
+					"when": "resourceFilename =~ /\\.s\\.sol$/",
+					"group": "lightchain@1"
+				}
+			]
+		},
+		"configuration": {
+			"title": "Lightchain",
+			"properties": {
+				"lightchain.marketplace.catalogUrl": {
+					"type": "string",
+					"default": "",
+					"markdownDescription": "URL of the Lightchain marketplace catalog (JSON). When empty, the catalog bundled with Lightchain Studio is used."
+				},
+				"lightchain.programs.scanExclude": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"default": [
+						"**/node_modules/**",
+						"**/.git/**",
+						"**/out/**",
+						"**/cache/**",
+						"**/broadcast/**",
+						"**/lib/**",
+						"**/artifacts/**",
+						"**/dist/**"
+					],
+					"description": "Globs skipped when checking which deployed programs are referenced in the project."
+				},
+				"lightchain.startPage.showOnStartup": {
+					"type": "boolean",
+					"default": true,
+					"description": "Show the Lightchain Studio start page when no editors are open at startup."
+				},
+				"lightchain.foundry.path": {
+					"type": "string",
+					"default": "",
+					"markdownDescription": "Path to `forge`. Empty = `~/.foundry/bin/forge` or PATH.",
+					"scope": "machine"
+				}
+			}
+		},
+		"taskDefinitions": [
+			{
+				"type": "lightchain",
+				"required": [
+					"task"
+				],
+				"properties": {
+					"task": {
+						"type": "string",
+						"description": "Lightchain Foundry task"
+					}
+				}
+			}
+		],
+		"problemMatchers": [
+			{
+				"name": "lightchain-forge",
+				"owner": "lightchain",
+				"source": "solc",
+				"fileLocation": [
+					"relative",
+					"${workspaceFolder}"
+				],
+				"pattern": [
+					{
+						"regexp": "^(Error|Warning) \\((\\d+)\\): (.*)$",
+						"severity": 1,
+						"code": 2,
+						"message": 3
+					},
+					{
+						"regexp": "^\\s*-->\\s+(.+?):(\\d+):(\\d+):?\\s*$",
+						"file": 1,
+						"line": 2,
+						"column": 3
+					}
+				]
+			}
+		]
+	},
+	"scripts": {
+		"build": "node build.mjs"
+	},
+	"devDependencies": {
+		"esbuild": "^0.25.0",
+		"viem": "^2.0.0",
+		"@types/node": "^22.0.0",
+		"@types/vscode": "^1.100.0",
+		"typescript": "^5.6.0"
+	}
+}

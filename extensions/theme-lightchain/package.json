@@ -1,0 +1,27 @@
+{
+	"name": "theme-lightchain",
+	"displayName": "Lightchain Studio Themes",
+	"description": "Official Lightchain Studio color themes.",
+	"version": "1.0.0",
+	"publisher": "lightchain",
+	"license": "MIT",
+	"engines": {
+		"vscode": "*"
+	},
+	"categories": [
+		"Themes"
+	],
+	"contributes": {
+		"themes": [
+			{
+				"id": "Lightchain Dark",
+				"label": "Lightchain Dark",
+				"uiTheme": "vs-dark",
+				"path": "./themes/lightchain-dark.json"
+			}
+		],
+		"configurationDefaults": {
+			"workbench.colorTheme": "Lightchain Dark"
+		}
+	}
+}
