@@ -69,9 +69,7 @@ async function main(buildDir?: string): Promise<void> {
 		throw new Error('$AGENT_BUILDDIRECTORY not set');
 	}
 
-	if (!tempDir) {
-		throw new Error('$AGENT_TEMPDIRECTORY not set');
-	}
+	// Without a CI temp dir, sign with the login keychain (local release builds).
 
 	const appRoot = path.join(buildDir, `VSCode-darwin-${arch}`);
 	const appName = product.nameLong + '.app';
@@ -86,7 +84,7 @@ async function main(buildDir?: string): Promise<void> {
 		}),
 		preAutoEntitlements: false,
 		preEmbedProvisioningProfile: false,
-		keychain: path.join(tempDir, 'buildagent.keychain'),
+		keychain: tempDir ? path.join(tempDir, 'buildagent.keychain') : undefined,
 		version: getElectronVersion(),
 		identity,
 	};
@@ -98,28 +96,28 @@ async function main(buildDir?: string): Promise<void> {
 			'-insert',
 			'NSAppleEventsUsageDescription',
 			'-string',
-			'An application in Visual Studio Code wants to use AppleScript.',
+			'An extension in Lightchain Studio wants to use AppleScript.',
 			`${infoPlistPath}`
 		]);
 		await spawn('plutil', [
 			'-replace',
 			'NSMicrophoneUsageDescription',
 			'-string',
-			'An application in Visual Studio Code wants to use the Microphone.',
+			'An extension in Lightchain Studio wants to use the Microphone.',
 			`${infoPlistPath}`
 		]);
 		await spawn('plutil', [
 			'-replace',
 			'NSCameraUsageDescription',
 			'-string',
-			'An application in Visual Studio Code wants to use the Camera.',
+			'An extension in Lightchain Studio wants to use the Camera.',
 			`${infoPlistPath}`
 		]);
 		await spawn('plutil', [
 			'-replace',
 			'NSAudioCaptureUsageDescription',
 			'-string',
-			'An application in Visual Studio Code wants to use Audio Capture.',
+			'An extension in Lightchain Studio wants to use Audio Capture.',
 			`${infoPlistPath}`
 		]);
 		await spawn('plutil', [

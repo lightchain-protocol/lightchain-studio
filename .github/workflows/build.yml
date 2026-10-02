@@ -1,0 +1,44 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install
+        run: npm ci
+
+      - name: Lightchain extension (typecheck + bundle)
+        working-directory: extensions/lightchain-studio/tools
+        run: |
+          npm install --no-audit --no-fund
+          npm run typecheck
+          npm run build
+
+      - name: Compile
+        run: npm run compile
+
+      - name: Package (macOS arm64)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          ./scripts/package-mac.sh arm64
+          mv ../LightchainStudio-*.dmg .
+
+      - name: Upload DMG
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: LightchainStudio-macos-arm64
+          path: LightchainStudio-*.dmg

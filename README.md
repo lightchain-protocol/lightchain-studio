@@ -43,18 +43,28 @@ To open a project directly, run `./scripts/code.sh path/to/project`.
 ### Packaged app
 
 ```sh
-npm run gulp vscode-darwin-arm64-min   # → ../VSCode-darwin-arm64/Lightchain Studio.app
-# other targets: vscode-darwin-x64-min, vscode-linux-x64-min, vscode-win32-x64-min
+./scripts/package-mac.sh arm64         # → ../LightchainStudio-<version>-arm64.dmg (x64 for Intel Macs)
+npm run gulp vscode-linux-x64-min      # Linux build (also: vscode-win32-x64-min for Windows)
 ```
+
+The DMG is unsigned unless these are set; macOS then asks users to right-click → **Open** the first time:
+
+```sh
+export APPLE_SIGN_IDENTITY="Developer ID Application: <Org> (<TEAMID>)"
+export APPLE_ID=… APPLE_TEAM_ID=… APPLE_APP_PASSWORD=…   # notarization (app-specific password)
+```
+
+GitHub Actions (`.github/workflows/build.yml`) installs, typechecks and compiles every push. Run the workflow manually to also build a macOS DMG artifact.
 
 ### Lightchain extension
 
-The Lightchain features live in `extensions/lightchain-studio`. The compiled bundle (`dist/extension.js`) is committed, so the IDE runs right after `npm run compile`. After changing its TypeScript sources, rebuild it:
+The Lightchain features live in `extensions/lightchain-studio`. The compiled bundle (`dist/extension.js`) is committed, so the IDE runs right after `npm run compile`. After changing its TypeScript sources (`src/`), rebuild it:
 
 ```sh
-cd extensions/lightchain-studio
+cd extensions/lightchain-studio/tools
 npm install
-npm run build        # src/ → dist/extension.js
+npm run typecheck    # optional
+npm run build        # ../src → ../dist/extension.js
 ```
 
 Then reload the window (*Developer: Reload Window*).

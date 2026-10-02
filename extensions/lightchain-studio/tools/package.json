@@ -1,0 +1,16 @@
+{
+	"name": "lightchain-studio-build",
+	"private": true,
+	"description": "Build tooling for the Lightchain Studio extension (src/ \u2192 dist/extension.js). Kept out of the extension manifest so packaging never sees it.",
+	"scripts": {
+		"build": "node build.mjs",
+		"typecheck": "tsc -p ."
+	},
+	"devDependencies": {
+		"@types/node": "^22.0.0",
+		"@types/vscode": "^1.100.0",
+		"esbuild": "^0.25.0",
+		"typescript": "^5.6.0",
+		"viem": "^2.0.0"
+	}
+}
