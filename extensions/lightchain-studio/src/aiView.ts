@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { lineDiff } from './agent/lineDiff';
+import { AgentStuckError } from './agent/agent';
 import * as fs from 'node:fs';
 import { NetworkState } from './networkState';
 import { Wallet } from './wallet';
@@ -9,7 +10,7 @@ import { Agent, InferenceProvider } from './agent/agent';
 import { ApprovalRequest } from './agent/tools';
 import { ProposalStore } from './agent/proposals';
 import { findForge } from './foundry';
-import { DelegateNotAuthorizedError, InsufficientCreditsError } from './lightchain/inference';
+import { DelegateNotAuthorizedError, InsufficientCreditsError, SubmitError, WorkerError } from './lightchain/inference';
 import { LightchainModel, fetchModels, pickDefault } from './lightchain/models';
 
 /**
@@ -17,6 +18,9 @@ import { LightchainModel, fetchModels, pickDefault } from './lightchain/models';
  * Styled only with lightchain.ai components (see fork-tools/theme), scaled to
  * the IDE's text size.
  */
+/** No answer this long after the job was submitted → suggest another model. */
+const SLOW_AFTER_MS = 45_000;
+
 export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disposable {
 	private view?: vscode.WebviewView;
 	private readonly disposables: vscode.Disposable[] = [];
@@ -29,6 +33,8 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	private retryText?: string; // prompt to send again once a setup step (credits) is done
 	private models: LightchainModel[] = [];
 	private model?: string;
+	private slowTimer?: ReturnType<typeof setTimeout>;
+	private inFlight?: { text: string; job?: string }; // the prompt being answered right now
 
 	constructor(
 		private readonly extensionUri: vscode.Uri,
@@ -58,7 +64,10 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		} catch {
 			return; // offline — keep the last list
 		}
-		this.model = pickDefault(this.models, this.memento.get<string>('lightchain.ai.model'));
+		const chosen = this.memento.get<string>('lightchain.ai.model');
+		// Keep the user's pick while it is still served (availability shows as its dot);
+		// only fall back when nothing was picked or the model is gone.
+		this.model = chosen && this.models.some(m => m.name === chosen) ? chosen : pickDefault(this.models, chosen);
 		this.post({ type: 'models', models: this.models, selected: this.model });
 	}
 
@@ -83,6 +92,24 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				return this.send(String(msg.text ?? ''));
 			case 'enableCredits':
 				return this.enableCredits();
+			case 'retryWith': {
+				// slow worker: re-send the same prompt on another model (new session)
+				const text = this.inFlight?.text ?? this.retryText;
+				this.retryText = undefined;
+				if (typeof msg.name !== 'string' || !text) {
+					return;
+				}
+				this.abort?.abort();
+				await this.until(() => !this.abort);
+				this.model = msg.name;
+				await this.memento.update('lightchain.ai.model', msg.name);
+				this.agent = undefined;
+				this.post({ type: 'models', models: this.models, selected: this.model });
+				this.post({ type: 'notice', message: `Re-sending your prompt to ${msg.name}.` });
+				return this.send(text, true);
+			}
+			case 'keepWaiting':
+				return;
 			case 'retry': {
 				const text = this.retryText;
 				this.retryText = undefined;
@@ -99,6 +126,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 					this.model = msg.name;
 					await this.memento.update('lightchain.ai.model', msg.name);
 					this.resetChat(); // a Lightchain session is bound to one model
+					this.post({ type: 'models', models: this.models, selected: this.model });
 					this.post({ type: 'notice', message: `Model: ${msg.name}. New chat started.` });
 				}
 				return;
@@ -149,13 +177,25 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		}
 		this.post({ type: 'busy', busy: true });
 		this.post({ type: 'status', text: 'Starting…' });
+		this.inFlight = { text };
+		const clearSlow = () => { clearTimeout(this.slowTimer); this.slowTimer = undefined; this.post({ type: 'cardRemove', id: 'slow' }); };
 		try {
 			await this.agent.run(text, {
-				onText: delta => this.post({ type: 'delta', text: delta }),
+				onText: delta => { clearSlow(); this.post({ type: 'delta', text: delta }); },
 				onToolStart: call => this.post({ type: 'toolStart', name: call.name, summary: summarize(call.name, call.args) }),
-				onToolEnd: (call, result) => this.post({ type: 'toolEnd', name: call.name, ok: result.ok, output: result.output.slice(0, 600) }),
+				onToolEnd: (call, result, soft) => soft
+					? this.post({ type: 'status', text: 'Lightchain AI is adjusting its approach…' })
+					: this.post({ type: 'toolEnd', name: call.name, ok: result.ok, output: result.output.slice(0, 600) }),
 				onTurnEnd: () => this.post({ type: 'turnEnd' }),
-				onStatus: (status, o) => this.post({ type: 'status', text: status, walletPrompt: !!o?.walletPrompt }),
+				onStatus: (status, o) => {
+					this.post({ type: 'status', text: status, walletPrompt: !!o?.walletPrompt });
+					const job = /^Job (\d+) submitted/.exec(status)?.[1];
+					if (job && this.inFlight) {
+						this.inFlight.job = job;
+						clearTimeout(this.slowTimer);
+						this.slowTimer = setTimeout(() => this.suggestOtherModels(job), SLOW_AFTER_MS);
+					}
+				},
 			}, this.abort.signal);
 		} catch (err) {
 			if (this.abort.signal.aborted) {
@@ -170,6 +210,26 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 					detail: `A single on-chain approval on ${this.network.current.label}${this.wallet.active?.kind === 'browser' ? ', confirmed in your browser wallet' : ''}. Your message is sent automatically right after.`,
 					actions: [{ label: 'Allow', command: 'enableCredits' }],
 				});
+			} else if (err instanceof AgentStuckError) {
+				this.retryText = text;
+				const others = this.otherModels();
+				this.post({
+					type: 'card', title: `${this.model} couldn't complete the change`, state: 'Stopped', stateKind: 'err',
+					detail: `${err.message} Try rephrasing the request more specifically${others.length ? ', or send it to another model' : ''}.`,
+					actions: [...others.map((m, i) => ({ label: `Try ${m.name}`, command: 'retryWith', arg: m.name, ghost: i > 0 })), { label: 'Try again', command: 'retry', ghost: true }],
+				});
+			} else if (err instanceof SubmitError) {
+				this.retryText = text;
+				this.post({ type: 'card', title: err.message, state: 'Failed', stateKind: 'err', actions: [{ label: 'Try again', command: 'retry' }] });
+			} else if (err instanceof WorkerError) {
+				// a worker failure, not the user's: offer the same prompt on another model
+				this.retryText = text;
+				const others = this.otherModels();
+				this.post({
+					type: 'card', title: err.message, state: 'Failed', stateKind: 'err',
+					detail: others.length ? 'Send the same prompt to another model:' : 'Try again in a moment.',
+					actions: [...others.map((m, i) => ({ label: `Try ${m.name}`, command: 'retryWith', arg: m.name, ghost: i > 0 })), { label: 'Try again', command: 'retry', ghost: true }],
+				});
 			} else if (err instanceof InsufficientCreditsError) {
 				this.retryText = text;
 				this.post({ type: 'card', title: 'Not enough credits', state: 'Top up needed', stateKind: 'wait', detail: err.message, actions: [{ label: 'Top up credits', command: 'lightchain.credits.topUp' }, { label: 'Send again', command: 'retry', ghost: true }] });
@@ -178,12 +238,33 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				this.retryText = text;
 			}
 		} finally {
+			clearSlow();
+			this.inFlight = undefined;
 			this.approvals.forEach(a => a.resolve(false));
 			this.approvals.clear();
 			this.abort = undefined;
 			this.post({ type: 'busy', busy: false });
 			this.postState();
 		}
+	}
+
+	/** No answer yet: workers sometimes accept a job and stall. Offer models with free workers. */
+	private suggestOtherModels(job: string): void {
+		const others = this.otherModels();
+		this.post({
+			type: 'card', id: 'slow', title: 'This is taking longer than usual', state: '', stateKind: 'info',
+			detail: `${this.model} accepted job ${job} but hasn't started answering. Workers sometimes stall; ${others.length ? 'you can send the same prompt to another model' : 'you can stop and try again in a moment'}.`,
+			actions: [...others.map((m, i) => ({ label: `Try ${m.name}`, command: 'retryWith', arg: m.name, ghost: i > 0 })), { label: 'Keep waiting', command: 'keepWaiting', ghost: true, dismiss: true }],
+		});
+	}
+
+	/** Up to three other chat models with free workers right now. */
+	private otherModels(): LightchainModel[] {
+		return this.models.filter(m => m.available && m.name !== this.model && (m.freeSlots ?? 1) > 0).slice(0, 3);
+	}
+
+	private until(cond: () => boolean): Promise<void> {
+		return new Promise(resolve => { const t = setInterval(() => { if (cond()) { clearInterval(t); resolve(); } }, 50); });
 	}
 
 	private async enableCredits(): Promise<void> {
@@ -277,6 +358,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	.lc-model__label { padding: 4px 8px; font-size: 11px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.08em; color: #CCCEEF; }
 	.lc-model__item { position: relative; display: flex; align-items: center; width: 100%; padding: 6px 8px 6px 32px; border: 0; border-radius: 8px; background: transparent; color: #CCCEEF; font-family: "Inter", sans-serif; font-size: 14px; text-align: left; cursor: pointer; outline: none; transition: background-color .15s; }
 	.lc-model__item:hover, .lc-model__item:focus { background: hsl(240 3.7% 15.9%); }
+	.lc-model__item:disabled { opacity: .45; cursor: default; background: transparent; }
 	.lc-model__check { position: absolute; left: 8px; display: flex; width: 14px; height: 14px; align-items: center; justify-content: center; }
 	.lc-model__check::after { content: ""; width: 8px; height: 8px; border-radius: 9999px; background: currentColor; }
 	.lc-model__row { display: flex; width: 100%; min-width: 0; align-items: center; justify-content: space-between; gap: 8px; }
@@ -305,6 +387,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	.lc-step.has-out .lc-step__row:hover { color: #b1b3d0; }
 	.lc-step__label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 	.lc-step__label b { color: #b1b3d0; font-weight: 500; }
+	.lc-step__why { flex: none; color: #7376aa; font-size: 12px; white-space: nowrap; }
 	.lc-ico { flex: none; width: 14px; height: 14px; display: inline-flex; align-items: center; justify-content: center; }
 	.lc-ico svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 	.lc-ico.ok { color: #3eb75e; } .lc-ico.err { color: #ff2a27; }
@@ -453,7 +536,8 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			const actions = el('div', 'lc-note__actions');
 			m.actions.forEach((a, i) => actions.append(smallBtn(a.label, !a.ghost && i === 0, () => {
 				actions.querySelectorAll('button').forEach(x => x.disabled = true);
-				vscode.postMessage(a.command.startsWith('lightchain.') ? { type: 'command', command: a.command } : { type: a.command });
+				if (a.dismiss) { n.remove(); return; }
+				vscode.postMessage(a.command.startsWith('lightchain.') ? { type: 'command', command: a.command } : { type: a.command, name: a.arg });
 			})));
 			n.append(actions);
 		}
@@ -525,6 +609,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		const st = dotState(mo);
 		const count = Object.assign(document.createElement('span'), { className: 'lc-model__count ' + st, textContent: st === 'off' ? 'Offline' : st === 'busy' ? 'Busy' : mo.workers + ' online' });
 		row.append(left, count); b.append(row);
+		if (st === 'off' && !selected) { b.disabled = true; b.title = 'No workers serve this model right now'; } // can't answer: not pickable
 		b.onclick = () => { openMenu(false); if (!selected) vscode.postMessage({ type: 'model', name: mo.name }); };
 		return b;
 	}
@@ -545,8 +630,13 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				const row = lastTool.querySelector('.lc-step__row');
 				if (row) {
 					row.querySelector('.lc-ico')?.replaceWith(ico(m.ok ? 'ok' : 'err'));
+					if (!m.ok && m.output) {
+						// one quiet line: why it failed; the full output opens on click
+						const why = m.output.split('\\n')[0].replace(/ — .*$/, '').replace(/\\.$/, '');
+						row.append(el('span', 'lc-step__why', '· ' + (why.length > 48 ? why.slice(0, 47) + '…' : why)));
+					}
 					if (m.output && (!m.ok || m.name === 'forge_build' || m.name === 'run_command')) {
-						const out = el('div', 'lc-step__out', m.output); out.hidden = m.ok; lastTool.append(out); lastTool.classList.add('has-out');
+						const out = el('div', 'lc-step__out', m.output); out.hidden = true; lastTool.append(out); lastTool.classList.add('has-out');
 					}
 				} else {
 					// an approval block: show the outcome in its header
@@ -608,6 +698,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			case 'busy': setBusy(m.busy); if (!m.busy) { closeBubble(); clearStatus(); } break;
 			case 'error': card({ title: m.message, state: 'Failed', stateKind: 'err' }); break;
 			case 'card': card(m); break;
+			case 'cardRemove': thread.querySelector('[data-card="' + m.id + '"]')?.remove(); break;
 			case 'cardUpdate': {
 				const el = thread.querySelector('[data-card="' + m.id + '"]');
 				if (el) fillCard(el, m); else card(m);

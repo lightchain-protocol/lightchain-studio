@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { InteractPanels } from './interact';
+import { setLog as setInferenceLog } from './lightchain/inference';
 import { addressUrl } from './networks';
 import { NetworkState } from './networkState';
 import { Wallet, WalletAccount, isAddress } from './wallet';
@@ -26,6 +27,9 @@ export function activate(context: vscode.ExtensionContext): void {
 	const programs = new DeployedProgramsProvider(context, network, () => wallet.active?.address);
 	const marketplace = new MarketplaceProvider();
 	const proposals = new ProposalStore();
+	const aiLog = vscode.window.createOutputChannel('Lightchain AI', { log: true });
+	setInferenceLog(line => aiLog.warn(line));
+	context.subscriptions.push(aiLog);
 	const interact = new InteractPanels(context, wallet, network, (address, name) => void programs.rememberName(address, name));
 	context.subscriptions.push(interact, vscode.workspace.registerTextDocumentContentProvider(PROPOSAL_SCHEME, proposals));
 	const ai = new LightchainAiView(context.extensionUri, wallet, network, credits, model => new LightchainProvider(wallet, network, model), proposals, context.globalState);

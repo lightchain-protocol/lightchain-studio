@@ -155,11 +155,20 @@ export const TOOLS: Tool[] = [
 			const p = await safePath(ctx, args.path);
 			const before = await fs.readFile(p, 'utf8');
 			const old = String(args.old ?? '');
+			const replacement = String(args.new ?? '');
 			const count = old ? before.split(old).length - 1 : 0;
-			if (count !== 1) {
-				return { ok: false, output: count === 0 ? '"old" text not found — read the file and copy the exact text.' : `"old" text matches ${count} times — include more context so it is unique.` };
+			let after: string | undefined;
+			if (count === 1) {
+				after = before.replace(old, replacement);
+			} else if (count > 1) {
+				return { ok: false, output: `"old" text matches ${count} times — include more surrounding lines so it is unique.` };
+			} else {
+				// Small models rarely copy indentation/spacing exactly: match line by line ignoring whitespace.
+				after = looseReplace(before, old, replacement);
+				if (after === undefined) {
+					return { ok: false, output: `"old" text not found in ${rel(ctx, p)}. Copy it exactly from the current file below, or use write_file with the complete new content.\n\n${numbered(before)}` };
+				}
 			}
-			const after = before.replace(old, String(args.new ?? ''));
 			const ok = await ctx.approve({ kind: 'edit', title: `Edit ${rel(ctx, p)}`, diff: { path: rel(ctx, p), before, after } });
 			if (!ok) {
 				return { ok: false, output: 'The user rejected this change.' };
@@ -207,4 +216,39 @@ function runProcess(cmd: string, args: string[], cwd: string): Promise<ToolResul
 			resolve({ ok: !err, output: out || (err ? err.message : '(no output)') });
 		});
 	});
+}
+
+/** Whitespace-insensitive, line-based replace of `old` by `replacement`; undefined unless exactly one match. */
+export function looseReplace(text: string, old: string, replacement: string): string | undefined {
+	const norm = (l: string) => l.replace(/\s+/g, ''); // spacing/indentation never decide a match
+	const lines = text.split('\n');
+	const want = old.split('\n').map(norm);
+	while (want.length && !want[0]) { want.shift(); }
+	while (want.length && !want[want.length - 1]) { want.pop(); }
+	if (!want.length) {
+		return undefined;
+	}
+	const hits: number[] = [];
+	for (let i = 0; i + want.length <= lines.length; i++) {
+		if (want.every((w, k) => norm(lines[i + k]) === w)) {
+			hits.push(i);
+		}
+	}
+	if (hits.length !== 1) {
+		return undefined;
+	}
+	const start = hits[0];
+	// keep the file's indentation when the replacement comes without any
+	const indentOf = (k: number) => /^\s*/.exec(lines[start + Math.min(k, want.length - 1)])![0];
+	const repl = replacement.replace(/\n$/, '').split('\n');
+	const hasIndent = repl.some(l => /^\s+\S/.test(l));
+	// line k of the replacement takes the indentation of the line it replaces
+	const placed = hasIndent ? repl : repl.map((l, k) => (l.trim() ? indentOf(k) + l.trim() : l));
+	return [...lines.slice(0, start), ...placed, ...lines.slice(start + want.length)].join('\n');
+}
+
+/** File content with line numbers, capped, for an error the model can copy from. */
+function numbered(text: string): string {
+	const out = text.split('\n').map((l, i) => `${String(i + 1).padStart(4)}  ${l}`).join('\n');
+	return out.length > 6000 ? out.slice(0, 6000) + '\n… (truncated)' : out;
 }

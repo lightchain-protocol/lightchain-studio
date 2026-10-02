@@ -26,7 +26,8 @@ export interface InferenceProvider {
 export interface AgentEvents {
 	onText(delta: string): void;
 	onToolStart(call: ToolCall): void;
-	onToolEnd(call: ToolCall, result: ToolResult): void;
+	/** `soft`: a slip by the model it is told to correct (not shown to the user as a failure). */
+	onToolEnd(call: ToolCall, result: ToolResult, soft?: boolean): void;
 	onTurnEnd(): void;
 	onStatus(status: string, opts?: { walletPrompt?: boolean }): void;
 }
@@ -34,8 +35,15 @@ export interface AgentEvents {
 const MAX_STEPS = 12;
 const TOOL_BLOCK = /```tool\s*\n([\s\S]*?)\n```/g;
 
+/**
+ * Tools offered to the model. No partial edits: models reliably get "find this exact
+ * text" wrong, so a change is always read_file → write_file with the complete content
+ * (the user still approves it as a diff).
+ */
+const AGENT_TOOLS = TOOLS.filter(t => t.name !== 'edit_file');
+
 export function systemPrompt(workspaceName: string): string {
-	const tools = TOOLS.map(t => `- ${t.name}: ${t.description}\n  args: ${t.args}`).join('\n');
+	const tools = AGENT_TOOLS.map(t => `- ${t.name}: ${t.description}\n  args: ${t.args}`).join('\n');
 	return [
 		`You are Lightchain AI, the coding agent inside Lightchain Studio — the IDE for building on the Lightchain AI blockchain (EVM, Solidity, Foundry). Testnet chain id 8200, mainnet 9200, native token LCAI.`,
 		`You are working in the project "${workspaceName}". Paths are relative to the project root.`,
@@ -55,7 +63,7 @@ export function systemPrompt(workspaceName: string): string {
 		`{"name": "write_file", "args": {"path": "src/Hello.sol", "content": "// SPDX-License-Identifier: MIT\\npragma solidity ^0.8.24;\\n\\ncontract Hello {}\\n"}}`,
 		'```',
 		``,
-		`Rules: a file only exists after a write_file result says "Wrote …" — never claim you created or changed a file otherwise. Read files before editing them; write complete, compilable Solidity (pragma ^0.8.24, SPDX header); prefer Foundry conventions (src/, test/, script/); keep changes minimal and explain them briefly.`,
+		`Rules: a file only exists after a write_file result says "Wrote …" — never claim you created or changed a file otherwise. To change a file, read_file it, then write_file the COMPLETE new file (never a fragment); write complete, compilable Solidity (pragma ^0.8.24, SPDX header); prefer Foundry conventions (src/, test/, script/); keep changes minimal and explain them briefly.`,
 	].join('\n');
 }
 
@@ -112,6 +120,19 @@ export function codeBlockAsWrite(text: string): ToolCall | undefined {
 	return undefined;
 }
 
+/** "I have created `src/Game.sol`…" → "src/Game.sol" (a claim of a file change), else undefined. */
+export function claimedFile(text: string): string | undefined {
+	if (!/\b(I(?:'ve| have)?\s+(?:now\s+)?(?:created|written|wrote|added|updated|modified|saved|implemented)|has been (?:created|written|added|updated|saved))\b/i.test(text)) {
+		return undefined;
+	}
+	return /`?((?:[\w.-]+\/)*[\w-]+\.(?:t\.sol|s\.sol|sol|ts|js|json|toml|md))`?/.exec(text)?.[1];
+}
+
+/** The model kept failing its tool calls; stopped so it doesn't spend credits in a loop. */
+export class AgentStuckError extends Error { }
+
+const MAX_FAILED_STEPS = 3;
+
 export class Agent {
 	private history: ChatMessage[];
 
@@ -137,6 +158,9 @@ export class Agent {
 
 	private async loop(userText: string, events: AgentEvents, signal: AbortSignal): Promise<void> {
 		this.history.push({ role: 'user', content: userText });
+		let wrote = false;   // a write_file/edit_file ran this turn
+		let failedSteps = 0; // consecutive steps where every tool call failed
+		let nudged = false;  // already told the model to actually write
 		for (let step = 0; step < MAX_STEPS && !signal.aborted; step++) {
 			let reply = '';
 			for await (const delta of this.provider.chat(this.history, signal, (st, o) => events.onStatus(st, o))) {
@@ -148,6 +172,14 @@ export class Agent {
 			if (!calls.length) {
 				const apply = codeBlockAsWrite(reply);
 				if (!apply) {
+					// Small models often say they created a file without calling write_file.
+					const claimed = claimedFile(reply);
+					if (claimed && !wrote && !nudged) {
+						nudged = true;
+						events.onStatus(`The model described ${claimed} without writing it — asking it to write the file…`);
+						this.history.push({ role: 'user', content: `You said you created or changed ${claimed}, but no write_file call was made, so nothing changed. Call write_file now with the complete file content, using a tool block.` });
+						continue;
+					}
 					break;
 				}
 				calls.push(apply); // still goes through the approval gate with a diff
@@ -157,13 +189,30 @@ export class Agent {
 				if (signal.aborted) {
 					break;
 				}
+				const tool = AGENT_TOOLS.find(t => t.name === call.name);
+				if (!tool) {
+					// a slip the model corrects itself: tell it, don't show it as a failed step
+					const output = call.name === 'edit_file'
+						? `edit_file is not available. Call read_file on ${String(call.args.path ?? 'the file')} if needed, then write_file with its complete new content.`
+						: call.name === '__invalid__' ? 'Invalid tool JSON — use {"name": ..., "args": {...}} inside a ```tool block.' : `Unknown tool "${call.name}". Available: ${AGENT_TOOLS.map(t => t.name).join(', ')}.`;
+					events.onToolEnd(call, { ok: false, output }, true);
+					if (!results.some(r => r.includes(output))) {
+						results.push(`Result of ${call.name} (error):\n${output}`);
+					}
+					continue;
+				}
 				events.onToolStart(call);
-				const tool = TOOLS.find(t => t.name === call.name);
-				const result: ToolResult = tool
-					? await tool.run(call.args, this.ctx).catch(err => ({ ok: false, output: (err as Error).message }))
-					: { ok: false, output: call.name === '__invalid__' ? 'Invalid tool JSON — use {"name": ..., "args": {...}}.' : `Unknown tool "${call.name}".` };
+				const result: ToolResult = await tool.run(call.args, this.ctx).catch(err => ({ ok: false, output: (err as Error).message }));
 				events.onToolEnd(call, result);
+				if (result.ok && call.name === 'write_file') {
+					wrote = true;
+				}
 				results.push(`Result of ${call.name}${result.ok ? '' : ' (error)'}:\n${result.output}`);
+			}
+			failedSteps = results.length && results.every(r => r.includes(' (error):')) ? failedSteps + 1 : 0;
+			if (failedSteps >= MAX_FAILED_STEPS) {
+				this.history.push({ role: 'user', content: results.join('\n\n') });
+				throw new AgentStuckError(`Stopped after ${MAX_FAILED_STEPS} failed attempts in a row, so it doesn't keep spending credits.`);
 			}
 			this.history.push({ role: 'user', content: results.join('\n\n') });
 		}

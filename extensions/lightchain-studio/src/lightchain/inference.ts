@@ -23,6 +23,18 @@ import { bytesToBase64, base64ToBytes } from './base64';
 export class DelegateNotAuthorizedError extends Error {
 	constructor(readonly delegate?: string) { super('Lightchain AI is not yet allowed to spend your credits.'); }
 }
+/** The worker accepted the job but failed or went silent — another model may answer. */
+export class WorkerError extends Error {
+	constructor(message: string, readonly jobId?: string) { super(message); }
+}
+
+/** The relayer's submit transaction failed; nothing was charged and the prompt can be re-sent. */
+export class SubmitError extends Error { }
+
+/** Diagnostic sink (the "Lightchain AI" output channel); frames carry only ciphertext. */
+export let log: (line: string) => void = () => { };
+export function setLog(fn: (line: string) => void): void { log = fn; }
+
 export class InsufficientCreditsError extends Error {
 	constructor(message = 'Not enough Lightchain AI credits for this prompt.') { super(message); }
 }
@@ -237,12 +249,24 @@ export class LightchainInference {
 				throw new Error(`Prompt upload failed (${blob.status}): ${blob.data?.message ?? ''}`);
 			}
 			this.status('Submitting the job on-chain…');
-			const sub = await this.api<any>('POST', `/api/sessions/${this.sessionId}/messages`, { blobHash }, 120_000);
+			let sub = await this.api<any>('POST', `/api/sessions/${this.sessionId}/messages`, { blobHash }, 120_000);
+			if (sub.status >= 500) {
+				// The relayer's submit tx can revert (e.g. a gas limit set too tight); nothing is
+				// charged then, so one automatic retry is safe.
+				log(`submit failed (${sub.status}): ${sub.data?.message ?? ''} — retrying once`);
+				this.status('Submitting the job again…');
+				await new Promise(r => setTimeout(r, 2000));
+				sub = await this.api<any>('POST', `/api/sessions/${this.sessionId}/messages`, { blobHash }, 120_000);
+			}
 			if (sub.status === 403) {
 				throw new DelegateNotAuthorizedError(sub.data?.delegate);
 			}
 			if (sub.status === 402) {
 				throw new InsufficientCreditsError(sub.data?.message);
+			}
+			if (sub.status >= 500) {
+				log(`submit failed again (${sub.status}): ${sub.data?.message ?? ''}`);
+				throw new SubmitError('Lightchain couldn\'t submit this prompt on-chain (a network-side failure). No credits were charged.');
 			}
 			if (sub.status >= 400) {
 				throw new Error(`Prompt submission failed (${sub.status}): ${sub.data?.message ?? ''}`);
@@ -261,10 +285,10 @@ export class LightchainInference {
 						throw new Error('The Lightchain relay closed before the answer finished.');
 					}
 					if (!gotFrame && Date.now() > deadline) {
-						throw new Error('No response from the Lightchain worker in time.');
+						throw new WorkerError(`No response from the ${this.modelName} worker in time (job ${jobId}).`, jobId);
 					}
 					if (gotFrame && Date.now() - lastFrameAt > IDLE_TIMEOUT_MS) {
-						throw new Error(`The ${this.modelName} worker stopped responding (job ${jobId}). Try again or pick another model.`);
+						throw new WorkerError(`The ${this.modelName} worker stopped responding (job ${jobId}).`, jobId);
 					}
 					await new Promise<void>(r => { wake = r; setTimeout(r, 1000); });
 					continue;
@@ -281,7 +305,10 @@ export class LightchainInference {
 					if (f.code === 'RATE_LIMITED' && (f.droppedSeq ?? 0) > 0) {
 						continue;
 					}
-					throw new Error(`Lightchain worker error: ${f.message ?? f.code}`);
+					log(`job ${jobId} error frame: ${JSON.stringify({ ...f, payload: f.payload ? '<ciphertext>' : undefined })}`);
+					// consumer-api sends error frames without a message (lcai-chat-v2 handles it the same way)
+					const detail = f.message || f.reason || f.code;
+					throw new WorkerError(`The ${this.modelName} worker reported an error while answering job ${jobId}${detail ? ` (${detail})` : ''}.`, jobId);
 				}
 				if (f.type === 'metadata' || !f.payload || (f.kind && f.kind !== 'text' && f.type !== 'complete')) {
 					continue;
@@ -290,7 +317,7 @@ export class LightchainInference {
 				if (f.type === 'complete') {
 					const full = unwrapEnvelope(plain);
 					if (!full.trim() && !acc.trim()) {
-						throw new Error('The Lightchain worker returned an empty answer.');
+						throw new WorkerError(`The ${this.modelName} worker returned an empty answer (job ${jobId}).`, jobId);
 					}
 					if (full.startsWith(acc)) {
 						yield full.slice(acc.length);

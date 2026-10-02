@@ -9,19 +9,23 @@ export interface LightchainModel {
 	available: boolean;
 }
 
-/** Not chat/completion models — never offered in the picker. */
-const NON_CHAT = /^(tts-|.*-embedding)/i;
-
 /**
- * Agent default: first available in this order. gpt-oss is last: its workers
- * currently stall on tool-style prompts (reasoning frames, then no answer).
+ * Models the coding agent may use: large enough to follow the tool protocol and
+ * write real files. Left out: tiny models (gemma4:e2b) that claim edits without
+ * making them, vision models (qwen3-vl), speech/embedding models, and gpt-oss
+ * while its workers stall on tool-style prompts. A model the network adds later
+ * appears only once it is added here. Also the default order (coding strength first).
  */
-export const PREFERRED = ['qwen3-coder-next', 'glm-4.7-flash', 'llama3-70b', 'qwen3.6:27b', 'llama3-8b', 'gpt-oss:120b', 'gpt-oss:20b'];
+export const AGENT_MODELS = [
+	'qwen3-coder-next', 'glm-4.7-flash', 'llama3-70b', 'qwen3.6:27b',
+	'deepseek-r1:32b', 'mistral-small:24b', 'gemma4:26b', 'llama3-8b',
+];
+export const PREFERRED = AGENT_MODELS;
 
 export async function fetchModels(network: LightchainNetwork): Promise<LightchainModel[]> {
 	const api = network.consumerApiUrl;
 	const { models } = await fetch(`${api}/api/models`, { signal: AbortSignal.timeout(15_000) }).then(r => r.json()) as { models: Array<{ id: string; name: string }> };
-	const chat = models.filter(m => !NON_CHAT.test(m.name));
+	const chat = models.filter(m => AGENT_MODELS.includes(m.name));
 	let availability: Record<string, { eligibleWorkers?: number; freeSlots?: number; status?: string }> = {};
 	try {
 		const av = await fetch(`${api}/api/workers/availability?models=${chat.map(m => m.id).join(',')}`, { signal: AbortSignal.timeout(15_000) }).then(r => r.json()) as { models?: Array<{ modelId: string; eligibleWorkers?: number; freeSlots?: number; status?: string }> };
