@@ -4,7 +4,8 @@
 	"description": "Build tooling for the Lightchain Studio extension (src/ \u2192 dist/extension.js). Kept out of the extension manifest so packaging never sees it.",
 	"scripts": {
 		"build": "node build.mjs",
-		"typecheck": "tsc -p ."
+		"typecheck": "tsc -p .",
+		"test": "node ../test/run.mjs"
 	},
 	"devDependencies": {
 		"@types/node": "^22.0.0",

@@ -54,3 +54,5 @@ dist
 .v[0-9]*/
 # Local agent validation evidence
 .agent-validation/
+
+extensions/lightchain-studio/test/.out/

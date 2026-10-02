@@ -1,5 +1,10 @@
 import * as vscode from 'vscode';
-import { lineDiff } from './agent/lineDiff';
+import * as path from 'node:path';
+import { applyHunks, lineDiff } from './agent/lineDiff';
+import { ChatStore, ChatEvent } from './agent/chatStore';
+import { runInlineEdit } from './agent/inlineEdit';
+import { StuckJobs } from './lightchain/stuckJobs';
+import { PromptContext, buildContext, editorContext, mentionableFiles } from './agent/context';
 import { AgentStuckError } from './agent/agent';
 import * as fs from 'node:fs';
 import { NetworkState } from './networkState';
@@ -7,7 +12,7 @@ import { Wallet } from './wallet';
 import { shortAddress } from './deployedPrograms';
 import { Credits, formatLcai } from './credits';
 import { Agent, InferenceProvider } from './agent/agent';
-import { ApprovalRequest } from './agent/tools';
+import { ApprovalRequest, PartialApproval } from './agent/tools';
 import { ProposalStore } from './agent/proposals';
 import { findForge } from './foundry';
 import { DelegateNotAuthorizedError, InsufficientCreditsError, SubmitError, WorkerError } from './lightchain/inference';
@@ -21,19 +26,30 @@ import { LightchainModel, fetchModels, pickDefault } from './lightchain/models';
 /** No answer this long after the job was submitted → suggest another model. */
 const SLOW_AFTER_MS = 45_000;
 
+/** Escrowed per job on testnet today (JobRegistry fee); used for the pre-send credit check. */
+const JOB_FEE_LCAI = 0.02;
+
 export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disposable {
 	private view?: vscode.WebviewView;
 	private readonly disposables: vscode.Disposable[] = [];
 	private generation = 0;
 	private agent?: Agent;
 	private abort?: AbortController;
-	private approvals = new Map<string, { resolve: (ok: boolean) => void; req: ApprovalRequest }>();
+	private approvals = new Map<string, { resolve: (decision: boolean | PartialApproval) => void; req: ApprovalRequest }>();
 	private seq = 0;
 	private pendingDelegate?: `0x${string}`;
 	private retryText?: string; // prompt to send again once a setup step (credits) is done
 	private models: LightchainModel[] = [];
 	private model?: string;
 	private slowTimer?: ReturnType<typeof setTimeout>;
+	/** Per turn: files the agent wrote, with their content before the turn (undefined = created). */
+	private checkpoints = new Map<string, Map<string, { before?: string; after: string }>>();
+	private currentTurn?: string;
+	private autoRetried = false; // one automatic retry per request after a worker failure
+	private lastCredits?: number; // LCAI, from the last balance read
+	private readonly stuck: StuckJobs;
+	private readonly chats: ChatStore;
+	private recap?: string; // summary of a restored chat, sent with the next prompt (new worker session)
 	private inFlight?: { text: string; job?: string }; // the prompt being answered right now
 
 	constructor(
@@ -44,7 +60,10 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		private readonly provider: (model: string) => InferenceProvider,
 		private readonly proposals: ProposalStore,
 		private readonly memento: vscode.Memento,
+		workspaceState: vscode.Memento,
 	) {
+		this.chats = new ChatStore(workspaceState);
+		this.stuck = new StuckJobs(memento, wallet);
 		this.disposables.push(wallet.onDidChange(() => this.postState()), network.onDidChange(() => { this.resetChat(); this.refreshModels(); this.postState(); }), credits.onDidChange(() => this.postState()));
 	}
 
@@ -56,6 +75,11 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		view.onDidChangeVisibility(() => { if (view.visible) { this.postState(); this.refreshModels(); } }, undefined, this.disposables);
 		this.postState();
 		this.refreshModels();
+		// keep the composer's context chips in sync with the editor
+		let t: ReturnType<typeof setTimeout> | undefined;
+		const sync = () => { clearTimeout(t); t = setTimeout(() => this.post({ type: 'context', ...editorContext() }), 150); };
+		this.disposables.push(vscode.window.onDidChangeActiveTextEditor(sync), vscode.window.onDidChangeTextEditorSelection(sync));
+		sync();
 	}
 
 	private async refreshModels(): Promise<void> {
@@ -74,11 +98,39 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	private resetChat(): void {
 		this.abort?.abort();
 		this.agent = undefined;
+		this.recap = undefined;
+		void this.chats.startNew();
 		this.post({ type: 'cleared' });
 	}
 
 	private post(msg: unknown): void {
 		this.view?.webview.postMessage(msg);
+		const m = msg as ChatEvent;
+		if (m.type === 'turnEnd' || m.type === 'toolStart') {
+			this.chats.closeAnswer();
+		}
+		if (m.type === 'card') {
+			// transient prompts (setup, slow worker) are live-only; errors are kept without their buttons
+			if (!m.id) {
+				this.chats.record({ ...m, actions: undefined }, this.model);
+			}
+		} else {
+			this.chats.record(m, this.model);
+		}
+	}
+
+	/** Show the saved chat (after a reload, or when picked from History). */
+	private replay(): void {
+		const chat = this.chats.current();
+		if (!chat) {
+			return;
+		}
+		for (const e of chat.events) {
+			this.view?.webview.postMessage(e);
+		}
+		this.view?.webview.postMessage({ type: 'turnEnd' });
+		this.recap = ChatStore.summary(chat);
+		this.agent = undefined; // a new worker session; the recap carries the context
 	}
 
 	private async onMessage(msg: any): Promise<void> {
@@ -88,8 +140,36 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 					vscode.commands.executeCommand(msg.command);
 				}
 				return;
-			case 'send':
-				return this.send(String(msg.text ?? ''));
+			case 'send': {
+				const c = msg.ctx ?? {};
+				return this.send(String(msg.text ?? ''), false, {
+					file: typeof c.file === 'string' ? c.file : undefined,
+					selection: c.selection && typeof c.selection.start === 'number' ? c.selection : undefined,
+					mentions: Array.isArray(c.mentions) ? c.mentions.filter((m: unknown) => typeof m === 'string').slice(0, 8) : [],
+				});
+			}
+			case 'reclaimStuck': {
+				const account = this.wallet.active;
+				if (!account) {
+					return;
+				}
+				const net = this.network.current;
+				try {
+					const { claimable } = await this.stuck.summary(net, account);
+					const n = await this.stuck.reclaim(net, account, claimable);
+					this.post({ type: 'info', text: `Reclaimed the fees of ${n} stalled job${n === 1 ? '' : 's'} — they are back in your credits.` });
+				} catch (err) {
+					this.post({ type: 'error', message: friendlyError(err, account) });
+				}
+				return this.postState();
+			}
+			case 'faucet':
+				return this.claimFaucet();
+			case 'undoTurn':
+				return this.undoTurn(String(msg.id));
+			case 'files':
+				this.post({ type: 'files', files: await mentionableFiles() });
+				return;
 			case 'enableCredits':
 				return this.enableCredits();
 			case 'retryWith': {
@@ -121,6 +201,29 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			case 'new':
 				this.resetChat();
 				return;
+			case 'ready':
+				return this.replay();
+			case 'history':
+				this.post({ type: 'historyList', chats: this.chats.all().map(c => ({ id: c.id, title: c.title, updated: c.updated, current: c.id === this.chats.current()?.id })) });
+				return;
+			case 'openChat': {
+				if (typeof msg.id !== 'string' || this.abort) {
+					return;
+				}
+				await this.chats.open(msg.id);
+				this.view?.webview.postMessage({ type: 'cleared' });
+				return this.replay();
+			}
+			case 'deleteChat':
+				if (typeof msg.id === 'string') {
+					const wasCurrent = this.chats.current()?.id === msg.id;
+					await this.chats.remove(msg.id);
+					if (wasCurrent) {
+						this.resetChat();
+					}
+					this.post({ type: 'historyList', chats: this.chats.all().map(c => ({ id: c.id, title: c.title, updated: c.updated, current: c.id === this.chats.current()?.id })) });
+				}
+				return;
 			case 'model':
 				if (typeof msg.name === 'string' && msg.name !== this.model) {
 					this.model = msg.name;
@@ -134,7 +237,18 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				const a = this.approvals.get(msg.id);
 				if (a) {
 					this.approvals.delete(msg.id);
-					a.resolve(!!msg.ok);
+					const declined: number[] = Array.isArray(msg.declined) ? msg.declined.filter((n: unknown) => typeof n === 'number') : [];
+					const total = a.req.diff ? lineDiff(a.req.diff.before ?? '', a.req.diff.after).hunks : 0;
+					if (!msg.ok || (total && declined.length >= total)) {
+						a.resolve(false);
+					} else if (declined.length && a.req.diff) {
+						a.resolve({
+							content: applyHunks(a.req.diff.before ?? '', a.req.diff.after, declined),
+							note: `The user kept ${total - declined.length} of ${total} proposed changes and declined change(s) ${declined.map(n => n + 1).join(', ')}; the file now contains only the kept changes. Do not re-add the declined ones unless asked.`,
+						});
+					} else {
+						a.resolve(true);
+					}
 				}
 				return;
 			}
@@ -149,9 +263,13 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		}
 	}
 
-	private async send(text: string, retry = false): Promise<void> {
-		if (!text.trim() || this.abort) {
+	private async send(request: string, retry = false, ctx?: PromptContext): Promise<void> {
+		if (!request.trim() || this.abort) {
 			return;
+		}
+		if (!retry) {
+			this.autoRetried = false;
+			void this.memento.update('lightchain.ai.asked', true);
 		}
 		const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 		if (!root) {
@@ -166,18 +284,46 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			this.post({ type: 'error', message: 'No Lightchain model is available right now. Try again in a moment.' });
 			return;
 		}
+		// Don't submit a prompt the credits can't pay for: it would only fail after sign-in and upload.
+		if (!retry && this.lastCredits !== undefined && this.lastCredits < JOB_FEE_LCAI) {
+			this.post({ type: 'restoreInput', text: request });
+			this.post({
+				type: 'card', title: 'Not enough credits for a prompt', state: '', stateKind: 'err',
+				detail: `Each Lightchain AI job costs about ${JOB_FEE_LCAI} LCAI in credits; you have ${this.lastCredits.toFixed(2)}. Top up, then send again.`,
+				actions: [{ label: 'Top up credits', command: 'lightchain.credits.topUp' }],
+			});
+			return;
+		}
+		// Attach the project context (open file, selection, @-mentions, problems) to the prompt.
+		let text = ctx ? (await buildContext(ctx)) + request : request;
+		if (this.recap && !this.agent) {
+			text = `Earlier in this conversation (recap — you are continuing it):\n${this.recap}\n\n---\n\n${text}`;
+			this.recap = undefined;
+		}
 		this.agent ??= new Agent(this.provider(this.model), {
 			root: fs.realpathSync(root),
 			forgePath: findForge(),
 			approve: req => this.requestApproval(req),
+			onWrite: (file, before, after) => {
+				const turn = this.currentTurn && this.checkpoints.get(this.currentTurn);
+				if (turn) {
+					const prev = turn.get(file);
+					turn.set(file, { before: prev ? prev.before : before, after }); // keep the earliest "before"
+				}
+			},
 		});
 		this.abort = new AbortController();
 		if (!retry) {
-			this.post({ type: 'user', text });
+			const chips = ctx ? [...(ctx.file ? [ctx.selection ? `${basename(ctx.file)} · L${ctx.selection.start}–${ctx.selection.end}` : basename(ctx.file)] : []), ...ctx.mentions.map(basename)] : [];
+			this.post({ type: 'user', text: request, chips });
 		}
 		this.post({ type: 'busy', busy: true });
 		this.post({ type: 'status', text: 'Starting…' });
 		this.inFlight = { text };
+		let autoRetry: { text: string; model: string } | undefined;
+		const turnId = `t${++this.seq}`;
+		this.currentTurn = turnId;
+		this.checkpoints.set(turnId, new Map());
 		const clearSlow = () => { clearTimeout(this.slowTimer); this.slowTimer = undefined; this.post({ type: 'cardRemove', id: 'slow' }); };
 		try {
 			await this.agent.run(text, {
@@ -198,6 +344,9 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				},
 			}, this.abort.signal);
 		} catch (err) {
+			if (err instanceof WorkerError && err.jobId && this.wallet.active) {
+				this.stuck.remember(err.jobId, this.network.current, this.wallet.active); // its fee can be reclaimed later
+			}
 			if (this.abort.signal.aborted) {
 				// stopped by the user
 			} else if (err instanceof DelegateNotAuthorizedError && err.delegate) {
@@ -221,6 +370,13 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			} else if (err instanceof SubmitError) {
 				this.retryText = text;
 				this.post({ type: 'card', title: err.message, state: 'Failed', stateKind: 'err', actions: [{ label: 'Try again', command: 'retry' }] });
+			} else if (err instanceof WorkerError && !this.autoRetried) {
+				// Recover without asking: another model with free workers, else a fresh session
+				// on the same model (sortition usually picks a different worker).
+				this.autoRetried = true;
+				const next = this.otherModels()[0]?.name ?? this.model;
+				autoRetry = { text, model: next! };
+				this.post({ type: 'info', text: next === this.model ? 'The worker stopped responding — retried on a new worker.' : `The worker stopped responding — retried with ${next}.` });
 			} else if (err instanceof WorkerError) {
 				// a worker failure, not the user's: offer the same prompt on another model
 				this.retryText = text;
@@ -238,6 +394,13 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				this.retryText = text;
 			}
 		} finally {
+			const changed = this.checkpoints.get(turnId);
+			if (changed?.size) {
+				const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+				this.post({ type: 'checkpoint', id: turnId, files: [...changed.keys()].map(f => path.relative(root, f)) });
+			} else {
+				this.checkpoints.delete(turnId);
+			}
 			clearSlow();
 			this.inFlight = undefined;
 			this.approvals.forEach(a => a.resolve(false));
@@ -245,6 +408,13 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			this.abort = undefined;
 			this.post({ type: 'busy', busy: false });
 			this.postState();
+		}
+		if (autoRetry) {
+			// a new session: the failed one is bound to the stalled worker
+			this.model = autoRetry.model;
+			this.agent = undefined;
+			this.post({ type: 'models', models: this.models, selected: this.model });
+			await this.send(autoRetry.text, true);
 		}
 	}
 
@@ -256,6 +426,164 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			detail: `${this.model} accepted job ${job} but hasn't started answering. Workers sometimes stall; ${others.length ? 'you can send the same prompt to another model' : 'you can stop and try again in a moment'}.`,
 			actions: [...others.map((m, i) => ({ label: `Try ${m.name}`, command: 'retryWith', arg: m.name, ghost: i > 0 })), { label: 'Keep waiting', command: 'keepWaiting', ghost: true, dismiss: true }],
 		});
+	}
+
+	/** ⌘I: rewrite the selection (or the current line) in place from an instruction; Keep or Undo after. */
+	async inlineEdit(): Promise<void> {
+		const editor = vscode.window.activeTextEditor;
+		if (!editor) {
+			return;
+		}
+		if (!this.wallet.active) {
+			vscode.window.showWarningMessage('Connect a wallet to use Lightchain AI.', 'Connect Wallet').then(p => p && vscode.commands.executeCommand('lightchain.wallet.menu'));
+			return;
+		}
+		if (this.lastCredits !== undefined && this.lastCredits < JOB_FEE_LCAI) {
+			vscode.window.showWarningMessage(`Not enough Lightchain AI credits (each request costs about ${JOB_FEE_LCAI} LCAI).`, 'Top Up').then(p => p && vscode.commands.executeCommand('lightchain.credits.topUp'));
+			return;
+		}
+		if (!this.model) {
+			await this.refreshModels();
+		}
+		const model = this.model;
+		if (!model) {
+			vscode.window.showWarningMessage('No Lightchain model is available right now.');
+			return;
+		}
+		const doc = editor.document;
+		const sel = editor.selection;
+		const startLine = sel.start.line;
+		const endLine = sel.isEmpty ? sel.start.line : (sel.end.character === 0 && sel.end.line > sel.start.line ? sel.end.line - 1 : sel.end.line);
+		const range = new vscode.Range(startLine, 0, endLine, doc.lineAt(endLine).text.length);
+		const instruction = await vscode.window.showInputBox({
+			title: `Edit with Lightchain AI · ${model}`,
+			prompt: `${startLine === endLine ? `Line ${startLine + 1}` : `Lines ${startLine + 1}–${endLine + 1}`} of ${vscode.workspace.asRelativePath(doc.uri, false)}`,
+			placeHolder: 'Describe the change, e.g. add a require that msg.value > 0',
+			ignoreFocusOut: true,
+		});
+		if (!instruction?.trim()) {
+			return;
+		}
+		const original = doc.getText(range);
+		const version = doc.version;
+		let replacement: string | undefined;
+		try {
+			replacement = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Lightchain AI · ${model}`, cancellable: true }, async (progress, token) => {
+				const ac = new AbortController();
+				token.onCancellationRequested(() => ac.abort());
+				return runInlineEdit(this.provider(model), {
+					file: vscode.workspace.asRelativePath(doc.uri, false), language: doc.languageId, text: doc.getText(),
+					startLine: startLine + 1, endLine: endLine + 1, instruction: instruction.trim(),
+				}, ac.signal, status => progress.report({ message: status }));
+			});
+		} catch (err) {
+			vscode.window.showErrorMessage(err instanceof WorkerError || err instanceof SubmitError ? `${err.message} Try again.` : friendlyError(err, this.wallet.active));
+			return;
+		} finally {
+			this.postState();
+		}
+		if (!replacement || replacement === original) {
+			vscode.window.showInformationMessage('Lightchain AI suggested no change.');
+			return;
+		}
+		if (doc.version !== version) {
+			vscode.window.showWarningMessage('The file changed while Lightchain AI was working, so the edit was not applied.');
+			return;
+		}
+		await editor.edit(b => b.replace(range, replacement!));
+		const newEnd = startLine + replacement.split('\n').length - 1;
+		const changed = new vscode.Range(startLine, 0, newEnd, doc.lineAt(Math.min(newEnd, doc.lineCount - 1)).text.length);
+		const highlight = vscode.window.createTextEditorDecorationType({ backgroundColor: 'rgba(62, 183, 94, 0.12)', isWholeLine: true });
+		editor.setDecorations(highlight, [changed]);
+		const choice = await vscode.window.showInformationMessage(`Lightchain AI edited lines ${startLine + 1}–${newEnd + 1}.`, 'Keep', 'Undo');
+		highlight.dispose();
+		if (choice === 'Undo' && doc.getText(changed) === replacement) {
+			await editor.edit(b => b.replace(changed, original));
+		}
+	}
+
+	/** Open the panel and send a prompt about a file range (used by the lightbulb quick fix). */
+	async fixProblems(uri: vscode.Uri, problems: { line: number; endLine: number; message: string }[]): Promise<void> {
+		await vscode.commands.executeCommand('lightchain.ai.focus');
+		const file = vscode.workspace.asRelativePath(uri, false);
+		const start = Math.max(1, Math.min(...problems.map(p => p.line)) - 3);
+		const end = Math.max(...problems.map(p => p.endLine)) + 3;
+		const list = problems.map(p => `- line ${p.line}: ${p.message}`).join('\n');
+		await this.send(`Fix ${problems.length === 1 ? 'this problem' : 'these problems'} in ${file}:\n${list}`, false, { file, selection: { start, end }, mentions: [] });
+	}
+
+	/** Open the panel with the selection attached and the cursor in the composer (nothing sent). */
+	async askAboutSelection(): Promise<void> {
+		await vscode.commands.executeCommand('lightchain.ai.focus');
+		this.post({ type: 'context', ...editorContext() });
+		this.post({ type: 'focusInput' });
+	}
+
+	/** Testnet only: claim LCAI from the Lightchain faucet (2 LCAI per 24 h, no captcha). */
+	private async claimFaucet(): Promise<void> {
+		const account = this.wallet.active;
+		if (!account || this.network.current.id !== 'testnet') {
+			return;
+		}
+		this.post({ type: 'faucetState', busy: true });
+		let message: string;
+		let ok = false;
+		try {
+			const res = await fetch('https://lightfaucet.ai/api/claim', {
+				method: 'POST', headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ address: account.address, network: 'testnet' }),
+				signal: AbortSignal.timeout(60_000),
+			});
+			const body = await res.json().catch(() => ({})) as { message?: string };
+			ok = res.ok;
+			message = (body.message ?? (ok ? 'Testnet LCAI sent.' : `Faucet error (${res.status}).`)).replace(/^([^:]+):\s*/, '$1 — ');
+		} catch {
+			message = 'The faucet is unreachable right now. Try lightfaucet.ai in your browser.';
+		}
+		this.post({ type: 'faucetState', busy: false, ok, message });
+		if (ok) {
+			// the transfer needs a block or two
+			setTimeout(() => this.postState(), 6_000);
+			setTimeout(() => this.postState(), 15_000);
+		}
+	}
+
+	/** Restore every file the agent wrote in one turn to its state before the turn. */
+	private async undoTurn(id: string): Promise<void> {
+		const turn = this.checkpoints.get(id);
+		if (!turn) {
+			return;
+		}
+		const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+		const current = async (f: string) => {
+			const open = vscode.workspace.textDocuments.find(d => d.uri.fsPath === f);
+			return open ? open.getText() : fs.promises.readFile(f, 'utf8').catch(() => undefined);
+		};
+		const edited: string[] = [];
+		for (const [f, v] of turn) {
+			if ((await current(f)) !== v.after) {
+				edited.push(path.relative(root, f));
+			}
+		}
+		if (edited.length) {
+			const ok = await vscode.window.showWarningMessage(
+				`${edited.join(', ')} changed after Lightchain AI wrote ${edited.length === 1 ? 'it' : 'them'}.`,
+				{ modal: true, detail: 'Undo restores the version from before this turn and discards those later edits.' },
+				'Undo Anyway');
+			if (ok !== 'Undo Anyway') {
+				return;
+			}
+		}
+		for (const [f, v] of turn) {
+			const uri = vscode.Uri.file(f);
+			if (v.before === undefined) {
+				await vscode.workspace.fs.delete(uri, { useTrash: true }).then(undefined, () => undefined);
+			} else {
+				await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(v.before));
+			}
+		}
+		this.checkpoints.delete(id);
+		this.post({ type: 'checkpointUndone', id });
 	}
 
 	/** Up to three other chat models with free workers right now. */
@@ -295,7 +623,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		}
 	}
 
-	private requestApproval(req: ApprovalRequest): Promise<boolean> {
+	private requestApproval(req: ApprovalRequest): Promise<boolean | PartialApproval> {
 		const id = `a${++this.seq}`;
 		return new Promise(resolve => {
 			this.approvals.set(id, { resolve, req });
@@ -308,13 +636,23 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		const gen = ++this.generation;
 		const account = this.wallet.active;
 		const network = this.network.current;
-		const base = { type: 'state', network: network.label, account: account ? shortAddress(account.address) : null, credits: null as string | null };
+		const base = {
+			type: 'state', network: network.label, testnet: network.id === 'testnet',
+			account: account ? shortAddress(account.address) : null, credits: null as string | null,
+			gas: null as number | null, creditsNum: null as number | null,
+			asked: this.memento.get<boolean>('lightchain.ai.asked', false),
+		};
 		this.post(base);
 		if (account) {
 			try {
 				const snap = await this.credits.read(account, network);
 				if (gen === this.generation) {
-					this.post({ ...base, credits: formatLcai(snap.credits) });
+					this.lastCredits = Number(snap.credits) / 1e18;
+					this.post({ ...base, credits: formatLcai(snap.credits), gas: Number(snap.walletBalance) / 1e18, creditsNum: this.lastCredits });
+				}
+				const stuck = await this.stuck.summary(network, account);
+				if (gen === this.generation) {
+					this.post({ type: 'reclaim', count: stuck.claimable.length, fee: formatLcai(stuck.fee) });
 				}
 			} catch { /* RPC unreachable */ }
 		}
@@ -366,12 +704,37 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	.lc-model__left .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 500; }
 	.lc-model__count { margin-left: auto; flex: none; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 10px; }
 	.lc-model__count.off { color: oklch(63.7% 0.237 25.331); } .lc-model__count.busy { color: oklch(76.9% 0.188 70.08); }
+	.lc-top { position: relative; }
+	.lc-history { position: absolute; right: 16px; top: calc(100% + 4px); z-index: 70; width: 300px; max-height: 360px; overflow-y: auto; padding: 6px; border: 1px solid rgba(204, 206, 239, 0.06); border-radius: 12px; background: #0F0F14; }
+	.lc-history[hidden] { display: none; }
+	.lc-history__label { padding: 4px 8px; font-size: 11px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.08em; color: #CCCEEF; }
+	.lc-history__item { display: flex; align-items: center; gap: 6px; border-radius: 8px; }
+	.lc-history__item:hover, .lc-history__item.current { background: hsl(240 3.7% 15.9%); }
+	.lc-history__item button.open { flex: 1; min-width: 0; padding: 6px 8px; border: 0; background: transparent; color: #CCCEEF; font-family: "Inter", sans-serif; font-size: 13px; text-align: left; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.lc-history__item small { flex: none; color: #7376aa; font-size: 11px; }
+	.lc-history__item button.del { flex: none; width: 22px; height: 22px; border: 0; border-radius: 6px; background: transparent; color: #7376aa; cursor: pointer; }
+	.lc-history__item button.del:hover { color: #f5f6ff; background: rgba(204, 206, 239, 0.1); }
+	.lc-history__empty { padding: 6px 8px; color: #7376aa; font-size: 13px; }
+	.lc-top__right .lc-link + .lc-link { margin-left: 2px; }
 	.lc-link { background: none; border: 0; color: #b1b3d0; font: inherit; font-size: 14px; cursor: pointer; padding: 0; }
 
+	.lc-banner { flex: none; zoom: 0.8125; display: flex; align-items: center; gap: 8px; margin: 10px 16px 0; padding: 8px 8px 8px 12px; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 10px; background: #020203; color: #b1b3d0; font-size: 13px; }
+	.lc-banner[hidden] { display: none; }
+	.lc-banner span { flex: 1; min-width: 0; }
 	.lc-thread { flex: 1; min-height: 0; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
 	.lc-empty { margin: auto 0; text-align: left; }
 	.lc-empty img { width: 176px; height: auto; display: block; margin-bottom: 16px; }
 	.lc-empty p { color: #b1b3d0; font-size: 14px; }
+	/* first-run checklist */
+	.lc-setup { margin-top: 20px; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 10px; background: #020203; overflow: hidden; }
+	.lc-setup[hidden] { display: none; }
+	.lc-setup__title { padding: 10px 12px 6px; color: #f5f6ff; font-size: 13px; font-weight: 500; }
+	.lc-setup__row { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-top: 1px solid rgba(255, 255, 255, 0.06); font-size: 13px; color: #b1b3d0; }
+	.lc-setup__n { flex: none; width: 18px; height: 18px; border-radius: 50%; border: 1px solid rgba(204, 206, 239, 0.25); display: inline-flex; align-items: center; justify-content: center; font-size: 11px; color: #7376aa; }
+	.lc-setup__row.done { color: #7376aa; }
+	.lc-setup__row.done .lc-setup__n { border-color: #3eb75e; color: #3eb75e; }
+	.lc-setup__row .t { flex: 1; min-width: 0; }
+	.lc-setup__row .t small { display: block; color: #7376aa; font-size: 11px; }
 	/* Chat layout in the style of Cursor / Claude, with lightchain.ai colours and type */
 	.lc-thread > * { flex: none; } /* never squash blocks; the thread scrolls instead */
 	.lc-msg-user { align-self: stretch; padding: 10px 14px; background: rgba(204, 206, 239, 0.06); border: 1px solid rgba(255, 255, 255, 0.06); border-radius: 10px; color: #f5f6ff; font-size: 15px; white-space: pre-wrap; word-break: break-word; }
@@ -387,6 +750,9 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	.lc-step.has-out .lc-step__row:hover { color: #b1b3d0; }
 	.lc-step__label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 	.lc-step__label b { color: #b1b3d0; font-weight: 500; }
+	.lc-checkpoint { display: flex; align-items: center; gap: 8px; color: #7376aa; font-size: 12px; }
+	.lc-checkpoint .files { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.lc-checkpoint.undone .files { text-decoration: line-through; }
 	.lc-step__why { flex: none; color: #7376aa; font-size: 12px; white-space: nowrap; }
 	.lc-ico { flex: none; width: 14px; height: 14px; display: inline-flex; align-items: center; justify-content: center; }
 	.lc-ico svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
@@ -414,6 +780,11 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	.lc-diff .ctx::before { content: "  "; }
 	.lc-diff .gap { color: #7376aa; opacity: .6; text-align: center; }
 	.lc-edit.done .lc-diff { display: none; }
+	.lc-diff .lc-hunk { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 2px 6px 2px 12px; background: rgba(204, 206, 239, 0.04); color: #7376aa; font-family: "Inter", sans-serif; font-size: 11px; white-space: normal; min-width: 0; }
+	.lc-diff .lc-hunk::before { content: none; }
+	.lc-hunk__toggle { height: 20px; padding: 0 8px; border: 1px solid rgba(62, 183, 94, 0.4); border-radius: 5px; background: transparent; color: #3eb75e; font-size: 11px; cursor: pointer; }
+	.lc-hunk__toggle.off { border-color: rgba(255, 255, 255, 0.15); color: #7376aa; }
+	.lc-diff .declined { opacity: .35; }
 	.lc-edit__cmd { padding: 10px 12px; font-family: Menlo, Monaco, "Courier New", monospace; font-size: 12px; color: #ccceef; white-space: pre-wrap; word-break: break-all; }
 
 	/* small inline actions (not page buttons) */
@@ -433,7 +804,23 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 
 	/* composer: one box, model picker and round send button inside */
 	.lc-form { flex: none; padding: 8px 12px 12px; }
-	.lc-composer { border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 12px; background: #020203; transition: border-color .15s; }
+	.lc-composer { position: relative; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 12px; background: #020203; transition: border-color .15s; }
+	/* context chips (current file, selection, @-mentions) */
+	.lc-chips { display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 10px 0; }
+	.lc-chips:empty { display: none; }
+	.lc-chip { display: inline-flex; align-items: center; gap: 4px; height: 22px; max-width: 100%; padding: 0 4px 0 8px; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 6px; background: rgba(204, 206, 239, 0.06); color: #b1b3d0; font-size: 12px; white-space: nowrap; }
+	.lc-chip.off { opacity: .5; text-decoration: line-through; }
+	.lc-chip span { overflow: hidden; text-overflow: ellipsis; }
+	.lc-chip button { width: 16px; height: 16px; border: 0; border-radius: 4px; background: transparent; color: #7376aa; font-size: 12px; line-height: 16px; cursor: pointer; padding: 0; }
+	.lc-chip button:hover { background: rgba(204, 206, 239, 0.1); color: #f5f6ff; }
+	.lc-msg-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+	.lc-msg-chips span { padding: 1px 6px; border-radius: 4px; background: rgba(204, 206, 239, 0.08); color: #7376aa; font-size: 11px; }
+	/* @-mention picker: same surface as the model menu */
+	.lc-mention { position: absolute; left: 8px; right: 8px; bottom: calc(100% + 4px); z-index: 60; max-height: 220px; overflow-y: auto; padding: 6px; border: 1px solid rgba(204, 206, 239, 0.06); border-radius: 12px; background: #0F0F14; }
+	.lc-mention[hidden] { display: none; }
+	.lc-mention button { display: block; width: 100%; padding: 5px 8px; border: 0; border-radius: 8px; background: transparent; color: #CCCEEF; font-family: Menlo, Monaco, "Courier New", monospace; font-size: 12px; text-align: left; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.lc-mention button.active, .lc-mention button:hover { background: hsl(240 3.7% 15.9%); }
+	.lc-mention .empty { padding: 5px 8px; color: #7376aa; font-size: 12px; }
 	.lc-composer:focus-within { border-color: rgba(255, 255, 255, 0.2); }
 	textarea { display: block; width: 100%; max-height: 200px; padding: 10px 12px 4px; resize: none; background: transparent; border: 0; outline: none; color: #ccceef; font-family: "Inter", sans-serif; font-size: 15px; line-height: 22px; }
 	textarea::placeholder { color: #7376aa; }
@@ -455,17 +842,22 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 <body>
 	<div class="lc-top">
 		<h4 class="lc-sm-title" id="eyebrow">Testnet</h4>
-		<div class="lc-top__right"><div class="lc-top__credits" id="credits" title="Lightchain AI credits"></div><button class="lc-link" id="new">New chat</button></div>
+		<div class="lc-top__right"><div class="lc-top__credits" id="credits" title="Lightchain AI credits"></div><button class="lc-link" id="historyBtn">History</button><button class="lc-link" id="new">New chat</button></div>
+		<div class="lc-history" id="history" hidden></div>
 	</div>
+	<div class="lc-banner" id="banner" hidden></div>
 	<div class="lc-thread" id="thread">
 		<div class="lc-empty" id="empty">
 			<img src="${media('logo.svg')}" alt="Lightchain AI">
 			<p>Ask Lightchain AI to write contracts, tests and scripts, explain code or fix build errors. It reads your project and proposes changes you approve.</p>
+			<div class="lc-setup" id="setup" hidden></div>
 		</div>
 	</div>
 	<div class="lc-form">
 		<div class="lc-composer">
-			<textarea id="input" rows="2" placeholder="Ask Lightchain AI… e.g. Create an ERC-20 token with a deploy script"></textarea>
+			<div class="lc-mention" id="mention" hidden></div>
+			<div class="lc-chips" id="chips"></div>
+			<textarea id="input" rows="2" placeholder="Ask Lightchain AI… type @ to add a file"></textarea>
 			<div class="lc-form__row">
 				<div class="lc-model" id="modelBox">
 					<button class="lc-model__trigger" id="modelBtn" type="button" aria-haspopup="listbox" aria-expanded="false"><span class="lc-dot" id="modelDot"></span><span id="modelLogo"></span><span class="lc-model__name" id="modelLabel">Select model</span><svg class="lc-chev" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
@@ -568,10 +960,91 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	}
 	function autosize() { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 200) + 'px'; }
 	function setBusy(b) { busy = b; syncSend(); }
+	// ---- first-run checklist ----
+	let lastState = null, faucet = {};
+	function renderSetup() {
+		const box = $('setup'); if (!box || !lastState) return;
+		const s = lastState;
+		const steps = [
+			{ title: 'Connect a wallet', done: !!s.account, action: ['Connect', () => vscode.postMessage({ type: 'command', command: 'lightchain.wallet.menu' })] },
+		];
+		if (s.testnet) steps.push({ title: 'Get testnet LCAI', note: faucet.message || 'Free test tokens pay for gas — 2 LCAI per day', done: s.gas !== null && s.gas >= 0.05, action: s.account ? [faucet.busy ? 'Claiming…' : 'Claim', () => vscode.postMessage({ type: 'faucet' }), faucet.busy] : null });
+		steps.push({ title: 'Add credits for Lightchain AI', note: 'Prompts are paid from credits on ' + s.network, done: s.creditsNum !== null && s.creditsNum >= 0.05, action: s.account ? ['Top up', () => vscode.postMessage({ type: 'command', command: 'lightchain.credits.topUp' })] : null });
+		steps.push({ title: 'Ask your first question', done: !!s.asked, action: ['Start', () => input.focus()] });
+		const allDone = steps.every(x => x.done);
+		box.hidden = allDone;
+		if (allDone) return;
+		box.replaceChildren(el('div', 'lc-setup__title', 'Get started'));
+		steps.forEach((x, i) => {
+			const row = el('div', 'lc-setup__row' + (x.done ? ' done' : ''));
+			const n = el('span', 'lc-setup__n', x.done ? '✓' : String(i + 1));
+			const t = el('span', 't', x.title); if (x.note && !x.done) t.append(el('small', '', x.note));
+			row.append(n, t);
+			if (!x.done && x.action) { const b = smallBtn(x.action[0], i === steps.findIndex(y => !y.done), x.action[1]); if (x.action[2]) b.disabled = true; row.append(b); }
+			box.append(row);
+		});
+	}
+
+	// ---- context chips + @-mentions ----
+	const ctx = { file: null, selection: null, fileOff: false, mentions: [] };
+	const chipsEl = $('chips'), mentionEl = $('mention');
+	let allFiles = null, mentionIdx = 0, mentionMatches = [];
+	const base = p => p.split('/').pop();
+	function renderChips() {
+		chipsEl.replaceChildren();
+		const chip = (label, title, onX, off) => {
+			const c = el('span', 'lc-chip' + (off ? ' off' : '')); c.title = title;
+			const t = el('span', '', label); const x = el('button', '', off ? '+' : '×'); x.title = off ? 'Include' : 'Remove'; x.onclick = onX;
+			c.append(t, x); chipsEl.append(c);
+		};
+		if (ctx.file) {
+			const label = ctx.selection && !ctx.fileOff ? base(ctx.file) + ' · L' + ctx.selection.start + '–' + ctx.selection.end : base(ctx.file);
+			chip(label, ctx.fileOff ? ctx.file + ' (not included)' : ctx.file + ' — included with your prompt', () => { ctx.fileOff = !ctx.fileOff; renderChips(); }, ctx.fileOff);
+		}
+		ctx.mentions.forEach((m, i) => chip('@' + base(m), m, () => { ctx.mentions.splice(i, 1); renderChips(); }));
+	}
+	function mentionQuery() {
+		const before = input.value.slice(0, input.selectionStart);
+		const m = /(^|\\s)@([^\\s@]*)$/.exec(before);
+		return m ? m[2] : null;
+	}
+	function showMentions() {
+		const q = mentionQuery();
+		if (q === null) { mentionEl.hidden = true; return; }
+		if (!allFiles) { vscode.postMessage({ type: 'files' }); allFiles = []; }
+		const ql = q.toLowerCase();
+		mentionMatches = allFiles.filter(f => f.toLowerCase().includes(ql) && !ctx.mentions.includes(f)).slice(0, 12);
+		mentionIdx = Math.min(mentionIdx, Math.max(0, mentionMatches.length - 1));
+		mentionEl.replaceChildren(...(mentionMatches.length ? mentionMatches.map((f, i) => {
+			const b = el('button', i === mentionIdx ? 'active' : '', f); b.type = 'button';
+			b.onmousedown = e => { e.preventDefault(); pickMention(f); };
+			return b;
+		}) : [el('div', 'empty', allFiles.length ? 'No matching files' : 'Loading files…')]));
+		mentionEl.hidden = false;
+	}
+	function pickMention(f) {
+		const caret = input.selectionStart;
+		const before = input.value.slice(0, caret).replace(/@[^\\s@]*$/, '');
+		input.value = before + input.value.slice(caret);
+		input.selectionStart = input.selectionEnd = before.length;
+		if (!ctx.mentions.includes(f) && f !== ctx.file) ctx.mentions.push(f);
+		mentionEl.hidden = true; renderChips(); autosize(); syncSend(); input.focus();
+	}
+	input.addEventListener('input', () => { mentionIdx = 0; showMentions(); });
+	input.addEventListener('keydown', e => {
+		if (mentionEl.hidden) return;
+		if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); e.stopImmediatePropagation(); mentionIdx = (mentionIdx + (e.key === 'ArrowDown' ? 1 : mentionMatches.length - 1)) % Math.max(1, mentionMatches.length); showMentions(); }
+		else if ((e.key === 'Enter' || e.key === 'Tab') && mentionMatches.length) { e.preventDefault(); e.stopImmediatePropagation(); pickMention(mentionMatches[mentionIdx]); }
+		else if (e.key === 'Escape') { mentionEl.hidden = true; }
+	}, true);
+	input.addEventListener('blur', () => setTimeout(() => { mentionEl.hidden = true; }, 150));
+
 	send.onclick = () => {
 		if (busy) { vscode.postMessage({ type: 'stop' }); return; }
 		const text = input.value.trim(); if (!text) return;
-		input.value = ''; autosize(); syncSend(); vscode.postMessage({ type: 'send', text });
+		const payload = { file: ctx.file && !ctx.fileOff ? ctx.file : null, selection: ctx.file && !ctx.fileOff ? ctx.selection : null, mentions: ctx.mentions.slice() };
+		ctx.mentions = []; renderChips();
+		input.value = ''; autosize(); syncSend(); vscode.postMessage({ type: 'send', text, ctx: payload });
 	};
 	input.addEventListener('input', () => { autosize(); syncSend(); });
 	input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send.click(); } });
@@ -582,7 +1055,26 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		else if (e.key === 'Backspace' && document.activeElement !== input) { e.preventDefault(); pending(false); }
 	});
 	syncSend();
+	vscode.postMessage({ type: 'ready' }); // the extension replays the saved chat
 	$('new').onclick = () => vscode.postMessage({ type: 'new' });
+	const historyEl = $('history');
+	$('historyBtn').onclick = e => { e.stopPropagation(); if (historyEl.hidden) vscode.postMessage({ type: 'history' }); else historyEl.hidden = true; };
+	document.addEventListener('click', e => { if (!historyEl.contains(e.target)) historyEl.hidden = true; });
+	const ago = t => { const m = Math.round((Date.now() - t) / 60000); return m < 1 ? 'now' : m < 60 ? m + 'm' : m < 1440 ? Math.round(m / 60) + 'h' : Math.round(m / 1440) + 'd'; };
+	function renderHistory(chats) {
+		historyEl.replaceChildren(el('div', 'lc-history__label', 'Chats in this project'));
+		if (!chats.length) historyEl.append(el('div', 'lc-history__empty', 'No saved chats yet.'));
+		for (const c of chats) {
+			const row = el('div', 'lc-history__item' + (c.current ? ' current' : ''));
+			const open = el('button', 'open', c.title); open.title = c.title;
+			open.onclick = () => { historyEl.hidden = true; vscode.postMessage({ type: 'openChat', id: c.id }); };
+			const del = el('button', 'del', '×'); del.title = 'Delete this chat';
+			del.onclick = e => { e.stopPropagation(); vscode.postMessage({ type: 'deleteChat', id: c.id }); };
+			row.append(open, el('small', '', ago(c.updated)), del);
+			historyEl.append(row);
+		}
+		historyEl.hidden = false;
+	}
 	const menu = $('modelMenu'), trigger = $('modelBtn');
 	// lcai-chat-v2 components/model-logo.tsx brandFor(): simple-icons (CC0) Meta / Alibaba Cloud / Google
 	const LOGOS = { meta: { color: "#0467DF", d: "M6.915 4.03c-1.968 0-3.683 1.28-4.871 3.113C.704 9.208 0 11.883 0 14.449c0 .706.07 1.369.21 1.973a6.624 6.624 0 0 0 .265.86 5.297 5.297 0 0 0 .371.761c.696 1.159 1.818 1.927 3.593 1.927 1.497 0 2.633-.671 3.965-2.444.76-1.012 1.144-1.626 2.663-4.32l.756-1.339.186-.325c.061.1.121.196.183.3l2.152 3.595c.724 1.21 1.665 2.556 2.47 3.314 1.046.987 1.992 1.22 3.06 1.22 1.075 0 1.876-.355 2.455-.843a3.743 3.743 0 0 0 .81-.973c.542-.939.861-2.127.861-3.745 0-2.72-.681-5.357-2.084-7.45-1.282-1.912-2.957-2.93-4.716-2.93-1.047 0-2.088.467-3.053 1.308-.652.57-1.257 1.29-1.82 2.05-.69-.875-1.335-1.547-1.958-2.056-1.182-.966-2.315-1.303-3.454-1.303zm10.16 2.053c1.147 0 2.188.758 2.992 1.999 1.132 1.748 1.647 4.195 1.647 6.4 0 1.548-.368 2.9-1.839 2.9-.58 0-1.027-.23-1.664-1.004-.496-.601-1.343-1.878-2.832-4.358l-.617-1.028a44.908 44.908 0 0 0-1.255-1.98c.07-.109.141-.224.211-.327 1.12-1.667 2.118-2.602 3.358-2.602zm-10.201.553c1.265 0 2.058.791 2.675 1.446.307.327.737.871 1.234 1.579l-1.02 1.566c-.757 1.163-1.882 3.017-2.837 4.338-1.191 1.649-1.81 1.817-2.486 1.817-.524 0-1.038-.237-1.383-.794-.263-.426-.464-1.13-.464-2.046 0-2.221.63-4.535 1.66-6.088.454-.687.964-1.226 1.533-1.533a2.264 2.264 0 0 1 1.088-.285z" }, alibaba: { color: "#FF6A00", d: "M3.996 4.517h5.291L8.01 6.324 4.153 7.506a1.668 1.668 0 0 0-1.165 1.601v5.786a1.668 1.668 0 0 0 1.165 1.6l3.857 1.183 1.277 1.807H3.996A3.996 3.996 0 0 1 0 15.487V8.513a3.996 3.996 0 0 1 3.996-3.996m16.008 0h-5.291l1.277 1.807 3.857 1.182c.715.227 1.17.889 1.165 1.601v5.786a1.668 1.668 0 0 1-1.165 1.6l-3.857 1.183-1.277 1.807h5.291A3.996 3.996 0 0 0 24 15.487V8.513a3.996 3.996 0 0 0-3.996-3.996m-4.007 8.345H8.002v-1.804h7.995Z" }, google: { color: "#4285F4", d: "M12.48 10.92v3.28h7.84c-.24 1.84-.853 3.187-1.787 4.133-1.147 1.147-2.933 2.4-6.053 2.4-4.827 0-8.6-3.893-8.6-8.72s3.773-8.72 8.6-8.72c2.6 0 4.507 1.027 5.907 2.347l2.307-2.307C18.747 1.44 16.133 0 12.48 0 5.867 0 .307 5.387.307 12s5.56 12 12.173 12c3.573 0 6.267-1.173 8.373-3.36 2.16-2.16 2.84-5.213 2.84-7.667 0-.76-.053-1.467-.173-2.053H12.48z" } };
@@ -616,13 +1108,57 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	window.addEventListener('message', e => {
 		const m = e.data;
 		switch (m.type) {
+			case 'reclaim': {
+				const b = $('banner');
+				b.hidden = !m.count;
+				if (m.count) {
+					const btn = smallBtn('Reclaim', true, () => { btn.disabled = true; vscode.postMessage({ type: 'reclaimStuck' }); });
+					b.replaceChildren(el('span', '', m.fee + ' LCAI from ' + m.count + ' stalled job' + (m.count === 1 ? '' : 's') + ' can be reclaimed'), btn);
+				}
+				break;
+			}
+			case 'faucetState':
+				faucet = m;
+				renderSetup();
+				break;
 			case 'state':
+				lastState = m; renderSetup();
 				$('eyebrow').textContent = m.network; // the view header already says "Lightchain AI"
 				$('credits').replaceChildren();
 				if (m.account) { $('credits').append(m.credits ?? '—', Object.assign(document.createElement('span'), { textContent: m.credits === '1' ? ' credit' : ' credits' })); }
 				else { $('credits').append(Object.assign(document.createElement('span'), { textContent: 'Connect wallet' })); }
 				break;
-			case 'user': closeBubble(); add(Object.assign(document.createElement('div'), { className: 'lc-msg-user', textContent: m.text })); break;
+			case 'user': {
+				closeBubble();
+				const u = el('div', 'lc-msg-user', m.text);
+				if (m.chips && m.chips.length) { const cs = el('div', 'lc-msg-chips'); m.chips.forEach(c => cs.append(el('span', '', c))); u.append(cs); }
+				add(u);
+				break;
+			}
+			case 'info': closeBubble(); add(el('div', 'lc-checkpoint', m.text)); break;
+			case 'checkpoint': {
+				closeBubble(); clearStatus();
+				const row = el('div', 'lc-checkpoint'); row.dataset.checkpoint = m.id;
+				row.append(el('span', 'files', 'Changed ' + m.files.map(base).join(', ')));
+				const b = smallBtn('Undo', false, () => { b.disabled = true; vscode.postMessage({ type: 'undoTurn', id: m.id }); setTimeout(() => { b.disabled = false; }, 1500); });
+				b.title = 'Restore these files to how they were before this turn';
+				row.append(b); add(row);
+				break;
+			}
+			case 'checkpointUndone': {
+				const row = thread.querySelector('[data-checkpoint="' + m.id + '"]');
+				if (row) { row.classList.add('undone'); row.querySelector('button')?.remove(); row.append(el('span', '', 'Undone')); }
+				break;
+			}
+			case 'context':
+				if (m.file !== ctx.file) ctx.fileOff = false;
+				ctx.file = m.file || null; ctx.selection = m.selection || null; renderChips();
+				break;
+			case 'files': allFiles = m.files || []; showMentions(); break;
+			case 'historyList': renderHistory(m.chats || []); break;
+			case 'ai': { const b = aiBubble(); currentText = m.text || ''; b.innerHTML = render(currentText); closeBubble(); break; }
+			case 'focusInput': input.focus(); break;
+			case 'restoreInput': if (!input.value.trim()) { input.value = m.text; autosize(); syncSend(); } break;
 			case 'delta': { const b = aiBubble(); currentText += m.text; b.innerHTML = render(currentText); scroll(); break; }
 			case 'toolStart': clearStatus(); lastTool = toolCard(m.name, m.summary); break;
 			case 'toolEnd': {
@@ -660,10 +1196,13 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 					head.append(path, stat);
 				}
 				const actions = el('div', 'lc-edit__actions');
+				const declined = new Set(); // hunks the user switched off
+				const total = m.diff ? m.diff.hunks || 0 : 0;
 				const decide = ok => {
 					pending = null;
-					vscode.postMessage({ type: 'approve', id: m.id, ok });
-					const st = el('span', 'lc-edit__state ' + (ok ? 'ok' : 'err'), ok ? (m.kind === 'command' ? 'Ran' : 'Accepted') : (m.kind === 'command' ? 'Skipped' : 'Rejected'));
+					vscode.postMessage({ type: 'approve', id: m.id, ok, declined: [...declined] });
+					const partial = ok && declined.size && declined.size < total;
+					const st = el('span', 'lc-edit__state ' + (ok ? 'ok' : 'err'), ok ? (m.kind === 'command' ? 'Ran' : partial ? 'Accepted ' + (total - declined.size) + ' of ' + total : 'Accepted') : (m.kind === 'command' ? 'Skipped' : 'Rejected'));
 					actions.replaceWith(st);
 					if (!ok) box.classList.add('done');
 				};
@@ -676,7 +1215,29 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 					box.append(el('div', 'lc-edit__cmd', m.detail || ''));
 				} else if (m.diff) {
 					const d = el('div', 'lc-diff');
-					for (const line of m.diff.lines) d.append(el('div', line.t === '+' ? 'add' : line.t === '-' ? 'del' : line.t === '…' ? 'gap' : 'ctx', line.t === '…' ? '⋯' : line.s));
+					let shown = -1;
+					for (const line of m.diff.lines) {
+						if (total > 1 && line.h !== undefined && line.h !== shown) {
+							// one toggle per change, so parts of the proposal can be declined
+							shown = line.h;
+							const h = line.h;
+							const bar = el('div', 'lc-hunk');
+							const label = el('span', '', 'Change ' + (h + 1) + ' of ' + total);
+							const t = el('button', 'lc-hunk__toggle', 'Keep');
+							t.onclick = () => {
+								if (declined.has(h)) declined.delete(h); else declined.add(h);
+								const off = declined.has(h);
+								t.textContent = off ? 'Declined' : 'Keep';
+								t.classList.toggle('off', off);
+								d.querySelectorAll('[data-h="' + h + '"]').forEach(x => x.classList.toggle('declined', off));
+							};
+							bar.append(label, t);
+							d.append(bar);
+						}
+						const row = el('div', line.t === '+' ? 'add' : line.t === '-' ? 'del' : line.t === '…' ? 'gap' : 'ctx', line.t === '…' ? '⋯' : line.s);
+						if (line.h !== undefined) row.dataset.h = String(line.h);
+						d.append(row);
+					}
 					box.append(d);
 				}
 				closeBubble(); clearStatus();
@@ -718,6 +1279,8 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		this.disposables.forEach(d => d.dispose());
 	}
 }
+
+const basename = (p: string) => p.split('/').pop() ?? p;
 
 /** One readable line for wallet/RPC/protocol errors (viem errors are multi-paragraph). */
 export function friendlyError(err: unknown, account?: { name: string; address: string }): string {

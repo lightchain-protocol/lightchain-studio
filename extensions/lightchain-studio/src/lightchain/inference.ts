@@ -45,7 +45,8 @@ interface Frame {
 	payload?: string; code?: string; droppedSeq?: number; message?: string; reason?: string;
 }
 
-const FIRST_FRAME_TIMEOUT_MS = 180_000;
+/** Jobs have a 124 s on-chain deadline; nothing arrives after that. */
+const FIRST_FRAME_TIMEOUT_MS = 135_000;
 /** Worker went quiet mid-answer (seen with gpt-oss on tool-style prompts: reasoning, then nothing). */
 const IDLE_TIMEOUT_MS = 120_000;
 const json = { 'content-type': 'application/json' };

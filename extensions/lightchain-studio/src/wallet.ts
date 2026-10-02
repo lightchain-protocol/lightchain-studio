@@ -208,7 +208,8 @@ export class Wallet implements vscode.Disposable {
 	async sendRawFromTx(account: WalletAccount, network: LightchainNetwork, tx: {
 		to?: `0x${string}`; data?: Hex; value?: bigint; gas?: bigint; nonce?: number;
 		gasPrice?: bigint; maxFeePerGas?: bigint; maxPriorityFeePerGas?: bigint;
-	}): Promise<Hex> {
+	}, purpose?: string): Promise<Hex> {
+		await this.confirmMainnet(account, network, tx, purpose ?? (tx.to ? 'Transaction from a Foundry script' : 'Contract deployment from a Foundry script'));
 		if (account.kind === 'browser') {
 			return this.bridge.request<Hex>(network, 'eth_sendTransaction', [{
 				from: account.address,
@@ -219,7 +220,7 @@ export class Wallet implements vscode.Disposable {
 				gasPrice: tx.gasPrice !== undefined ? toHex(tx.gasPrice) : undefined,
 				maxFeePerGas: tx.maxFeePerGas !== undefined ? toHex(tx.maxFeePerGas) : undefined,
 				maxPriorityFeePerGas: tx.maxPriorityFeePerGas !== undefined ? toHex(tx.maxPriorityFeePerGas) : undefined,
-			}], account.address);
+			}], account.address, purpose);
 		}
 		const key = await this.exportKey(account.id);
 		if (!key) {
@@ -232,8 +233,38 @@ export class Wallet implements vscode.Disposable {
 		return client.sendTransaction({ to: tx.to ?? null, data: tx.data, value: tx.value, gas: tx.gas, nonce: tx.nonce, ...fees } as Parameters<typeof client.sendTransaction>[0]);
 	}
 
+	/**
+	 * Mainnet guard: real LCAI is at stake, so every mainnet transaction gets an explicit
+	 * confirmation with what it does, the value and the estimated fee. Throws if declined.
+	 */
+	async confirmMainnet(account: WalletAccount, network: LightchainNetwork, tx: { to?: `0x${string}`; data?: Hex; value?: bigint; gas?: bigint }, purpose?: string): Promise<void> {
+		if (network.id !== 'mainnet') {
+			return;
+		}
+		let fee = 'unknown';
+		try {
+			const client = this.publicClient(network);
+			const [gas, price] = await Promise.all([
+				tx.gas ?? client.estimateGas({ account: account.address, to: tx.to, data: tx.data, value: tx.value }),
+				client.getGasPrice(),
+			]);
+			fee = `≈ ${Number(formatEther(gas * price)).toPrecision(3)} LCAI`;
+		} catch { /* the wallet will show it */ }
+		const lines = [
+			purpose ?? (tx.to ? `Transaction to ${tx.to}` : 'Contract deployment'),
+			`From: ${account.name} (${account.address})`,
+			...(tx.value ? [`Value: ${formatEther(tx.value)} LCAI`] : []),
+			`Network fee: ${fee}`,
+		];
+		const ok = await vscode.window.showWarningMessage('Send this transaction on Lightchain Mainnet?', { modal: true, detail: `${lines.join('\n')}\n\nThis uses real LCAI and cannot be undone.` }, 'Send on Mainnet');
+		if (ok !== 'Send on Mainnet') {
+			throw new Error('Cancelled — the mainnet transaction was not sent.');
+		}
+	}
+
 	/** Send a transaction on `network` and wait for it to be mined. Returns the tx hash. */
 	async sendTransaction(account: WalletAccount, network: LightchainNetwork, tx: TxRequest, purpose?: string): Promise<Hex> {
+		await this.confirmMainnet(account, network, tx, purpose);
 		let hash: Hex;
 		if (account.kind === 'browser') {
 			// The connect page switches/adds the Lightchain network before sending.

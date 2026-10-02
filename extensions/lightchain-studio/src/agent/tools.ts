@@ -13,10 +13,16 @@ export interface ApprovalRequest {
 	diff?: { path: string; before: string; after: string };
 }
 
+/** The user kept only some of the changes: write `content` instead, tell the model `note`. */
+export interface PartialApproval { content: string; note: string }
+
 export interface ToolContext {
 	root: string;                                        // workspace root (absolute)
-	approve(req: ApprovalRequest): Promise<boolean>;     // UI approval gate
+	/** UI approval gate: true/false, or the user's partial acceptance of a file change. */
+	approve(req: ApprovalRequest): Promise<boolean | PartialApproval>;
 	forgePath?: string;
+	/** Called after a file write; `before` is undefined when the file did not exist (for checkpoints). */
+	onWrite?(absPath: string, before: string | undefined, after: string): void;
 }
 
 export interface Tool {
@@ -137,13 +143,19 @@ export const TOOLS: Tool[] = [
 			if (typeof args.content !== 'string') {
 				return { ok: false, output: '"content" (string) is required.' };
 			}
-			const before = await fs.readFile(p, 'utf8').catch(() => '');
-			const ok = await ctx.approve({ kind: 'write', title: `${before ? 'Overwrite' : 'Create'} ${rel(ctx, p)}`, diff: { path: rel(ctx, p), before, after: args.content } });
-			if (!ok) {
+			const existing = await fs.readFile(p, 'utf8').catch(() => undefined);
+			const before = existing ?? '';
+			const decision = await ctx.approve({ kind: 'write', title: `${before ? 'Overwrite' : 'Create'} ${rel(ctx, p)}`, diff: { path: rel(ctx, p), before, after: args.content } });
+			if (!decision) {
 				return { ok: false, output: 'The user rejected this change.' };
 			}
+			const content = typeof decision === 'object' ? decision.content : args.content;
 			await fs.mkdir(path.dirname(p), { recursive: true });
-			await fs.writeFile(p, args.content, 'utf8');
+			await fs.writeFile(p, content, 'utf8');
+			ctx.onWrite?.(p, existing, content);
+			if (typeof decision === 'object') {
+				return { ok: true, output: `Wrote ${rel(ctx, p)}. ${decision.note}` };
+			}
 			return { ok: true, output: `Wrote ${rel(ctx, p)} (${args.content.split('\n').length} lines).` };
 		},
 	},
@@ -169,7 +181,7 @@ export const TOOLS: Tool[] = [
 					return { ok: false, output: `"old" text not found in ${rel(ctx, p)}. Copy it exactly from the current file below, or use write_file with the complete new content.\n\n${numbered(before)}` };
 				}
 			}
-			const ok = await ctx.approve({ kind: 'edit', title: `Edit ${rel(ctx, p)}`, diff: { path: rel(ctx, p), before, after } });
+			const ok = !!(await ctx.approve({ kind: 'edit', title: `Edit ${rel(ctx, p)}`, diff: { path: rel(ctx, p), before, after } }));
 			if (!ok) {
 				return { ok: false, output: 'The user rejected this change.' };
 			}
@@ -197,7 +209,7 @@ export const TOOLS: Tool[] = [
 			if (!command) {
 				return { ok: false, output: 'A "command" is required.' };
 			}
-			const ok = await ctx.approve({ kind: 'command', title: 'Run command', detail: command });
+			const ok = !!(await ctx.approve({ kind: 'command', title: 'Run command', detail: command }));
 			if (!ok) {
 				return { ok: false, output: 'The user rejected this command.' };
 			}

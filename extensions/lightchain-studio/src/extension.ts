@@ -4,6 +4,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { InteractPanels } from './interact';
+import { DeployCodeLens, deployWizard } from './deployWizard';
+import { LightchainCodeActions } from './agent/quickFix';
 import { setLog as setInferenceLog } from './lightchain/inference';
 import { addressUrl } from './networks';
 import { NetworkState } from './networkState';
@@ -32,7 +34,7 @@ export function activate(context: vscode.ExtensionContext): void {
 	context.subscriptions.push(aiLog);
 	const interact = new InteractPanels(context, wallet, network, (address, name) => void programs.rememberName(address, name));
 	context.subscriptions.push(interact, vscode.workspace.registerTextDocumentContentProvider(PROPOSAL_SCHEME, proposals));
-	const ai = new LightchainAiView(context.extensionUri, wallet, network, credits, model => new LightchainProvider(wallet, network, model), proposals, context.globalState);
+	const ai = new LightchainAiView(context.extensionUri, wallet, network, credits, model => new LightchainProvider(wallet, network, model), proposals, context.globalState, context.workspaceState);
 
 	const programsView = vscode.window.createTreeView('lightchain.deployedPrograms', { treeDataProvider: programs, showCollapseAll: true });
 	programs.view = programsView;
@@ -41,6 +43,12 @@ export function activate(context: vscode.ExtensionContext): void {
 		network, bridge, wallet, credits, programs, marketplace, ai, programsView,
 		vscode.window.createTreeView('lightchain.marketplace', { treeDataProvider: marketplace }),
 		vscode.window.registerWebviewViewProvider('lightchain.ai', ai),
+		vscode.commands.registerCommand('lightchain.deployContract', (contractName?: string) => deployWizard(wallet, network, programs, typeof contractName === 'string' ? contractName : undefined)),
+		vscode.languages.registerCodeLensProvider({ language: 'solidity', scheme: 'file' }, new DeployCodeLens()),
+		vscode.languages.registerCodeActionsProvider({ scheme: 'file' }, new LightchainCodeActions(), { providedCodeActionKinds: LightchainCodeActions.kinds }),
+		vscode.commands.registerCommand('lightchain.ai.fix', (uri: vscode.Uri, problems: { line: number; endLine: number; message: string }[]) => ai.fixProblems(uri, problems)),
+		vscode.commands.registerCommand('lightchain.ai.askSelection', () => ai.askAboutSelection()),
+		vscode.commands.registerCommand('lightchain.ai.inlineEdit', () => ai.inlineEdit()),
 		// A new active account is the default deployer, so re-sync programs.
 		wallet.onDidChange(() => programs.refresh()),
 	);
@@ -116,6 +124,7 @@ function registerProgramCommands(context: vscode.ExtensionContext, programs: Dep
 		}),
 
 		vscode.commands.registerCommand('lightchain.programs.interact', (node: ProgramNode) => interact.open(node.program)),
+		vscode.commands.registerCommand('lightchain.programs.interactAddress', (address: `0x${string}`, name?: string) => interact.open({ address, name, sources: ['manual'] })),
 
 		vscode.commands.registerCommand('lightchain.programs.openInExplorer', (node: ProgramNode) =>
 			vscode.env.openExternal(vscode.Uri.parse(addressUrl(network.current, node.program.address)))),

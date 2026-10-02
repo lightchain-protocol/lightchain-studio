@@ -234,14 +234,45 @@
 				"command": "lightchain.wallet.exportKeystore",
 				"title": "Export to Foundry Keystore",
 				"category": "Lightchain Wallet"
+			},
+			{
+				"command": "lightchain.ai.fix",
+				"title": "Fix with Lightchain AI",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.ai.askSelection",
+				"title": "Ask Lightchain AI about Selection",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.deployContract",
+				"title": "Deploy Contract…",
+				"category": "Lightchain",
+				"icon": "$(rocket)"
+			},
+			{
+				"command": "lightchain.programs.interactAddress",
+				"title": "Interact with Address",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.ai.inlineEdit",
+				"title": "Edit with Lightchain AI",
+				"category": "Lightchain"
 			}
 		],
 		"menus": {
 			"view/title": [
 				{
-					"command": "lightchain.foundry.deploy",
+					"command": "lightchain.deployContract",
 					"when": "view == lightchain.deployedPrograms",
 					"group": "navigation@0"
+				},
+				{
+					"command": "lightchain.foundry.deploy",
+					"when": "view == lightchain.deployedPrograms",
+					"group": "1_deploy@1"
 				},
 				{
 					"command": "lightchain.network.useMainnet",
@@ -334,6 +365,14 @@
 				{
 					"command": "lightchain.programs.interact",
 					"when": "false"
+				},
+				{
+					"command": "lightchain.ai.fix",
+					"when": "false"
+				},
+				{
+					"command": "lightchain.programs.interactAddress",
+					"when": "false"
 				}
 			],
 			"editor/title": [
@@ -348,6 +387,18 @@
 					"command": "lightchain.foundry.deploy",
 					"when": "resourceFilename =~ /\\.s\\.sol$/",
 					"group": "lightchain@1"
+				}
+			],
+			"editor/context": [
+				{
+					"command": "lightchain.ai.askSelection",
+					"when": "editorHasSelection",
+					"group": "0_lightchain@1"
+				},
+				{
+					"command": "lightchain.ai.inlineEdit",
+					"when": "editorTextFocus && !editorReadonly",
+					"group": "0_lightchain@0"
 				}
 			]
 		},
@@ -426,6 +477,24 @@
 						"column": 3
 					}
 				]
+			}
+		],
+		"keybindings": [
+			{
+				"command": "lightchain.ai.askSelection",
+				"key": "cmd+l",
+				"mac": "cmd+l",
+				"win": "ctrl+l",
+				"linux": "ctrl+l",
+				"when": "editorTextFocus"
+			},
+			{
+				"command": "lightchain.ai.inlineEdit",
+				"key": "cmd+i",
+				"mac": "cmd+i",
+				"win": "ctrl+i",
+				"linux": "ctrl+i",
+				"when": "editorTextFocus && !editorReadonly"
 			}
 		]
 	}

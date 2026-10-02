@@ -25,6 +25,7 @@ jobs:
         run: |
           npm install --no-audit --no-fund
           npm run typecheck
+          npm test
           npm run build
 
       - name: Compile

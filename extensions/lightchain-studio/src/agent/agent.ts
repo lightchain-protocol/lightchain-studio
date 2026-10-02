@@ -132,6 +132,7 @@ export function claimedFile(text: string): string | undefined {
 export class AgentStuckError extends Error { }
 
 const MAX_FAILED_STEPS = 3;
+const MAX_FIX_ROUNDS = 2;
 
 export class Agent {
 	private history: ChatMessage[];
@@ -161,6 +162,8 @@ export class Agent {
 		let wrote = false;   // a write_file/edit_file ran this turn
 		let failedSteps = 0; // consecutive steps where every tool call failed
 		let nudged = false;  // already told the model to actually write
+		let unbuilt = false; // .sol files written since the last successful build
+		let fixRounds = 0;   // automatic "fix the build" rounds this turn
 		for (let step = 0; step < MAX_STEPS && !signal.aborted; step++) {
 			let reply = '';
 			for await (const delta of this.provider.chat(this.history, signal, (st, o) => events.onStatus(st, o))) {
@@ -179,6 +182,21 @@ export class Agent {
 						events.onStatus(`The model described ${claimed} without writing it — asking it to write the file…`);
 						this.history.push({ role: 'user', content: `You said you created or changed ${claimed}, but no write_file call was made, so nothing changed. Call write_file now with the complete file content, using a tool block.` });
 						continue;
+					}
+					// Build-and-fix: compile what was written; feed errors back (max 2 rounds).
+					if (unbuilt && this.ctx.forgePath && !signal.aborted) {
+						const build = TOOLS.find(t => t.name === 'forge_build')!;
+						const call: ToolCall = { name: 'forge_build', args: {} };
+						events.onToolStart(call);
+						const result = await build.run({}, this.ctx).catch(err => ({ ok: false, output: (err as Error).message }));
+						events.onToolEnd(call, result);
+						unbuilt = !result.ok;
+						if (!result.ok && fixRounds < MAX_FIX_ROUNDS) {
+							fixRounds++;
+							events.onStatus(`Build failed — Lightchain AI is fixing it (attempt ${fixRounds} of ${MAX_FIX_ROUNDS})…`);
+							this.history.push({ role: 'user', content: `forge build failed:\n${result.output.slice(0, 4000)}\n\nFix every error: read_file the affected file(s), then write_file each with its complete corrected content.` });
+							continue;
+						}
 					}
 					break;
 				}
@@ -206,6 +224,12 @@ export class Agent {
 				events.onToolEnd(call, result);
 				if (result.ok && call.name === 'write_file') {
 					wrote = true;
+					if (/\.sol$/.test(String(call.args.path ?? ''))) {
+						unbuilt = true;
+					}
+				}
+				if (call.name === 'forge_build') {
+					unbuilt = !result.ok;
 				}
 				results.push(`Result of ${call.name}${result.ok ? '' : ' (error)'}:\n${result.output}`);
 			}

@@ -1,8 +1,17 @@
 import * as vscode from 'vscode';
 import { NETWORKS } from './networks';
+import { TEMPLATES } from './templates';
+import { findForge } from './foundry';
+import { execFile } from 'node:child_process';
 
 /** Scaffolds a Foundry project preconfigured for Lightchain testnet + mainnet. */
 export async function newProject(): Promise<void> {
+	const template = await vscode.window.showQuickPick(
+		TEMPLATES.map(t => ({ label: t.label, detail: t.detail, template: t })),
+		{ title: 'New Lightchain Project — choose a template', matchOnDetail: true });
+	if (!template) {
+		return;
+	}
 	const parent = await vscode.window.showOpenDialog({
 		title: 'New Lightchain Project — choose a parent folder',
 		canSelectFolders: true,
@@ -49,54 +58,6 @@ lightchain_mainnet = "${m.rpcUrl}"
 lightchain_testnet = { key = "lightscan", url = "${t.explorerUrl}/api", chain = ${t.chainId} }
 lightchain_mainnet = { key = "lightscan", url = "${m.explorerUrl}/api", chain = ${m.chainId} }
 `,
-		'src/Counter.sol': `// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
-
-contract Counter {
-    uint256 public number;
-
-    function setNumber(uint256 newNumber) external {
-        number = newNumber;
-    }
-
-    function increment() external {
-        number++;
-    }
-}
-`,
-		'script/Deploy.s.sol': `// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
-
-import {Script} from "forge-std/Script.sol";
-import {Counter} from "../src/Counter.sol";
-
-contract Deploy is Script {
-    function run() external returns (Counter counter) {
-        vm.startBroadcast();
-        counter = new Counter();
-        vm.stopBroadcast();
-    }
-}
-`,
-		'test/Counter.t.sol': `// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
-
-import {Test} from "forge-std/Test.sol";
-import {Counter} from "../src/Counter.sol";
-
-contract CounterTest is Test {
-    Counter counter;
-
-    function setUp() public {
-        counter = new Counter();
-    }
-
-    function test_Increment() public {
-        counter.increment();
-        assertEq(counter.number(), 1);
-    }
-}
-`,
 		'.gitignore': `out/
 cache/
 broadcast/*/31337/
@@ -125,9 +86,22 @@ Test LCAI: https://lightfaucet.ai · Explorer: ${t.explorerUrl}
 `,
 	};
 
+	Object.assign(files, template.template.files);
 	const encoder = new TextEncoder();
 	for (const [path, content] of Object.entries(files)) {
 		await vscode.workspace.fs.writeFile(vscode.Uri.joinPath(root, path), encoder.encode(content));
+	}
+	// Install forge-std so the project builds and tests right away.
+	const forge = findForge();
+	if (forge) {
+		await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Creating ${name.trim()}: installing forge-std…` }, async () => {
+			const run = (cmd: string, args: string[]) => new Promise<boolean>(resolve =>
+				execFile(cmd, args, { cwd: root.fsPath, timeout: 180_000, env: { ...process.env, PATH: `${process.env.HOME}/.foundry/bin:${process.env.PATH}` } }, err => resolve(!err)));
+			const ok = await run('git', ['init', '-q']) && await run(forge, ['install', 'foundry-rs/forge-std']);
+			if (!ok) {
+				vscode.window.showWarningMessage('Could not install forge-std automatically (git and internet access are needed). Run "forge install foundry-rs/forge-std" in the project.');
+			}
+		});
 	}
 	await vscode.commands.executeCommand('vscode.openFolder', root, { forceNewWindow: false });
 }

@@ -135,7 +135,7 @@ export class InteractPanels implements vscode.Disposable {
 				return reply('Would revert', 'err', friendlyError(err, account));
 			}
 			const call = `${fn.name}(${args.map(a => formatValue(a)).join(', ')})`;
-			if (account.kind === 'local') {
+			if (account.kind === 'local' && net.id !== 'mainnet') { // mainnet: the wallet's mainnet guard confirms
 				const ok = await vscode.window.showWarningMessage(
 					`Send ${call} to ${name} on ${net.label}?`,
 					{ modal: true, detail: `From ${account.name} (${account.address})${value ? `\nValue: ${formatEther(value)} LCAI` : ''}\nThis is an on-chain transaction and costs gas.` },
