@@ -6,6 +6,19 @@ import { execFile } from 'node:child_process';
 export interface ToolCall { name: string; args: Record<string, any> }
 export interface ToolResult { ok: boolean; output: string }
 
+/**
+ * Replies are capped in length, so a model rewriting a long file often sends a stub or
+ * stops halfway. Catch a rewrite that drops most of an existing file before it is shown.
+ */
+export function truncatedRewrite(before: string, after: string): string | undefined {
+	const count = (t: string) => t.split('\n').filter(l => l.trim()).length;
+	const was = count(before), now = count(after);
+	if (was < 15 || now >= was * 0.4) {
+		return undefined;
+	}
+	return `Not written: the new content has ${now} lines but the file has ${was}, so most of it would be lost (your reply was probably cut off). Send the COMPLETE file, or, if the file is long, change it in smaller parts: write only what changes and keep every other line exactly as it is.`;
+}
+
 export interface ApprovalRequest {
 	kind: 'write' | 'edit' | 'command';
 	title: string;        // e.g. "Create src/Token.sol"
@@ -32,7 +45,7 @@ export interface Tool {
 	run(args: Record<string, any>, ctx: ToolContext): Promise<ToolResult>;
 }
 
-const MAX_READ = 60_000;
+const MAX_READ = 20_000; // the model's window is small; longer files are clipped with a note
 const MAX_OUTPUT = 12_000;
 const IGNORE = new Set(['node_modules', '.git', 'out', 'cache', 'lib', 'broadcast', 'artifacts', 'dist']);
 
@@ -145,6 +158,10 @@ export const TOOLS: Tool[] = [
 			}
 			const existing = await fs.readFile(p, 'utf8').catch(() => undefined);
 			const before = existing ?? '';
+			const shrink = truncatedRewrite(before, args.content);
+			if (shrink) {
+				return { ok: false, output: shrink };
+			}
 			const decision = await ctx.approve({ kind: 'write', title: `${before ? 'Overwrite' : 'Create'} ${rel(ctx, p)}`, diff: { path: rel(ctx, p), before, after: args.content } });
 			if (!decision) {
 				return { ok: false, output: 'The user rejected this change.' };
@@ -201,6 +218,19 @@ export const TOOLS: Tool[] = [
 		},
 	},
 	{
+		name: 'forge_test',
+		description: 'Run the Foundry tests (forge test). Optional "match": a test contract or test function name to run only those. Returns the result summary.',
+		args: '{"match": "CounterTest"}',
+		async run(args, ctx) {
+			if (!ctx.forgePath) {
+				return { ok: false, output: 'Foundry (forge) is not installed.' };
+			}
+			const match = typeof args.match === 'string' && /^[\w.*-]+$/.test(args.match) ? args.match : undefined;
+			const filter = match ? [/^[a-z]/.test(match) ? '--match-test' : '--match-contract', match] : [];
+			return runProcess(ctx.forgePath, ['test', '-vv', ...filter], ctx.root, true);
+		},
+	},
+	{
 		name: 'run_command',
 		description: 'Run a shell command in the project root, e.g. "forge test" (needs user approval). Returns output.',
 		args: '{"command": "forge test -vv"}',
@@ -220,11 +250,13 @@ export const TOOLS: Tool[] = [
 	},
 ];
 
-function runProcess(cmd: string, args: string[], cwd: string): Promise<ToolResult> {
+/** Runs a process; `tail` keeps the end of long output (where test summaries are). */
+function runProcess(cmd: string, args: string[], cwd: string, tail = false): Promise<ToolResult> {
 	return new Promise(resolve => {
 		const env = { ...process.env, PATH: `${process.env.HOME}/.foundry/bin${path.delimiter}${process.env.PATH ?? ''}` };
 		execFile(cmd, args, { cwd, timeout: 180_000, maxBuffer: 4 * 1024 * 1024, env }, (err, stdout, stderr) => {
-			const out = clip(`${stdout}${stderr ? `\n${stderr}` : ''}`.trim());
+			const all = `${stdout}${stderr ? `\n${stderr}` : ''}`.trim();
+			const out = tail && all.length > MAX_OUTPUT ? `… (${all.length - MAX_OUTPUT} earlier characters omitted)\n${all.slice(-MAX_OUTPUT)}` : clip(all);
 			resolve({ ok: !err, output: out || (err ? err.message : '(no output)') });
 		});
 	});

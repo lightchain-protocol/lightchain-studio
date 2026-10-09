@@ -104,12 +104,30 @@ export async function deployWizard(wallet: Wallet, network: NetworkState, progra
 		}
 		value = parseEther(raw.trim() || '0') || undefined;
 	}
+	// offer a Lightchain AI security review first (on mainnet before the real-money confirmation)
+	const audit = 'Audit with Lightchain AI First';
 	if (net.id !== 'mainnet') {
 		const ok = await vscode.window.showInformationMessage(`Deploy ${chosen.name} to Lightchain ${net.label}?`, {
 			modal: true,
 			detail: [`From ${account.name} (${account.address})`, ...shown, ...(value ? [`Value: ${formatEther(value)} LCAI`] : [])].join('\n'),
-		}, 'Deploy');
+		}, 'Deploy', audit);
+		if (ok === audit) {
+			await vscode.commands.executeCommand('lightchain.ai.audit', chosen.source);
+			return;
+		}
 		if (ok !== 'Deploy') {
+			return;
+		}
+	} else {
+		const ok = await vscode.window.showWarningMessage(`Review ${chosen.name} before deploying to mainnet?`, {
+			modal: true,
+			detail: 'Mainnet contracts hold real LCAI and usually cannot be changed after deployment. Lightchain AI can do a security review of the source first.',
+		}, audit, 'Deploy Without Review');
+		if (ok === audit) {
+			await vscode.commands.executeCommand('lightchain.ai.audit', chosen.source);
+			return;
+		}
+		if (ok !== 'Deploy Without Review') {
 			return;
 		}
 	}

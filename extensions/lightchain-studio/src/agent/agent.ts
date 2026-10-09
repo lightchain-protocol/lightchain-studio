@@ -1,3 +1,5 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { TOOLS, ToolCall, ToolContext, ToolResult } from './tools';
 
@@ -15,7 +17,8 @@ import { TOOLS, ToolCall, ToolContext, ToolResult } from './tools';
  * appends results to the conversation and loops until the model answers
  * without tool calls (or the step budget runs out).
  */
-export interface ChatMessage { role: 'system' | 'user' | 'assistant'; content: string }
+/** `request`: on the user's own prompts, their words without the attached context. */
+export interface ChatMessage { role: 'system' | 'user' | 'assistant'; content: string; request?: string; /** system message: the project map */ map?: string }
 
 /** A model provider — Lightchain inference by default. */
 export interface InferenceProvider {
@@ -29,6 +32,8 @@ export interface AgentEvents {
 	/** `soft`: a slip by the model it is told to correct (not shown to the user as a failure). */
 	onToolEnd(call: ToolCall, result: ToolResult, soft?: boolean): void;
 	onTurnEnd(): void;
+	/** One model reply finished (a turn can have several, between tool steps). */
+	onReplyEnd?(): void;
 	onStatus(status: string, opts?: { walletPrompt?: boolean }): void;
 }
 
@@ -128,6 +133,20 @@ export function claimedFile(text: string): string | undefined {
 	return /`?((?:[\w.-]+\/)*[\w-]+\.(?:t\.sol|s\.sol|sol|ts|js|json|toml|md))`?/.exec(text)?.[1];
 }
 
+/** Whether the project has Foundry tests (.t.sol files under test/). */
+function hasTests(root: string): boolean {
+	const walk = (dir: string, depth: number): boolean => {
+		let entries: fs.Dirent[];
+		try {
+			entries = fs.readdirSync(dir, { withFileTypes: true });
+		} catch {
+			return false;
+		}
+		return entries.some(e => e.isFile() ? e.name.endsWith('.t.sol') : e.isDirectory() && depth < 4 && walk(path.join(dir, e.name), depth + 1));
+	};
+	return walk(path.join(root, 'test'), 0);
+}
+
 /** The model kept failing its tool calls; stopped so it doesn't spend credits in a loop. */
 export class AgentStuckError extends Error { }
 
@@ -137,18 +156,38 @@ const MAX_FIX_ROUNDS = 2;
 export class Agent {
 	private history: ChatMessage[];
 
-	constructor(private readonly provider: InferenceProvider, private readonly ctx: ToolContext) {
+	constructor(private provider: InferenceProvider, private readonly ctx: ToolContext) {
 		this.history = [{ role: 'system', content: systemPrompt(vscode.workspace.name ?? 'workspace') }];
+	}
+
+	/** The current project map; sent at the start of a session and again when it changes. */
+	setProjectMap(map: string): void {
+		this.history[0].map = map || undefined;
+	}
+
+	/** Number of messages so far (a mark to rewind to). */
+	get size(): number {
+		return this.history.length;
+	}
+
+	/** Forget everything after `mark` (the session must be replaced: the worker still has it). */
+	truncate(mark: number): void {
+		this.history.length = Math.max(1, Math.min(mark, this.history.length));
+	}
+
+	/** Continue the same conversation on another model or worker session. */
+	setProvider(provider: InferenceProvider): void {
+		this.provider = provider;
 	}
 
 	reset(): void {
 		this.history = this.history.slice(0, 1);
 	}
 
-	async run(userText: string, events: AgentEvents, signal: AbortSignal): Promise<void> {
+	async run(userText: string, events: AgentEvents, signal: AbortSignal, request?: string): Promise<void> {
 		const mark = this.history.length;
 		try {
-			await this.loop(userText, events, signal);
+			await this.loop(userText, events, signal, request ?? userText);
 		} catch (err) {
 			if (this.history.length === mark + 1) {
 				this.history.length = mark; // nothing was answered: forget the prompt so it can be retried
@@ -157,8 +196,8 @@ export class Agent {
 		}
 	}
 
-	private async loop(userText: string, events: AgentEvents, signal: AbortSignal): Promise<void> {
-		this.history.push({ role: 'user', content: userText });
+	private async loop(userText: string, events: AgentEvents, signal: AbortSignal, request: string): Promise<void> {
+		this.history.push({ role: 'user', content: userText, request });
 		let wrote = false;   // a write_file/edit_file ran this turn
 		let failedSteps = 0; // consecutive steps where every tool call failed
 		let nudged = false;  // already told the model to actually write
@@ -170,6 +209,7 @@ export class Agent {
 				reply += delta;
 				events.onText(delta);
 			}
+			events.onReplyEnd?.();
 			this.history.push({ role: 'assistant', content: reply });
 			const calls = parseToolCalls(reply);
 			if (!calls.length) {
@@ -196,6 +236,21 @@ export class Agent {
 							events.onStatus(`Build failed — Lightchain AI is fixing it (attempt ${fixRounds} of ${MAX_FIX_ROUNDS})…`);
 							this.history.push({ role: 'user', content: `forge build failed:\n${result.output.slice(0, 4000)}\n\nFix every error: read_file the affected file(s), then write_file each with its complete corrected content.` });
 							continue;
+						}
+						// it builds: run the project's tests too, and fix what broke
+						if (result.ok && hasTests(this.ctx.root) && !signal.aborted) {
+							const test = TOOLS.find(t => t.name === 'forge_test')!;
+							const tcall: ToolCall = { name: 'forge_test', args: {} };
+							events.onToolStart(tcall);
+							const tres = await test.run({}, this.ctx).catch(err => ({ ok: false, output: (err as Error).message }));
+							events.onToolEnd(tcall, tres);
+							if (!tres.ok && fixRounds < MAX_FIX_ROUNDS) {
+								fixRounds++;
+								unbuilt = true; // check again after the fix
+								events.onStatus(`Tests failed — Lightchain AI is fixing it (attempt ${fixRounds} of ${MAX_FIX_ROUNDS})…`);
+								this.history.push({ role: 'user', content: `forge test failed:\n${tres.output.slice(-4000)}\n\nFix the failures. Decide whether the test or the code is wrong and say which; read_file, then write_file the complete corrected file.` });
+								continue;
+							}
 						}
 					}
 					break;

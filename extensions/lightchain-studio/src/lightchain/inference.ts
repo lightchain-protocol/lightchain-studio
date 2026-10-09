@@ -61,6 +61,9 @@ export class LightchainInference {
 
 	get sessionModelId(): string | undefined { return this.modelId; }
 
+	/** Called for every job submitted on-chain (one per model reply). */
+	onJob?: (job: { jobId: string; txHash?: string }) => void;
+
 	constructor(
 		private readonly wallet: Wallet,
 		private readonly account: WalletAccount,
@@ -273,6 +276,7 @@ export class LightchainInference {
 				throw new Error(`Prompt submission failed (${sub.status}): ${sub.data?.message ?? ''}`);
 			}
 			const jobId = String(sub.data.jobId);
+			this.onJob?.({ jobId, txHash: typeof sub.data.txHash === 'string' ? sub.data.txHash : undefined });
 			this.status(`Job ${jobId} submitted — waiting for the worker…`);
 
 			let acc = '';

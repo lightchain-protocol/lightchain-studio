@@ -11,10 +11,16 @@
 	"contributes": {
 		"configurationDefaults": {
 			"workbench.tips.enabled": false,
-			"workbench.enableExperiments": false,
-			"workbench.welcomePage.walkthroughs.openOnInstall": false,
 			"workbench.editor.empty.hint": "hidden",
-			"chat.commandCenter.enabled": false
+			"chat.commandCenter.enabled": false,
+			"files.exclude": {
+				"**/out": {
+					"when": "foundry.toml"
+				},
+				"**/cache": {
+					"when": "foundry.toml"
+				}
+			}
 		}
 	}
 }

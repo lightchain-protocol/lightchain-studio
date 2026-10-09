@@ -14,7 +14,7 @@ const MAX_CHATS = 30;
 const MAX_EVENTS = 600;
 
 /** Event types worth keeping; everything else (status, busy, models…) is live-only. */
-const REPLAYABLE = new Set(['user', 'ai', 'toolStart', 'toolEnd', 'checkpoint', 'checkpointUndone', 'info', 'notice', 'card', 'error']);
+const REPLAYABLE = new Set(['user', 'ai', 'toolStart', 'toolEnd', 'checkpoint', 'checkpointUndone', 'info', 'notice', 'card', 'error', 'jobs']);
 
 export class ChatStore {
 	constructor(private readonly state: vscode.Memento) { }
@@ -80,6 +80,17 @@ export class ChatStore {
 		// newest first, capped
 		const ordered = [chat, ...chats.filter(c => c.id !== chat!.id)].slice(0, MAX_CHATS);
 		void this.state.update(KEY, ordered);
+	}
+
+	/** Drops the user message of `turn` and everything after it from the current chat. */
+	rewind(turn: string): void {
+		const chats = this.all();
+		const chat = chats.find(c => c.id === this.state.get<string>(CURRENT));
+		const at = chat?.events.findIndex(e => e.type === 'user' && e.turn === turn) ?? -1;
+		if (chat && at >= 0) {
+			chat.events.splice(at);
+			void this.state.update(KEY, chats);
+		}
 	}
 
 	/** Ends the current streamed answer so the next delta starts a new one. */

@@ -4,16 +4,22 @@ import { applyHunks, lineDiff } from './agent/lineDiff';
 import { ChatStore, ChatEvent } from './agent/chatStore';
 import { runInlineEdit } from './agent/inlineEdit';
 import { StuckJobs } from './lightchain/stuckJobs';
-import { PromptContext, buildContext, editorContext, mentionableFiles } from './agent/context';
+import { MentionItem, MentionResolver, PromptContext, buildContext, editorContext, mentionableFiles } from './agent/context';
+import { SLASH_COMMANDS, expandSlash, parseSlash } from './agent/commands';
+import { fixPrompt } from './failureWatcher';
+import { outlineSolidity } from './agent/projectMap';
 import { AgentStuckError } from './agent/agent';
 import * as fs from 'node:fs';
 import { NetworkState } from './networkState';
 import { Wallet } from './wallet';
 import { shortAddress } from './deployedPrograms';
+import { txUrl } from './networks';
 import { Credits, formatLcai } from './credits';
 import { Agent, InferenceProvider } from './agent/agent';
 import { ApprovalRequest, PartialApproval } from './agent/tools';
 import { ProposalStore } from './agent/proposals';
+import { EditorReview, ReviewOutcome } from './editorReview';
+import { InlinePrompt, InlineSession } from './inlinePrompt';
 import { findForge } from './foundry';
 import { DelegateNotAuthorizedError, InsufficientCreditsError, SubmitError, WorkerError } from './lightchain/inference';
 import { LightchainModel, fetchModels, pickDefault } from './lightchain/models';
@@ -35,7 +41,16 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	private generation = 0;
 	private agent?: Agent;
 	private abort?: AbortController;
-	private approvals = new Map<string, { resolve: (decision: boolean | PartialApproval) => void; req: ApprovalRequest }>();
+	private approvals = new Map<string, { resolve: (decision: boolean | PartialApproval) => void; req: ApprovalRequest; review?: string }>();
+	/** Shows proposed file changes inside the editor (set by the extension). */
+	review?: EditorReview;
+	/** The ⌘I prompt shown in the editor (set by the extension). */
+	inline?: InlinePrompt;
+	/** Builds the project map (set by the extension). */
+	projectMap?: () => Promise<string>;
+	/** What the @-picker offers, and how non-file mentions become context (set by the extension). */
+	mentions?: () => Promise<MentionItem[]>;
+	resolveMention?: MentionResolver;
 	private seq = 0;
 	private pendingDelegate?: `0x${string}`;
 	private retryText?: string; // prompt to send again once a setup step (credits) is done
@@ -44,11 +59,16 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	private slowTimer?: ReturnType<typeof setTimeout>;
 	/** Per turn: files the agent wrote, with their content before the turn (undefined = created). */
 	private checkpoints = new Map<string, Map<string, { before?: string; after: string }>>();
+	private turnOrder: string[] = []; // turns in the order they ran
+	private turnJobs: { jobId: string; txHash?: string }[] = []; // on-chain jobs of the running turn
+	private turnMarks = new Map<string, number>(); // user turn → agent history size before it
 	private currentTurn?: string;
 	private autoRetried = false; // one automatic retry per request after a worker failure
 	private lastCredits?: number; // LCAI, from the last balance read
 	private readonly stuck: StuckJobs;
 	private readonly chats: ChatStore;
+	private attached = new Map<string, string>(); // files attached in this conversation (not re-sent unchanged)
+	private refreshedThisTurn = false;
 	private recap?: string; // summary of a restored chat, sent with the next prompt (new worker session)
 	private inFlight?: { text: string; job?: string }; // the prompt being answered right now
 
@@ -106,7 +126,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	private post(msg: unknown): void {
 		this.view?.webview.postMessage(msg);
 		const m = msg as ChatEvent;
-		if (m.type === 'turnEnd' || m.type === 'toolStart') {
+		if (m.type === 'turnEnd' || m.type === 'replyEnd' || m.type === 'toolStart') {
 			this.chats.closeAnswer();
 		}
 		if (m.type === 'card') {
@@ -135,6 +155,13 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 
 	private async onMessage(msg: any): Promise<void> {
 		switch (msg?.type) {
+			case 'openUrl': {
+				const url = String(msg.url ?? '');
+				if (url.startsWith(this.network.current.explorerUrl + '/')) {
+					void vscode.env.openExternal(vscode.Uri.parse(url));
+				}
+				return;
+			}
 			case 'command':
 				if (typeof msg.command === 'string' && msg.command.startsWith('lightchain.')) {
 					vscode.commands.executeCommand(msg.command);
@@ -167,8 +194,10 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				return this.claimFaucet();
 			case 'undoTurn':
 				return this.undoTurn(String(msg.id));
+			case 'rewind':
+				return this.rewind(String(msg.turn), String(msg.text ?? ''));
 			case 'files':
-				this.post({ type: 'files', files: await mentionableFiles() });
+				this.post({ type: 'files', items: this.mentions ? await this.mentions() : (await mentionableFiles()).map(f => ({ id: f, label: f, kind: 'file' })) });
 				return;
 			case 'enableCredits':
 				return this.enableCredits();
@@ -183,7 +212,8 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				await this.until(() => !this.abort);
 				this.model = msg.name;
 				await this.memento.update('lightchain.ai.model', msg.name);
-				this.agent = undefined;
+				this.agent?.setProvider(this.chatProvider(msg.name)); // same conversation, new model
+				this.attached = new Map(); // the new session has not seen any file
 				this.post({ type: 'models', models: this.models, selected: this.model });
 				this.post({ type: 'notice', message: `Re-sending your prompt to ${msg.name}.` });
 				return this.send(text, true);
@@ -228,27 +258,22 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				if (typeof msg.name === 'string' && msg.name !== this.model) {
 					this.model = msg.name;
 					await this.memento.update('lightchain.ai.model', msg.name);
-					this.resetChat(); // a Lightchain session is bound to one model
+					// a Lightchain session is bound to one model: the next prompt opens a new one with a recap
+					this.agent?.setProvider(this.chatProvider(msg.name));
+					this.attached = new Map(); // the new session has not seen any file
 					this.post({ type: 'models', models: this.models, selected: this.model });
-					this.post({ type: 'notice', message: `Model: ${msg.name}. New chat started.` });
+					this.post({ type: 'notice', message: this.agent ? `Model: ${msg.name}. The conversation continues.` : `Model: ${msg.name}.` });
 				}
 				return;
 			case 'approve': {
 				const a = this.approvals.get(msg.id);
 				if (a) {
 					this.approvals.delete(msg.id);
-					const declined: number[] = Array.isArray(msg.declined) ? msg.declined.filter((n: unknown) => typeof n === 'number') : [];
-					const total = a.req.diff ? lineDiff(a.req.diff.before ?? '', a.req.diff.after).hunks : 0;
-					if (!msg.ok || (total && declined.length >= total)) {
-						a.resolve(false);
-					} else if (declined.length && a.req.diff) {
-						a.resolve({
-							content: applyHunks(a.req.diff.before ?? '', a.req.diff.after, declined),
-							note: `The user kept ${total - declined.length} of ${total} proposed changes and declined change(s) ${declined.map(n => n + 1).join(', ')}; the file now contains only the kept changes. Do not re-add the declined ones unless asked.`,
-						});
-					} else {
-						a.resolve(true);
+					if (a.review) {
+						await this.review?.cancel(a.review); // decided in the panel: the editor goes back to the file as it was
 					}
+					const declined: number[] = Array.isArray(msg.declined) ? msg.declined.filter((n: unknown) => typeof n === 'number') : [];
+					this.settle(a, !!msg.ok, declined);
 				}
 				return;
 			}
@@ -263,13 +288,27 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		}
 	}
 
-	private async send(request: string, retry = false, ctx?: PromptContext): Promise<void> {
+	/** `instruction`: what the agent gets when it differs from the text shown in the chat. */
+	private async send(request: string, retry = false, ctx?: PromptContext, instruction?: string): Promise<void> {
 		if (!request.trim() || this.abort) {
 			return;
 		}
 		if (!retry) {
 			this.autoRetried = false;
 			void this.memento.update('lightchain.ai.asked', true);
+		}
+		// slash commands: /explain /audit /test /fix /doc expand into full instructions; /deploy opens the wizard
+		instruction ??= request;
+		const slash = retry ? undefined : parseSlash(request);
+		if (slash?.command.name === 'deploy') {
+			const contract = ctx?.file?.endsWith('.sol') ? await this.firstContract(ctx.file) : undefined;
+			await vscode.commands.executeCommand('lightchain.deployContract', contract);
+			return;
+		}
+		if (slash) {
+			const where = ctx?.file ? (ctx.selection ? `lines ${ctx.selection.start}–${ctx.selection.end} of ${ctx.file}` : ctx.file) : undefined;
+			const scope = where ? `${where}${ctx?.mentions.length ? ' and the attached items' : ''}` : ctx?.mentions.length ? 'the attached items' : 'the contracts in this project';
+			instruction = expandSlash(request, scope) ?? request;
 		}
 		const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 		if (!root) {
@@ -295,12 +334,15 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			return;
 		}
 		// Attach the project context (open file, selection, @-mentions, problems) to the prompt.
-		let text = ctx ? (await buildContext(ctx)) + request : request;
+		// Files the session has already seen unchanged are not sent again; they count as sent once the turn succeeds.
+		const attaching = new Map(this.agent ? this.attached : []);
+		let text = ctx ? (await buildContext(ctx, attaching, this.resolveMention)) + instruction : instruction;
 		if (this.recap && !this.agent) {
 			text = `Earlier in this conversation (recap — you are continuing it):\n${this.recap}\n\n---\n\n${text}`;
 			this.recap = undefined;
 		}
-		this.agent ??= new Agent(this.provider(this.model), {
+		this.refreshedThisTurn = false;
+		this.agent ??= new Agent(this.chatProvider(this.model), {
 			root: fs.realpathSync(root),
 			forgePath: findForge(),
 			approve: req => this.requestApproval(req),
@@ -313,19 +355,23 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			},
 		});
 		this.abort = new AbortController();
+		const turnId = `t${++this.seq}`;
 		if (!retry) {
-			const chips = ctx ? [...(ctx.file ? [ctx.selection ? `${basename(ctx.file)} · L${ctx.selection.start}–${ctx.selection.end}` : basename(ctx.file)] : []), ...ctx.mentions.map(basename)] : [];
-			this.post({ type: 'user', text: request, chips });
+			const chips = ctx ? [...(ctx.file ? [ctx.selection ? `${basename(ctx.file)} · L${ctx.selection.start}–${ctx.selection.end}` : basename(ctx.file)] : []), ...ctx.mentions.map(mentionLabel)] : [];
+			this.post({ type: 'user', text: request, chips, turn: turnId });
+			this.turnMarks.set(turnId, this.agent.size);
 		}
+		this.turnOrder.push(turnId);
 		this.post({ type: 'busy', busy: true });
 		this.post({ type: 'status', text: 'Starting…' });
 		this.inFlight = { text };
 		let autoRetry: { text: string; model: string } | undefined;
-		const turnId = `t${++this.seq}`;
 		this.currentTurn = turnId;
+		this.turnJobs = [];
 		this.checkpoints.set(turnId, new Map());
 		const clearSlow = () => { clearTimeout(this.slowTimer); this.slowTimer = undefined; this.post({ type: 'cardRemove', id: 'slow' }); };
 		try {
+			this.agent.setProjectMap(await this.projectMap?.().catch(() => '') ?? '');
 			await this.agent.run(text, {
 				onText: delta => { clearSlow(); this.post({ type: 'delta', text: delta }); },
 				onToolStart: call => this.post({ type: 'toolStart', name: call.name, summary: summarize(call.name, call.args) }),
@@ -333,6 +379,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 					? this.post({ type: 'status', text: 'Lightchain AI is adjusting its approach…' })
 					: this.post({ type: 'toolEnd', name: call.name, ok: result.ok, output: result.output.slice(0, 600) }),
 				onTurnEnd: () => this.post({ type: 'turnEnd' }),
+				onReplyEnd: () => this.post({ type: 'replyEnd' }),
 				onStatus: (status, o) => {
 					this.post({ type: 'status', text: status, walletPrompt: !!o?.walletPrompt });
 					const job = /^Job (\d+) submitted/.exec(status)?.[1];
@@ -342,7 +389,8 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 						this.slowTimer = setTimeout(() => this.suggestOtherModels(job), SLOW_AFTER_MS);
 					}
 				},
-			}, this.abort.signal);
+			}, this.abort.signal, instruction);
+			this.attached = this.refreshedThisTurn ? new Map() : attaching;
 		} catch (err) {
 			if (err instanceof WorkerError && err.jobId && this.wallet.active) {
 				this.stuck.remember(err.jobId, this.network.current, this.wallet.active); // its fee can be reclaimed later
@@ -394,6 +442,15 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				this.retryText = text;
 			}
 		} finally {
+			if (this.turnJobs.length) {
+				// every reply is a job on Lightchain: show where to verify it and what it cost
+				const net = this.network.current;
+				this.post({
+					type: 'jobs', count: this.turnJobs.length, cost: +(this.turnJobs.length * JOB_FEE_LCAI).toFixed(4),
+					jobs: this.turnJobs.map(j => ({ id: j.jobId, url: j.txHash ? txUrl(net, j.txHash) : undefined })),
+				});
+				this.turnJobs = [];
+			}
 			const changed = this.checkpoints.get(turnId);
 			if (changed?.size) {
 				const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
@@ -403,7 +460,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			}
 			clearSlow();
 			this.inFlight = undefined;
-			this.approvals.forEach(a => a.resolve(false));
+			this.approvals.forEach(a => { if (a.review) { void this.review?.cancel(a.review); } a.resolve(false); });
 			this.approvals.clear();
 			this.abort = undefined;
 			this.post({ type: 'busy', busy: false });
@@ -412,7 +469,8 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		if (autoRetry) {
 			// a new session: the failed one is bound to the stalled worker
 			this.model = autoRetry.model;
-			this.agent = undefined;
+			this.agent?.setProvider(this.chatProvider(autoRetry.model));
+			this.attached = new Map(); // the new session has not seen any file
 			this.post({ type: 'models', models: this.models, selected: this.model });
 			await this.send(autoRetry.text, true);
 		}
@@ -426,6 +484,17 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			detail: `${this.model} accepted job ${job} but hasn't started answering. Workers sometimes stall; ${others.length ? 'you can send the same prompt to another model' : 'you can stop and try again in a moment'}.`,
 			actions: [...others.map((m, i) => ({ label: `Try ${m.name}`, command: 'retryWith', arg: m.name, ghost: i > 0 })), { label: 'Keep waiting', command: 'keepWaiting', ghost: true, dismiss: true }],
 		});
+	}
+
+	/** A provider for chat turns; tells the user when the conversation moves to a fresh session. */
+	private chatProvider(model: string): InferenceProvider {
+		const provider = this.provider(model) as InferenceProvider & { onRefresh?: () => void; onJob?: (job: { jobId: string; txHash?: string }) => void };
+		provider.onJob = job => this.turnJobs.push(job);
+		provider.onRefresh = () => {
+			this.refreshedThisTurn = true; // the new session has not seen the attached files
+			this.post({ type: 'info', text: 'Long conversation: continuing in a fresh Lightchain session with a recap of the chat so far.' });
+		};
+		return provider;
 	}
 
 	/** ⌘I: rewrite the selection (or the current line) in place from an instruction; Keep or Undo after. */
@@ -455,51 +524,92 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		const startLine = sel.start.line;
 		const endLine = sel.isEmpty ? sel.start.line : (sel.end.character === 0 && sel.end.line > sel.start.line ? sel.end.line - 1 : sel.end.line);
 		const range = new vscode.Range(startLine, 0, endLine, doc.lineAt(endLine).text.length);
-		const instruction = await vscode.window.showInputBox({
-			title: `Edit with Lightchain AI · ${model}`,
-			prompt: `${startLine === endLine ? `Line ${startLine + 1}` : `Lines ${startLine + 1}–${endLine + 1}`} of ${vscode.workspace.asRelativePath(doc.uri, false)}`,
-			placeHolder: 'Describe the change, e.g. add a require that msg.value > 0',
-			ignoreFocusOut: true,
-		});
-		if (!instruction?.trim()) {
-			return;
+		const where = `${startLine === endLine ? `line ${startLine + 1}` : `lines ${startLine + 1}–${endLine + 1}`}`;
+		let session: InlineSession | undefined;
+		let instruction: string | undefined;
+		if (this.inline) {
+			session = await this.inline.ask(doc, range, `Edit ${where} with Lightchain AI · ${model}`);
+			instruction = session?.instruction;
+		} else {
+			instruction = await vscode.window.showInputBox({ title: `Edit with Lightchain AI · ${model}`, prompt: `${where} of ${vscode.workspace.asRelativePath(doc.uri, false)}`, placeHolder: 'Describe the change, e.g. add a require that msg.value > 0', ignoreFocusOut: true });
 		}
-		const original = doc.getText(range);
-		const version = doc.version;
-		let replacement: string | undefined;
-		try {
-			replacement = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Lightchain AI · ${model}`, cancellable: true }, async (progress, token) => {
+		while (instruction?.trim()) {
+			const original = doc.getText(range);
+			const version = doc.version;
+			const fail = async (message: string): Promise<string | undefined> => {
+				if (!session) {
+					vscode.window.showErrorMessage(message);
+					return undefined;
+				}
+				session.status(`${message}\n\nEdit the instruction and send it again, or close this box.`);
+				return session.retry();
+			};
+			let replacement: string | undefined;
+			try {
 				const ac = new AbortController();
-				token.onCancellationRequested(() => ac.abort());
-				return runInlineEdit(this.provider(model), {
-					file: vscode.workspace.asRelativePath(doc.uri, false), language: doc.languageId, text: doc.getText(),
-					startLine: startLine + 1, endLine: endLine + 1, instruction: instruction.trim(),
-				}, ac.signal, status => progress.report({ message: status }));
-			});
-		} catch (err) {
-			vscode.window.showErrorMessage(err instanceof WorkerError || err instanceof SubmitError ? `${err.message} Try again.` : friendlyError(err, this.wallet.active));
+				const report = (status: string) => session?.status(`${status}`);
+				replacement = session
+					? await runInlineEdit(this.provider(model), { file: vscode.workspace.asRelativePath(doc.uri, false), language: doc.languageId, text: doc.getText(), startLine: startLine + 1, endLine: endLine + 1, instruction: instruction.trim() }, ac.signal, report)
+					: await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Lightchain AI · ${model}`, cancellable: true }, async (progress, token) => {
+						token.onCancellationRequested(() => ac.abort());
+						return runInlineEdit(this.provider(model), { file: vscode.workspace.asRelativePath(doc.uri, false), language: doc.languageId, text: doc.getText(), startLine: startLine + 1, endLine: endLine + 1, instruction: instruction!.trim() }, ac.signal, status => progress.report({ message: status }));
+					});
+			} catch (err) {
+				instruction = await fail(err instanceof WorkerError || err instanceof SubmitError ? err.message : friendlyError(err, this.wallet.active));
+				continue;
+			} finally {
+				this.postState();
+			}
+			if (!replacement || replacement === original) {
+				instruction = await fail('Lightchain AI suggested no change.');
+				continue;
+			}
+			if (doc.version !== version) {
+				instruction = await fail('The file changed while Lightchain AI was working, so the edit was not applied.');
+				continue;
+			}
+			session?.close();
+			// review it in place like an agent change: Accept / Reject per change (saved when decided)
+			if (!doc.isDirty && doc.uri.scheme === 'file' && this.review) {
+				const before = doc.getText();
+				const after = before.slice(0, doc.offsetAt(range.start)) + replacement + before.slice(doc.offsetAt(range.end));
+				if (await this.review.start(doc.uri.fsPath, before, after, () => { })) {
+					return;
+				}
+			}
+			await editor.edit(b => b.replace(range, replacement!));
+			const newEnd = startLine + replacement.split('\n').length - 1;
+			const changed = new vscode.Range(startLine, 0, newEnd, doc.lineAt(Math.min(newEnd, doc.lineCount - 1)).text.length);
+			const highlight = vscode.window.createTextEditorDecorationType({ backgroundColor: 'rgba(62, 183, 94, 0.12)', isWholeLine: true });
+			editor.setDecorations(highlight, [changed]);
+			const choice = await vscode.window.showInformationMessage(`Lightchain AI edited lines ${startLine + 1}–${newEnd + 1}.`, 'Keep', 'Undo');
+			highlight.dispose();
+			if (choice === 'Undo' && doc.getText(changed) === replacement) {
+				await editor.edit(b => b.replace(changed, original));
+			}
 			return;
-		} finally {
-			this.postState();
 		}
-		if (!replacement || replacement === original) {
-			vscode.window.showInformationMessage('Lightchain AI suggested no change.');
-			return;
+	}
+
+	private async firstContract(file: string): Promise<string | undefined> {
+		const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+		if (!root) {
+			return undefined;
 		}
-		if (doc.version !== version) {
-			vscode.window.showWarningMessage('The file changed while Lightchain AI was working, so the edit was not applied.');
-			return;
-		}
-		await editor.edit(b => b.replace(range, replacement!));
-		const newEnd = startLine + replacement.split('\n').length - 1;
-		const changed = new vscode.Range(startLine, 0, newEnd, doc.lineAt(Math.min(newEnd, doc.lineCount - 1)).text.length);
-		const highlight = vscode.window.createTextEditorDecorationType({ backgroundColor: 'rgba(62, 183, 94, 0.12)', isWholeLine: true });
-		editor.setDecorations(highlight, [changed]);
-		const choice = await vscode.window.showInformationMessage(`Lightchain AI edited lines ${startLine + 1}–${newEnd + 1}.`, 'Keep', 'Undo');
-		highlight.dispose();
-		if (choice === 'Undo' && doc.getText(changed) === replacement) {
-			await editor.edit(b => b.replace(changed, original));
-		}
+		const text = new TextDecoder().decode(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(root, file)).then(b => b, () => new Uint8Array()));
+		return outlineSolidity(text, false).find(u => !/interface|library/.test(u.kind))?.name;
+	}
+
+	/** /audit for one file (from the deploy wizard). */
+	async audit(file: string): Promise<void> {
+		await vscode.commands.executeCommand('lightchain.ai.focus');
+		await this.send('/audit', false, { file, mentions: [] });
+	}
+
+	/** A forge command failed: send its output to the chat to be fixed. */
+	async fixFailure(command: string, output: string): Promise<void> {
+		await vscode.commands.executeCommand('lightchain.ai.focus');
+		await this.send(`Fix the failing \`${command}\``, false, undefined, fixPrompt(command, output));
 	}
 
 	/** Open the panel and send a prompt about a file range (used by the lightbulb quick fix). */
@@ -550,18 +660,66 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 
 	/** Restore every file the agent wrote in one turn to its state before the turn. */
 	private async undoTurn(id: string): Promise<void> {
-		const turn = this.checkpoints.get(id);
-		if (!turn) {
+		if (await this.restoreTurns([id])) {
+			this.post({ type: 'checkpointUndone', id });
+		}
+	}
+
+	/**
+	 * Edit an earlier message: undo the file changes from that message on, forget
+	 * the conversation after it, and put the text back in the composer.
+	 */
+	private async rewind(turn: string, text: string): Promise<void> {
+		if (this.abort) {
+			this.abort.abort();
+			await this.until(() => !this.abort);
+		}
+		const from = this.turnOrder.indexOf(turn);
+		const later = from >= 0 ? this.turnOrder.slice(from) : [];
+		if (!(await this.restoreTurns(later.reverse()))) {
 			return;
+		}
+		this.turnOrder = from >= 0 ? this.turnOrder.slice(0, from) : this.turnOrder;
+		const mark = this.turnMarks.get(turn);
+		if (this.agent && mark !== undefined && this.model) {
+			this.agent.truncate(mark);
+			this.agent.setProvider(this.chatProvider(this.model)); // the worker session still holds the old turns
+			this.attached = new Map();
+		}
+		this.chats.rewind(turn);
+		const chat = this.chats.current();
+		if (!this.agent && chat) {
+			this.recap = ChatStore.summary(chat); // a restored chat: the next prompt starts a session from this
+		}
+		this.view?.webview.postMessage({ type: 'rewound', turn, text });
+	}
+
+	/** Restores the files written in `ids` (newest first); false when the user cancels. */
+	private async restoreTurns(ids: string[]): Promise<boolean> {
+		const turns = ids.map(id => this.checkpoints.get(id)).filter((t): t is Map<string, { before?: string; after: string }> => !!t && t.size > 0);
+		if (!turns.length) {
+			ids.forEach(id => this.checkpoints.delete(id));
+			return true;
 		}
 		const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
 		const current = async (f: string) => {
 			const open = vscode.workspace.textDocuments.find(d => d.uri.fsPath === f);
 			return open ? open.getText() : fs.promises.readFile(f, 'utf8').catch(() => undefined);
 		};
+		// the newest version each file got from these turns, and the oldest "before"
+		const newest = new Map<string, string>();
+		const oldest = new Map<string, string | undefined>();
+		for (const turn of turns) { // newest turn first
+			for (const [f, v] of turn) {
+				if (!newest.has(f)) {
+					newest.set(f, v.after);
+				}
+				oldest.set(f, v.before);
+			}
+		}
 		const edited: string[] = [];
-		for (const [f, v] of turn) {
-			if ((await current(f)) !== v.after) {
+		for (const [f, after] of newest) {
+			if ((await current(f)) !== after) {
 				edited.push(path.relative(root, f));
 			}
 		}
@@ -571,19 +729,19 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				{ modal: true, detail: 'Undo restores the version from before this turn and discards those later edits.' },
 				'Undo Anyway');
 			if (ok !== 'Undo Anyway') {
-				return;
+				return false;
 			}
 		}
-		for (const [f, v] of turn) {
+		for (const [f, before] of oldest) {
 			const uri = vscode.Uri.file(f);
-			if (v.before === undefined) {
+			if (before === undefined) {
 				await vscode.workspace.fs.delete(uri, { useTrash: true }).then(undefined, () => undefined);
 			} else {
-				await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(v.before));
+				await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(before));
 			}
 		}
-		this.checkpoints.delete(id);
-		this.post({ type: 'checkpointUndone', id });
+		ids.forEach(id => this.checkpoints.delete(id));
+		return true;
 	}
 
 	/** Up to three other chat models with free workers right now. */
@@ -626,10 +784,49 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	private requestApproval(req: ApprovalRequest): Promise<boolean | PartialApproval> {
 		const id = `a${++this.seq}`;
 		return new Promise(resolve => {
-			this.approvals.set(id, { resolve, req });
+			const entry: { resolve: typeof resolve; req: ApprovalRequest; review?: string } = { resolve, req };
+			this.approvals.set(id, entry);
 			const diff = req.diff ? lineDiff(req.diff.before ?? '', req.diff.after) : undefined;
 			this.post({ type: 'approval', id, kind: req.kind, title: req.title, detail: req.detail, path: req.diff?.path, diff, isNew: req.diff ? !req.diff.before : undefined });
+			// a change to an existing file is also shown in the file itself, with Accept / Reject per change
+			const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+			if (this.review && root && req.diff?.before && req.kind !== 'command') {
+				const abs = path.join(root, req.diff.path);
+				void this.review.start(abs, req.diff.before, req.diff.after, outcome => this.fromEditor(id, outcome)).then(shown => {
+					if (shown && this.approvals.get(id) === entry) {
+						entry.review = abs;
+						this.post({ type: 'approvalInEditor', id });
+					}
+				});
+			}
 		});
+	}
+
+	/** Every change of a proposal was decided in the editor. */
+	private fromEditor(id: string, outcome: ReviewOutcome): void {
+		const a = this.approvals.get(id);
+		if (!a || outcome === 'cancelled') {
+			return;
+		}
+		this.approvals.delete(id);
+		const ok = outcome !== 'rejected';
+		const declined = ok ? outcome.declined : [];
+		this.settle(a, ok, declined);
+		this.post({ type: 'approvalResolved', id, ok, declined });
+	}
+
+	private settle(a: { resolve: (decision: boolean | PartialApproval) => void; req: ApprovalRequest }, ok: boolean, declined: number[]): void {
+		const total = a.req.diff ? lineDiff(a.req.diff.before ?? '', a.req.diff.after).hunks : 0;
+		if (!ok || (total && declined.length >= total)) {
+			a.resolve(false);
+		} else if (declined.length && a.req.diff) {
+			a.resolve({
+				content: applyHunks(a.req.diff.before ?? '', a.req.diff.after, declined),
+				note: `The user kept ${total - declined.length} of ${total} proposed changes and declined change(s) ${declined.map(n => n + 1).join(', ')}; the file now contains only the kept changes. Do not re-add the declined ones unless asked.`,
+			});
+		} else {
+			a.resolve(true);
+		}
 	}
 
 	private async postState(): Promise<void> {
@@ -681,7 +878,9 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	.lc-sm-title { margin: 0; padding-left: 10px; border-left: 3px solid #dd00ac; color: #b1b3d0; font-size: 16px; font-weight: 500; line-height: 19.2px; letter-spacing: -0.096px; text-transform: uppercase; white-space: nowrap; }
 	.lc-top__credits { color: #f5f6ff; font-size: 14px; white-space: nowrap; cursor: pointer; }
 	.lc-top__credits span { color: #b1b3d0; }
-	.lc-top__right { display: flex; align-items: center; gap: 16px; }
+	.lc-sm-title[hidden] { display: none; }
+	.lc-edit__where { padding: 6px 12px; border-bottom: 1px solid rgba(255, 255, 255, 0.06); color: #b1b3d0; font-size: 12px; }
+	.lc-top__right { margin-left: auto; display: flex; align-items: center; gap: 16px; }
 	/* model picker = lcai-chat-v2 components/model-picker.tsx (ModelSelect) + ui/dropdown-menu, dark tokens */
 	.lc-model { position: relative; flex: 1; min-width: 0; }
 	.lc-model__trigger { display: inline-flex; align-items: center; gap: 8px; height: 32px; max-width: 100%; padding: 0 6px; border: 0; border-radius: 12px; background: transparent; color: #9798B6; font-family: "Inter", sans-serif; font-size: 12px; line-height: 16px; font-weight: 500; cursor: pointer; transition: background-color .15s; }
@@ -737,6 +936,13 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	.lc-setup__row .t small { display: block; color: #7376aa; font-size: 11px; }
 	/* Chat layout in the style of Cursor / Claude, with lightchain.ai colours and type */
 	.lc-thread > * { flex: none; } /* never squash blocks; the thread scrolls instead */
+	.lc-msg-user { position: relative; }
+	.lc-jobs { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: -4px; color: #7376aa; font-size: 11px; }
+	.lc-jobs__dot { width: 6px; height: 6px; border-radius: 9999px; background: oklch(69.6% 0.17 162.48); }
+	.lc-jobs a { color: #9798B6; text-decoration: none; font-family: Menlo, Monaco, "Courier New", monospace; }
+	.lc-jobs a:hover { color: #f5f6ff; text-decoration: underline; }
+	.lc-msg-edit { position: absolute; top: 6px; right: 8px; padding: 2px 8px; border: 0; border-radius: 6px; background: rgba(204, 206, 239, 0.08); color: #b1b3d0; font-family: "Inter", sans-serif; font-size: 11px; cursor: pointer; opacity: 0; transition: opacity .15s; }
+	.lc-msg-user:hover .lc-msg-edit { opacity: 1; }
 	.lc-msg-user { align-self: stretch; padding: 10px 14px; background: rgba(204, 206, 239, 0.06); border: 1px solid rgba(255, 255, 255, 0.06); border-radius: 10px; color: #f5f6ff; font-size: 15px; white-space: pre-wrap; word-break: break-word; }
 	.lc-msg-ai { color: #ccceef; font-size: 15px; word-break: break-word; }
 	.lc-msg-ai pre { margin: 8px 0; padding: 10px 12px; background: #020203; border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px; overflow-x: auto; font-family: Menlo, Monaco, "Courier New", monospace; font-size: 13px; line-height: 1.5; color: #ccceef; white-space: pre; }
@@ -820,6 +1026,9 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	.lc-mention[hidden] { display: none; }
 	.lc-mention button { display: block; width: 100%; padding: 5px 8px; border: 0; border-radius: 8px; background: transparent; color: #CCCEEF; font-family: Menlo, Monaco, "Courier New", monospace; font-size: 12px; text-align: left; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 	.lc-mention button.active, .lc-mention button:hover { background: hsl(240 3.7% 15.9%); }
+	.lc-mention button { display: flex; gap: 8px; align-items: baseline; }
+	.lc-mention .lbl { flex: none; max-width: 60%; overflow: hidden; text-overflow: ellipsis; }
+	.lc-mention .det { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: #7376aa; font-family: "Inter", sans-serif; font-size: 11px; }
 	.lc-mention .empty { padding: 5px 8px; color: #7376aa; font-size: 12px; }
 	.lc-composer:focus-within { border-color: rgba(255, 255, 255, 0.2); }
 	textarea { display: block; width: 100%; max-height: 200px; padding: 10px 12px 4px; resize: none; background: transparent; border: 0; outline: none; color: #ccceef; font-family: "Inter", sans-serif; font-size: 15px; line-height: 22px; }
@@ -841,7 +1050,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 </head>
 <body>
 	<div class="lc-top">
-		<h4 class="lc-sm-title" id="eyebrow">Testnet</h4>
+		<h4 class="lc-sm-title" id="eyebrow" hidden>Testnet</h4>
 		<div class="lc-top__right"><div class="lc-top__credits" id="credits" title="Lightchain AI credits"></div><button class="lc-link" id="historyBtn">History</button><button class="lc-link" id="new">New chat</button></div>
 		<div class="lc-history" id="history" hidden></div>
 	</div>
@@ -857,7 +1066,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		<div class="lc-composer">
 			<div class="lc-mention" id="mention" hidden></div>
 			<div class="lc-chips" id="chips"></div>
-			<textarea id="input" rows="2" placeholder="Ask Lightchain AI… type @ to add a file"></textarea>
+			<textarea id="input" rows="2" placeholder="Ask Lightchain AI… @ to add context, / for commands"></textarea>
 			<div class="lc-form__row">
 				<div class="lc-model" id="modelBox">
 					<button class="lc-model__trigger" id="modelBtn" type="button" aria-haspopup="listbox" aria-expanded="false"><span class="lc-dot" id="modelDot"></span><span id="modelLogo"></span><span class="lc-model__name" id="modelLabel">Select model</span><svg class="lc-chev" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
@@ -874,9 +1083,11 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	let busy = false, current = null, currentText = '';
 
 	const esc = s => s.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+	// the model's chatter around tool steps ("Please approve the changes.", "I apologize…", "Here are the tool calls:")
+	const FILLER = /(^|\\n|(?<=[.!:]) *)(please (approve|confirm|accept|review)[^.!\\n]*[.!]?|i apologi[sz]e[^.!\\n]*[.!]|(sorry|my apologies)[^.!\\n]*[.!]|(here (is|are)|below (is|are)) the (corrected |updated |next |following )?((tool|json)[^.:!\\n]*|commands?|calls?)[.:!]?|i will now (call|use|run)[^.:!\\n]*[.:!]?)/gi;
 	function render(text) {
 		// hide tool-call JSON (shown as tool cards), render fenced code + inline code + bold
-		const visible = text.replace(/\`\`\`tool[\\s\\S]*?(\`\`\`|$)/g, '').trim();
+		const visible = text.replace(/\`\`\`(tool|json)[\\s\\S]*?(\`\`\`|$)/g, '').replace(FILLER, '').trim();
 		const parts = visible.split(/(\`\`\`[\\s\\S]*?(?:\`\`\`|$))/g);
 		return parts.map(p => {
 			if (p.startsWith('\`\`\`')) {
@@ -949,6 +1160,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		return add(step);
 	}
 	let lastTool = null;
+	const approvalUi = {}; // approval id → { done(ok, declined), inEditor() }
 	let pending = null; // the approval waiting for Accept / Reject
 
 	const input = $('input'), send = $('send');
@@ -989,6 +1201,9 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	const ctx = { file: null, selection: null, fileOff: false, mentions: [] };
 	const chipsEl = $('chips'), mentionEl = $('mention');
 	let allFiles = null, mentionIdx = 0, mentionMatches = [];
+	const labels = {}; // mention id → chip label
+	const COMMANDS = ${JSON.stringify(SLASH_COMMANDS.map(c => ({ name: c.name, hint: c.hint })))};
+	const KIND = { file: '', contract: 'contract', deployed: 'deployed', tx: 'transaction', command: '' };
 	const base = p => p.split('/').pop();
 	function renderChips() {
 		chipsEl.replaceChildren();
@@ -1001,33 +1216,52 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			const label = ctx.selection && !ctx.fileOff ? base(ctx.file) + ' · L' + ctx.selection.start + '–' + ctx.selection.end : base(ctx.file);
 			chip(label, ctx.fileOff ? ctx.file + ' (not included)' : ctx.file + ' — included with your prompt', () => { ctx.fileOff = !ctx.fileOff; renderChips(); }, ctx.fileOff);
 		}
-		ctx.mentions.forEach((m, i) => chip('@' + base(m), m, () => { ctx.mentions.splice(i, 1); renderChips(); }));
+		ctx.mentions.forEach((m, i) => chip('@' + (labels[m] || base(m)), m, () => { ctx.mentions.splice(i, 1); renderChips(); }));
 	}
 	function mentionQuery() {
 		const before = input.value.slice(0, input.selectionStart);
 		const m = /(^|\\s)@([^\\s@]*)$/.exec(before);
 		return m ? m[2] : null;
 	}
+	function slashQuery() {
+		const m = /^\\/(\\w*)$/.exec(input.value.slice(0, input.selectionStart));
+		return m ? m[1].toLowerCase() : null;
+	}
 	function showMentions() {
-		const q = mentionQuery();
-		if (q === null) { mentionEl.hidden = true; return; }
-		if (!allFiles) { vscode.postMessage({ type: 'files' }); allFiles = []; }
-		const ql = q.toLowerCase();
-		mentionMatches = allFiles.filter(f => f.toLowerCase().includes(ql) && !ctx.mentions.includes(f)).slice(0, 12);
+		const sq = slashQuery();
+		if (sq !== null) {
+			mentionMatches = COMMANDS.filter(c => c.name.startsWith(sq)).map(c => ({ id: '/' + c.name, label: '/' + c.name, detail: c.hint, kind: 'command' }));
+		} else {
+			const q = mentionQuery();
+			if (q === null) { mentionEl.hidden = true; return; }
+			if (!allFiles) { vscode.postMessage({ type: 'files' }); allFiles = []; }
+			const ql = q.toLowerCase();
+			const extra = /^0x[0-9a-f]{64}$/i.test(q) ? [{ id: 'tx:' + q, label: 'tx ' + q.slice(0, 8) + '…' + q.slice(-4), detail: 'transaction on this network', kind: 'tx' }]
+				: /^0x[0-9a-f]{40}$/i.test(q) && !allFiles.some(x => x.id.toLowerCase() === 'deployed:' + ql) ? [{ id: 'deployed:' + q, label: q.slice(0, 6) + '…' + q.slice(-4), detail: 'contract at this address', kind: 'deployed' }] : [];
+			mentionMatches = extra.concat(allFiles.filter(x => (x.label.toLowerCase().includes(ql) || x.id.toLowerCase().includes(ql)) && !ctx.mentions.includes(x.id))).slice(0, 14);
+		}
 		mentionIdx = Math.min(mentionIdx, Math.max(0, mentionMatches.length - 1));
-		mentionEl.replaceChildren(...(mentionMatches.length ? mentionMatches.map((f, i) => {
-			const b = el('button', i === mentionIdx ? 'active' : '', f); b.type = 'button';
-			b.onmousedown = e => { e.preventDefault(); pickMention(f); };
+		mentionEl.replaceChildren(...(mentionMatches.length ? mentionMatches.map((x, i) => {
+			const b = el('button', i === mentionIdx ? 'active' : ''); b.type = 'button';
+			b.append(el('span', 'lbl', x.label));
+			if (x.detail || KIND[x.kind]) b.append(el('span', 'det', x.detail || KIND[x.kind]));
+			b.onmousedown = e => { e.preventDefault(); pickMention(x); };
 			return b;
-		}) : [el('div', 'empty', allFiles.length ? 'No matching files' : 'Loading files…')]));
+		}) : [el('div', 'empty', sq !== null ? 'No such command' : allFiles.length ? 'Nothing matches — paste a 0x… address or transaction hash' : 'Loading…')]));
 		mentionEl.hidden = false;
 	}
-	function pickMention(f) {
+	function pickMention(x) {
 		const caret = input.selectionStart;
-		const before = input.value.slice(0, caret).replace(/@[^\\s@]*$/, '');
-		input.value = before + input.value.slice(caret);
-		input.selectionStart = input.selectionEnd = before.length;
-		if (!ctx.mentions.includes(f) && f !== ctx.file) ctx.mentions.push(f);
+		if (x.kind === 'command') {
+			input.value = x.label + ' ' + input.value.slice(caret).trimStart();
+			input.selectionStart = input.selectionEnd = x.label.length + 1;
+		} else {
+			const before = input.value.slice(0, caret).replace(/@[^\\s@]*$/, '');
+			input.value = before + input.value.slice(caret);
+			input.selectionStart = input.selectionEnd = before.length;
+			labels[x.id] = x.label;
+			if (!ctx.mentions.includes(x.id) && x.id !== ctx.file) ctx.mentions.push(x.id);
+		}
 		mentionEl.hidden = true; renderChips(); autosize(); syncSend(); input.focus();
 	}
 	input.addEventListener('input', () => { mentionIdx = 0; showMentions(); });
@@ -1124,6 +1358,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			case 'state':
 				lastState = m; renderSetup();
 				$('eyebrow').textContent = m.network; // the view header already says "Lightchain AI"
+				$('eyebrow').hidden = m.testnet; // only flag mainnet (real LCAI); the status bar shows the network
 				$('credits').replaceChildren();
 				if (m.account) { $('credits').append(m.credits ?? '—', Object.assign(document.createElement('span'), { textContent: m.credits === '1' ? ' credit' : ' credits' })); }
 				else { $('credits').append(Object.assign(document.createElement('span'), { textContent: 'Connect wallet' })); }
@@ -1132,7 +1367,22 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				closeBubble();
 				const u = el('div', 'lc-msg-user', m.text);
 				if (m.chips && m.chips.length) { const cs = el('div', 'lc-msg-chips'); m.chips.forEach(c => cs.append(el('span', '', c))); u.append(cs); }
+				if (m.turn) {
+					u.dataset.turn = m.turn;
+					const edit = el('button', 'lc-msg-edit', 'Edit');
+					edit.title = 'Edit and resend from here — undoes the file changes made after this message';
+					edit.onclick = () => { if (!edit.disabled) { edit.disabled = true; vscode.postMessage({ type: 'rewind', turn: m.turn, text: m.text }); setTimeout(() => { edit.disabled = false; }, 2000); } };
+					u.append(edit);
+				}
 				add(u);
+				break;
+			}
+			case 'rewound': {
+				const u = thread.querySelector('[data-turn="' + m.turn + '"]');
+				if (u) { let n = u; while (n) { const next = n.nextSibling; n.remove(); n = next; } }
+				current = null; lastTool = null; pending = null;
+				input.value = m.text || ''; autosize(); syncSend(); input.focus();
+				if (!thread.querySelector('.lc-msg-user')) { thread.replaceChildren(); if (emptyState) thread.append(emptyState); }
 				break;
 			}
 			case 'info': closeBubble(); add(el('div', 'lc-checkpoint', m.text)); break;
@@ -1142,6 +1392,12 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				row.append(el('span', 'files', 'Changed ' + m.files.map(base).join(', ')));
 				const b = smallBtn('Undo', false, () => { b.disabled = true; vscode.postMessage({ type: 'undoTurn', id: m.id }); setTimeout(() => { b.disabled = false; }, 1500); });
 				b.title = 'Restore these files to how they were before this turn';
+				// a contract was written: offer to deploy it straight from the chat
+				if (m.files.some(f => /^src\\/.*\\.sol$/.test(f))) {
+					const d = smallBtn('Deploy', false, () => vscode.postMessage({ type: 'command', command: 'lightchain.deployContract' }));
+					d.title = 'Deploy a contract from this project (build, constructor arguments, confirm)';
+					row.append(d);
+				}
 				row.append(b); add(row);
 				break;
 			}
@@ -1154,7 +1410,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				if (m.file !== ctx.file) ctx.fileOff = false;
 				ctx.file = m.file || null; ctx.selection = m.selection || null; renderChips();
 				break;
-			case 'files': allFiles = m.files || []; showMentions(); break;
+			case 'files': allFiles = m.items || []; if (!mentionEl.hidden) showMentions(); break;
 			case 'historyList': renderHistory(m.chats || []); break;
 			case 'ai': { const b = aiBubble(); currentText = m.text || ''; b.innerHTML = render(currentText); closeBubble(); break; }
 			case 'focusInput': input.focus(); break;
@@ -1182,6 +1438,8 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				lastTool = null;
 				break;
 			}
+			case 'approvalInEditor': approvalUi[m.id]?.inEditor(); break;
+			case 'approvalResolved': approvalUi[m.id]?.done(m.ok, m.declined); break;
 			case 'approval': {
 				lastTool?.remove(); // replaced by the proposal block
 				const box = el('div', 'lc-edit');
@@ -1198,14 +1456,25 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				const actions = el('div', 'lc-edit__actions');
 				const declined = new Set(); // hunks the user switched off
 				const total = m.diff ? m.diff.hunks || 0 : 0;
-				const decide = ok => {
-					pending = null;
-					vscode.postMessage({ type: 'approve', id: m.id, ok, declined: [...declined] });
+				const show = ok => {
+					if (pending === decide) pending = null;
+					delete approvalUi[m.id];
 					const partial = ok && declined.size && declined.size < total;
 					const st = el('span', 'lc-edit__state ' + (ok ? 'ok' : 'err'), ok ? (m.kind === 'command' ? 'Ran' : partial ? 'Accepted ' + (total - declined.size) + ' of ' + total : 'Accepted') : (m.kind === 'command' ? 'Skipped' : 'Rejected'));
 					actions.replaceWith(st);
+					box.querySelector('.lc-edit__where')?.remove();
 					if (!ok) box.classList.add('done');
 				};
+				const decide = ok => {
+					vscode.postMessage({ type: 'approve', id: m.id, ok, declined: [...declined] });
+					show(ok);
+				};
+				approvalUi[m.id] = {
+					// decided in the editor
+					done: (ok, decl) => { (decl || []).forEach(h => declined.add(h)); d0()?.querySelectorAll('[data-h]').forEach(x => x.classList.toggle('declined', declined.has(Number(x.dataset.h)))); show(ok); },
+					inEditor: () => { if (!box.querySelector('.lc-edit__where')) box.insertBefore(el('div', 'lc-edit__where', 'Open in the editor: accept or reject each change there, or here.'), head.nextSibling); },
+				};
+				const d0 = () => box.querySelector('.lc-diff');
 				actions.append(
 					smallBtn(m.kind === 'command' ? 'Skip' : 'Reject', false, () => decide(false)),
 					smallBtn(m.kind === 'command' ? 'Run' : 'Accept', true, () => decide(true), '⌘⏎'));
@@ -1254,7 +1523,19 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				$('modelLogo').replaceChildren(...(sel && logo(sel.name) ? [logo(sel.name)] : []));
 				break;
 			}
-			case 'turnEnd': closeBubble(); break;
+			case 'turnEnd': case 'replyEnd': closeBubble(); break;
+			case 'jobs': {
+				closeBubble();
+				const row = el('div', 'lc-jobs');
+				row.append(el('span', 'lc-jobs__dot'), el('span', '', 'Verified on Lightchain · ' + m.count + ' job' + (m.count === 1 ? '' : 's') + ' · ≈' + m.cost + ' LCAI'));
+				m.jobs.slice(-3).forEach(j => {
+					const a = el('a', '', '#' + j.id);
+					if (j.url) { a.href = '#'; a.title = 'Open the job transaction on Lightscan'; a.onclick = e => { e.preventDefault(); vscode.postMessage({ type: 'openUrl', url: j.url }); }; }
+					row.append(a);
+				});
+				add(row);
+				break;
+			}
 			case 'status': setStatus(m.text, m.walletPrompt); break;
 			case 'busy': setBusy(m.busy); if (!m.busy) { closeBubble(); clearStatus(); } break;
 			case 'error': card({ title: m.message, state: 'Failed', stateKind: 'err' }); break;
@@ -1283,6 +1564,19 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 const basename = (p: string) => p.split('/').pop() ?? p;
 
 /** One readable line for wallet/RPC/protocol errors (viem errors are multi-paragraph). */
+/** Chip text for an @-mention id. */
+function mentionLabel(m: string): string {
+	const contract = /^contract:(\w+)@/.exec(m);
+	if (contract) {
+		return contract[1];
+	}
+	const hex = /^(deployed|tx):(0x[0-9a-fA-F]+)$/.exec(m);
+	if (hex) {
+		return `${hex[1] === 'tx' ? 'tx ' : ''}${hex[2].slice(0, 6)}…${hex[2].slice(-4)}`;
+	}
+	return basename(m);
+}
+
 export function friendlyError(err: unknown, account?: { name: string; address: string }): string {
 	const e = err as { name?: string; shortMessage?: string; message?: string; details?: string; code?: number };
 	const text = `${e?.name ?? ''} ${e?.shortMessage ?? ''} ${e?.details ?? ''} ${e?.message ?? ''}`.toLowerCase();
@@ -1303,6 +1597,7 @@ function summarize(name: string, args: Record<string, any>): string {
 		case 'write_file': return `Write ${args.path}`;
 		case 'edit_file': return `Edit ${args.path}`;
 		case 'forge_build': return 'forge build';
+		case 'forge_test': return args.match ? `forge test ${args.match}` : 'forge test';
 		case 'run_command': return `$ ${args.command}`;
 		default: return name;
 	}

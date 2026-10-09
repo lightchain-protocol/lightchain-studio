@@ -31,10 +31,31 @@ export function extractReplacement(reply: string): string | undefined {
 	return code.trim() ? code : undefined;
 }
 
+/**
+ * Models sometimes answer with the whole file instead of the range. Drop the lines
+ * before and after the range that the reply repeats, so they are not pasted twice.
+ */
+export function trimEcho(replacement: string, r: InlineEditRequest): string {
+	const file = r.text.replace(/\n$/, '').split('\n');
+	const prefix = file.slice(0, r.startLine - 1);
+	const suffix = file.slice(r.endLine);
+	let out = replacement.split('\n');
+	const same = (a: string, b: string) => a.trim() === b.trim();
+	let p = 0;
+	while (p < prefix.length && p < out.length && same(out[p], prefix[p])) { p++; }
+	// only strip a real echo (from the top of the file), not a line that happens to match
+	if (p === prefix.length || p >= 3) { out = out.slice(p); }
+	let q = 0;
+	while (q < suffix.length && q < out.length && same(out[out.length - 1 - q], suffix[suffix.length - 1 - q])) { q++; }
+	if (q === suffix.length || q >= 3) { out = out.slice(0, out.length - q); }
+	return out.join('\n');
+}
+
 export async function runInlineEdit(provider: InferenceProvider, r: InlineEditRequest, signal: AbortSignal, onStatus?: StatusFn): Promise<string | undefined> {
 	let reply = '';
 	for await (const delta of provider.chat(buildInlinePrompt(r), signal, onStatus)) {
 		reply += delta;
 	}
-	return extractReplacement(reply);
+	const code = extractReplacement(reply);
+	return code === undefined ? undefined : trimEcho(code, r);
 }
