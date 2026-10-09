@@ -11,9 +11,16 @@ export interface PromptContext {
 	mentions: string[];                             // workspace-relative paths from @-mentions
 }
 
-const MAX_FILE_CHARS = 12_000;
-const MAX_TOTAL_CHARS = 30_000;
+// Small: the model's window is shared by the whole conversation (see memory.ts).
+const MAX_FILE_CHARS = 8_000;
+const MAX_TOTAL_CHARS = 14_000;
 const MAX_PROBLEMS = 20;
+
+/** Turns a non-file @-mention (deployed contract, transaction) into a context note. */
+export type MentionResolver = (mention: string) => Promise<string | undefined>;
+
+/** Something the @-picker offers: a file, a contract, a deployed contract. */
+export interface MentionItem { id: string; label: string; detail?: string; kind: 'file' | 'contract' | 'deployed' }
 
 /** Files offered in the @-mention picker. */
 export async function mentionableFiles(): Promise<string[]> {
@@ -40,12 +47,33 @@ export function editorContext(): { file?: string; selection?: { start: number; e
 }
 
 /** The context block placed before the user's request. Empty when nothing is attached. */
-export async function buildContext(ctx: PromptContext): Promise<string> {
+/**
+ * `sent`: files already attached in this session (path → content). An unchanged
+ * file is not sent again; the map is updated with what this prompt attaches.
+ */
+export async function buildContext(ctx: PromptContext, sent?: Map<string, string>, resolve?: MentionResolver): Promise<string> {
 	const root = vscode.workspace.workspaceFolders?.[0]?.uri;
 	if (!root) {
 		return '';
 	}
-	const files = [...new Set([...(ctx.file ? [ctx.file] : []), ...ctx.mentions])];
+	// mentions other than files: "contract:Name@path", "deployed:0x…", "tx:0x…"
+	const notes: string[] = [];
+	const mentionFiles: string[] = [];
+	for (const m of ctx.mentions) {
+		const contract = /^contract:(\w+)@(.+)$/.exec(m);
+		if (contract) {
+			mentionFiles.push(contract[2]);
+			notes.push(`The user means contract ${contract[1]} in ${contract[2]}.`);
+		} else if (/^(deployed|tx):/.test(m)) {
+			const text = await resolve?.(m).catch(() => undefined);
+			if (text) {
+				notes.push(text);
+			}
+		} else {
+			mentionFiles.push(m);
+		}
+	}
+	const files = [...new Set([...(ctx.file ? [ctx.file] : []), ...mentionFiles])];
 	const parts: string[] = [];
 	let total = 0;
 	for (const rel of files) {
@@ -58,6 +86,10 @@ export async function buildContext(ctx: PromptContext): Promise<string> {
 		} catch {
 			continue;
 		}
+		if (sent?.get(rel) === text) {
+			parts.push(`File ${rel}: unchanged since it was attached earlier in this conversation.`);
+			continue;
+		}
 		if (total >= MAX_TOTAL_CHARS) {
 			parts.push(`File ${rel}: (not included — context limit reached; read_file it if needed)`);
 			continue;
@@ -65,6 +97,7 @@ export async function buildContext(ctx: PromptContext): Promise<string> {
 		const room = Math.min(MAX_FILE_CHARS, MAX_TOTAL_CHARS - total);
 		const body = text.length > room ? text.slice(0, room) + '\n… (truncated — read_file for the rest)' : text;
 		total += body.length;
+		sent?.set(rel, text);
 		parts.push(`File ${rel}:\n\`\`\`\n${numbered(body)}\n\`\`\``);
 	}
 	if (ctx.file && ctx.selection) {
@@ -79,6 +112,7 @@ export async function buildContext(ctx: PromptContext): Promise<string> {
 	if (problems.length) {
 		parts.push(`Current problems:\n${problems.join('\n')}`);
 	}
+	parts.push(...notes);
 	return parts.length ? `Project context (current file contents, line-numbered — line numbers are not part of the file):\n\n${parts.join('\n\n')}\n\n---\n\n` : '';
 }
 

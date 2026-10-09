@@ -93,3 +93,27 @@ test('a rejected write is reported to the model and nothing is written', async (
 	assert.equal(fs.existsSync(path.join(root, 'src/A.sol')), false);
 	assert.match(m.seen[1], /rejected/);
 });
+
+test('test-and-fix: after a successful build the tests run, and a failure goes back to the model', async () => {
+	const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'lc-agent-')));
+	fs.mkdirSync(path.join(root, 'src'));
+	fs.mkdirSync(path.join(root, 'test'));
+	fs.writeFileSync(path.join(root, 'test/Fee.t.sol'), '// test\n');
+	// builds always pass; tests fail while the fee is 10
+	const forge = path.join(root, 'fake-forge.sh');
+	fs.writeFileSync(forge, '#!/bin/sh\nif [ "$1" = "test" ]; then if grep -q "fee = 10" src/*.sol; then echo "[FAIL: assertion failed: 10 != 5] test_fee()"; exit 1; fi; echo "Suite result: ok. 1 passed"; exit 0; fi\necho "Compiler run successful!"\n', { mode: 0o755 });
+	const m = fakeModel([
+		tool({ name: 'write_file', args: { path: 'src/Fee.sol', content: 'contract Fee { uint fee = 10; }\n' } }),
+		'Done.',
+		tool({ name: 'write_file', args: { path: 'src/Fee.sol', content: 'contract Fee { uint fee = 5; }\n' } }),
+		'Fixed: the code was wrong.',
+	]);
+	const log: string[] = [];
+	const agent = new Agent(m.provider, { root, forgePath: forge, approve: async () => true });
+	await agent.run('add a fee', events(log), new AbortController().signal);
+	assert.deepEqual(log, [
+		'start write_file', 'end write_file ok', 'start forge_build', 'end forge_build ok', 'start forge_test', 'end forge_test fail',
+		'start write_file', 'end write_file ok', 'start forge_build', 'end forge_build ok', 'start forge_test', 'end forge_test ok', 'turnEnd',
+	]);
+	assert.match(m.seen[2], /forge test failed:[\s\S]*10 != 5/);
+});

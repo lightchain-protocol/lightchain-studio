@@ -19,6 +19,11 @@ import { StartPage } from './startPage';
 import { newProject } from './newProject';
 import { registerFoundry } from './foundry';
 import { LightchainProvider } from './lightchain/provider';
+import { EditorReview } from './editorReview';
+import { InlinePrompt } from './inlinePrompt';
+import { projectMap } from './agent/projectMap';
+import { mentionItems, resolveMention, solidityFiles } from './agent/mentions';
+import { watchFailures } from './failureWatcher';
 import { ProposalStore, PROPOSAL_SCHEME } from './agent/proposals';
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -34,8 +39,21 @@ export function activate(context: vscode.ExtensionContext): void {
 	context.subscriptions.push(aiLog);
 	const interact = new InteractPanels(context, wallet, network, (address, name) => void programs.rememberName(address, name));
 	context.subscriptions.push(interact, vscode.workspace.registerTextDocumentContentProvider(PROPOSAL_SCHEME, proposals));
+	const review = new EditorReview();
+	context.subscriptions.push(review);
 	const ai = new LightchainAiView(context.extensionUri, wallet, network, credits, model => new LightchainProvider(wallet, network, model), proposals, context.globalState, context.workspaceState);
 
+	ai.review = review;
+	ai.inline = new InlinePrompt();
+	ai.projectMap = async () => {
+		const map = projectMap(await solidityFiles(), programs.relevant, network.current.label);
+		const rules = await projectRules();
+		return [rules && `Project rules (.lightchain/rules.md — follow them):\n${rules}`, map].filter(Boolean).join('\n\n');
+	};
+	ai.mentions = () => mentionItems(programs.relevant);
+	context.subscriptions.push(watchFailures((command, output) => void ai.fixFailure(command, output)));
+	ai.resolveMention = m => resolveMention(m, network.current, programs.relevant);
+	context.subscriptions.push(ai.inline);
 	const programsView = vscode.window.createTreeView('lightchain.deployedPrograms', { treeDataProvider: programs, showCollapseAll: true });
 	programs.view = programsView;
 
@@ -49,6 +67,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		vscode.commands.registerCommand('lightchain.ai.fix', (uri: vscode.Uri, problems: { line: number; endLine: number; message: string }[]) => ai.fixProblems(uri, problems)),
 		vscode.commands.registerCommand('lightchain.ai.askSelection', () => ai.askAboutSelection()),
 		vscode.commands.registerCommand('lightchain.ai.inlineEdit', () => ai.inlineEdit()),
+		vscode.commands.registerCommand('lightchain.ai.audit', (file?: string) => typeof file === 'string' && ai.audit(file)),
 		// A new active account is the default deployer, so re-sync programs.
 		wallet.onDidChange(() => programs.refresh()),
 	);
@@ -443,8 +462,7 @@ function registerStatusBar(context: vscode.ExtensionContext, wallet: Wallet, net
 		try {
 			const snap = await credits.read(account, net);
 			if (gen === generation) {
-				const c = formatLcai(snap.credits);
-				item.text = `$(key) ${shortAddress(account.address)} · ${c} ${c === '1' ? 'credit' : 'credits'} · ${net.label}`;
+				// credits are shown in the Lightchain AI panel; the tooltip keeps the details
 				item.tooltip = `${account.name}\n${account.address}\nWallet: ${formatLcai(snap.walletBalance)} LCAI\nLightchain AI credits: ${formatLcai(snap.credits)} LCAI\nLightchain ${net.label} (chain ${net.chainId})`;
 			}
 		} catch {
@@ -454,6 +472,23 @@ function registerStatusBar(context: vscode.ExtensionContext, wallet: Wallet, net
 
 	context.subscriptions.push(wallet.onDidChange(update), network.onDidChange(update), credits.onDidChange(update));
 	update();
+}
+
+/** The project's own instructions for Lightchain AI (like Cursor rules), capped. */
+async function projectRules(): Promise<string> {
+	const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+	if (!root) {
+		return '';
+	}
+	for (const name of ['.lightchain/rules.md', '.lightchainrules']) {
+		try {
+			const text = new TextDecoder().decode(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(root, name))).trim();
+			if (text) {
+				return text.length > 2_000 ? text.slice(0, 2_000) + '\n… (truncated)' : text;
+			}
+		} catch { /* not there */ }
+	}
+	return '';
 }
 
 export function deactivate(): void { }

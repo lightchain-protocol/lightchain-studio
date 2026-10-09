@@ -260,6 +260,44 @@
 				"command": "lightchain.ai.inlineEdit",
 				"title": "Edit with Lightchain AI",
 				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.review.acceptAll",
+				"title": "Accept All Lightchain AI Changes",
+				"category": "Lightchain",
+				"enablement": "lightchain.reviewing"
+			},
+			{
+				"command": "lightchain.review.rejectAll",
+				"title": "Reject All Lightchain AI Changes",
+				"category": "Lightchain",
+				"enablement": "lightchain.reviewing"
+			},
+			{
+				"command": "lightchain.review.accept",
+				"title": "Accept",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.review.reject",
+				"title": "Reject",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.inline.submit",
+				"title": "Generate",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.inline.cancel",
+				"title": "Close",
+				"icon": "$(close)",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.ai.audit",
+				"title": "Audit with Lightchain AI",
+				"category": "Lightchain"
 			}
 		],
 		"menus": {
@@ -373,6 +411,26 @@
 				{
 					"command": "lightchain.programs.interactAddress",
 					"when": "false"
+				},
+				{
+					"command": "lightchain.review.accept",
+					"when": "false"
+				},
+				{
+					"command": "lightchain.review.reject",
+					"when": "false"
+				},
+				{
+					"command": "lightchain.inline.submit",
+					"when": "false"
+				},
+				{
+					"command": "lightchain.inline.cancel",
+					"when": "false"
+				},
+				{
+					"command": "lightchain.ai.audit",
+					"when": "false"
 				}
 			],
 			"editor/title": [
@@ -399,6 +457,20 @@
 					"command": "lightchain.ai.inlineEdit",
 					"when": "editorTextFocus && !editorReadonly",
 					"group": "0_lightchain@0"
+				}
+			],
+			"comments/commentThread/context": [
+				{
+					"command": "lightchain.inline.submit",
+					"group": "inline",
+					"when": "commentController == lightchain.inline"
+				}
+			],
+			"comments/commentThread/title": [
+				{
+					"command": "lightchain.inline.cancel",
+					"group": "navigation",
+					"when": "commentController == lightchain.inline"
 				}
 			]
 		},
@@ -437,6 +509,12 @@
 					"default": "",
 					"markdownDescription": "Path to `forge`. Empty = `~/.foundry/bin/forge` or PATH.",
 					"scope": "machine"
+				},
+				"lightchain.ai.contextTokens": {
+					"type": "number",
+					"default": 8192,
+					"minimum": 2048,
+					"markdownDescription": "How much conversation (in tokens) a Lightchain AI session may hold before Studio continues it in a fresh session with a recap. Match it to the model's context window."
 				}
 			}
 		},
@@ -495,6 +573,20 @@
 				"win": "ctrl+i",
 				"linux": "ctrl+i",
 				"when": "editorTextFocus && !editorReadonly"
+			},
+			{
+				"command": "lightchain.review.acceptAll",
+				"key": "cmd+enter",
+				"win": "ctrl+enter",
+				"linux": "ctrl+enter",
+				"when": "editorTextFocus && lightchain.reviewing"
+			},
+			{
+				"command": "lightchain.review.rejectAll",
+				"key": "cmd+backspace",
+				"win": "ctrl+backspace",
+				"linux": "ctrl+backspace",
+				"when": "editorTextFocus && lightchain.reviewing"
 			}
 		]
 	}
