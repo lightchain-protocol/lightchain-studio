@@ -19,6 +19,9 @@ jobs:
 
       - name: Install
         run: npm ci
+        env:
+          # @vscode/ripgrep and Electron download from GitHub; unauthenticated requests get rate-limited (403)
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Lightchain extension (typecheck + bundle)
         working-directory: extensions/lightchain-studio/tools
