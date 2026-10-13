@@ -272,3 +272,45 @@ test('instruction store: reads rules.md, AGENTS.md and the rules folder; creates
 		done();
 	}
 });
+
+test('agents in plain words: one access choice maps to the switches and back', async () => {
+	const { accessOf, withAccess, describeAgent, profileFromDraft } = await import('../src/agent/profiles');
+	const [builder, auditor, tester] = BUILTIN_AGENTS;
+	assert.deepEqual([accessOf(builder), accessOf(auditor), accessOf(tester)], ['suggest', 'answer', 'auto']);
+	for (const level of ['answer', 'suggest', 'auto'] as const) {
+		assert.equal(accessOf(withAccess(builder, level)), level);
+	}
+	const readOnly = withAccess(builder, 'answer');
+	assert.ok(!allowedTools(readOnly).includes('write_file') && !readOnly.check);
+	assert.equal(withAccess({ ...builder, can: { ...builder.can, run: true } }, 'answer').can.run, true, 'terminal access is a separate switch');
+	assert.match(describeAgent(auditor), /never changes your files/);
+	assert.match(describeAgent(builder), /waits for your OK/);
+	assert.match(describeAgent(tester), /on its own/);
+	const made = profileFromDraft('helper', { name: 'Helper', summary: 's', role: 'r', rules: ['a'], access: 'answer', starters: [] });
+	assert.deepEqual(allowedTools(made), ['list_dir', 'read_file', 'search', 'forge_build']);
+	assert.deepEqual(profileFromMarkdown('helper', profileToMarkdown(made))!.can, made.can);
+});
+
+test('agents from a description: local draft is safe, AI reply is parsed strictly', async () => {
+	const { draftFromText, parseDraft, draftPrompt, AGENT_TEMPLATES } = await import('../src/agent/profiles');
+	const review = draftFromText('An agent that reviews my contracts for mistakes before I deploy');
+	assert.equal(review.access, 'answer');
+	assert.equal(review.name, 'Contract Reviewer');
+	assert.equal(draftFromText('Find where my contracts waste gas and explain each saving').name, 'Gas Explainer');
+	assert.equal(draftFromText('I want a helper that fixes failing tests').name, 'Test Fixer');
+	assert.match(review.role, /Never change files/);
+	const fixer = draftFromText('I want a helper that fixes failing tests');
+	assert.equal(fixer.access, 'suggest', 'changing files always asks first unless the user chose otherwise');
+	assert.equal(draftFromText('   ').name, 'New agent');
+	assert.ok(draftPrompt('x'.repeat(2_000)).length < 1_600);
+
+	const ok = parseDraft('Sure!\n```json\n{"name": "Gas Saver", "summary": "Cheaper contracts", "role": "Find wasted gas.", "rules": ["Keep behaviour", 5, ""], "access": "AUTO", "starters": ["Where is gas wasted?"]}\n```');
+	assert.deepEqual(ok, { name: 'Gas Saver', summary: 'Cheaper contracts', role: 'Find wasted gas.', rules: ['Keep behaviour'], access: 'auto', starters: ['Where is gas wasted?'] });
+	assert.equal(parseDraft('{"name": "X", "role": "Do it", "access": "root"}')!.access, 'suggest');
+	assert.equal(parseDraft('I cannot do that.'), undefined);
+	assert.equal(parseDraft('{"name": "", "role": "x"}'), undefined);
+	assert.equal(parseDraft('{broken'), undefined);
+	for (const t of AGENT_TEMPLATES) {
+		assert.ok(t.name && t.summary && t.role && t.starters.length, t.id);
+	}
+});

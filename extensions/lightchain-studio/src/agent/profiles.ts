@@ -141,17 +141,17 @@ export function profilePrompt(p: AgentProfile): string {
 }
 
 /** The steps of an agent's way of working, for the visual flow. */
-export interface FlowStep { id: 'understand' | 'read' | 'plan' | 'write' | 'build' | 'test' | 'answer'; label: string; detail: string; on: boolean }
+export interface FlowStep { id: 'understand' | 'read' | 'plan' | 'write' | 'build' | 'test' | 'answer'; label: string; /** one word, for the chat's progress strip */ short: string; detail: string; on: boolean }
 
 export function flow(p: AgentProfile): FlowStep[] {
 	return [
-		{ id: 'understand', label: 'Understand', detail: 'Reads your request, the open file and the project map', on: true },
-		{ id: 'read', label: 'Read code', detail: 'Opens and searches the project files it needs', on: p.can.read },
-		{ id: 'plan', label: 'Plan', detail: 'Decides what to do, in a few steps', on: true },
-		{ id: 'write', label: 'Change files', detail: p.can.write ? (p.approval === 'ask' ? 'Shows each change — you accept or reject' : 'Applies changes — you can undo them') : 'Not allowed: answers in the chat only', on: p.can.write },
-		{ id: 'build', label: 'Build', detail: p.check ? 'Compiles after every contract change and fixes errors' : 'Compiles when it needs to', on: p.can.build },
-		{ id: 'test', label: 'Test', detail: p.check ? 'Runs the tests and fixes failures' : 'Runs tests when asked', on: p.can.test },
-		{ id: 'answer', label: 'Summarise', detail: 'Tells you what it did and what to try next', on: true },
+		{ id: 'understand', short: 'Understand', label: 'Understands your request', detail: 'Reads what you asked, the file you have open and your project\'s instructions', on: true },
+		{ id: 'read', short: 'Read', label: 'Looks at your project', detail: 'Opens and searches the files it needs', on: p.can.read },
+		{ id: 'plan', short: 'Plan', label: 'Makes a plan', detail: 'Decides what to do, following its rules', on: true },
+		{ id: 'write', short: 'Change', label: 'Changes your files', detail: p.can.write ? (p.approval === 'ask' ? 'Shows you each change — you accept or reject it' : 'Makes the changes — you can undo them') : 'Not allowed: it only answers in the chat', on: p.can.write },
+		{ id: 'build', short: 'Check', label: 'Checks the code works', detail: p.can.build ? (p.check ? 'Compiles the contracts after every change and fixes errors' : 'Compiles the contracts when it needs to') : 'Not allowed', on: p.can.build },
+		{ id: 'test', short: 'Test', label: 'Runs the tests', detail: p.can.test ? (p.check ? 'Runs your tests after every change and fixes failures' : 'Runs your tests when you ask') : 'Not allowed', on: p.can.test },
+		{ id: 'answer', short: 'Summarise', label: 'Tells you what it did', detail: 'A short summary, and what to try next', on: true },
 	];
 }
 
@@ -325,4 +325,132 @@ export class AgentProfiles implements vscode.Disposable {
 	isCustomized(id: string): boolean {
 		return BUILTIN_AGENTS.some(b => b.id === id) && this.custom.some(c => c.id === id);
 	}
+}
+
+// ---- agents for people who do not think in tools and permissions ----------------------
+
+/** How much an agent may do on its own, as one plain choice. */
+export type Access = 'answer' | 'suggest' | 'auto';
+
+export function accessOf(p: Pick<AgentProfile, 'can' | 'approval'>): Access {
+	return !p.can.write ? 'answer' : p.approval === 'auto' ? 'auto' : 'suggest';
+}
+
+/** The switches behind each choice. Running terminal commands stays an advanced, separate switch. */
+export function withAccess<T extends Pick<AgentProfile, 'can' | 'approval' | 'check'>>(p: T, access: Access): T {
+	return access === 'answer'
+		? { ...p, can: { ...p.can, read: true, write: false, test: false }, approval: 'ask', check: false }
+		: { ...p, can: { ...p.can, read: true, write: true, build: true, test: true }, approval: access === 'auto' ? 'auto' : 'ask', check: true };
+}
+
+/** What an agent does, in one or two everyday sentences. */
+export function describeAgent(p: AgentProfile): string {
+	const checks = [p.can.build && 'checks that the code still works', p.can.test && 'runs the tests'].filter(Boolean).join(' and ');
+	if (!p.can.write) {
+		return `It looks at your project${p.can.build ? ' and can check that the code works' : ''}, and answers in the chat. It never changes your files.`;
+	}
+	const after = p.check && checks ? ` After every change it ${checks}, and fixes what it broke.` : '';
+	return p.approval === 'auto'
+		? `It makes changes on its own — you can undo any of them from the chat.${after}`
+		: `It shows you each change and waits for your OK before anything is saved.${after}`;
+}
+
+export interface AgentDraft { name: string; summary: string; role: string; rules: string[]; access: Access; starters: string[] }
+
+/** Ready-made ideas offered when creating an agent. */
+export const AGENT_TEMPLATES: (AgentDraft & { id: string })[] = [
+	{
+		id: 'reviewer', name: 'Code Reviewer', summary: 'Reads your changes and says what could go wrong', access: 'answer',
+		role: 'Review the code like a careful colleague. Point out bugs, unclear names and missing checks, and say why each one matters. Never change files.',
+		rules: ['Point at the exact line.', 'Start with the most important problem.', 'Say what is good, too.'],
+		starters: ['Review the contract I have open', 'What would you change before launch?'],
+	},
+	{
+		id: 'gas-saver', name: 'Gas Saver', summary: 'Finds where a contract costs more than it should', access: 'suggest',
+		role: 'Find where contracts waste gas: storage writes in loops, values read again and again, types that are bigger than needed. Explain each saving in plain words, then make the change.',
+		rules: ['Never change what the contract does.', 'Explain the saving before changing anything.'],
+		starters: ['Where does this contract waste gas?', 'Make the transfer function cheaper'],
+	},
+	{
+		id: 'docs-writer', name: 'Docs Writer', summary: 'Explains your contracts in comments and a README', access: 'suggest',
+		role: 'Write clear documentation: a comment above every function saying what it does and who may call it, and a README that explains the project to someone new.',
+		rules: ['Use short sentences.', 'Never change the code itself, only comments and Markdown files.'],
+		starters: ['Document every function in this contract', 'Write a README for this project'],
+	},
+	{
+		id: 'launch-helper', name: 'Launch Helper', summary: 'Walks you through putting a contract on Lightchain', access: 'answer',
+		role: 'Guide the user through deploying to Lightchain testnet and then mainnet, one step at a time: what to check first, what each step costs, and how to confirm it worked. Ask before moving to the next step.',
+		rules: ['Always start on testnet.', 'Explain every cost in LCAI.', 'One step at a time.'],
+		starters: ['Help me deploy this to testnet', 'What should I check before mainnet?'],
+	},
+	{
+		id: 'tutor', name: 'Tutor', summary: 'Teaches blockchain development with your own project', access: 'answer',
+		role: 'Teach the user to build on Lightchain using their own project as the example. Explain one idea at a time, check they followed, and give a small exercise. Never write the answer for them unless they ask.',
+		rules: ['Avoid jargon, or explain it the first time.', 'End with one small exercise.'],
+		starters: ['Teach me how this contract works', 'What should I learn next?'],
+	},
+];
+
+/** A draft made on this machine from a description (no AI): good enough to adjust, never wrong about safety. */
+export function draftFromText(description: string): AgentDraft {
+	const text = description.trim().replace(/\s+/g, ' ');
+	const words = text.replace(/^(an?|the)\s+(agent|helper|assistant)\s+(that|which|to|who)\s+/i, '').replace(/^(i (want|need)|please|create|make)\s+(an?\s+)?((agent|helper|assistant)\s+)?(that|which|to|who)?\s*/i, '');
+	const about = words.toLowerCase();
+	const readOnly = /\b(review|audit|explain|teach|check|find|look for|answer|guide|advis|tell me|never change|read[- ]only)/.test(about) && !/\b(fix|write|add|creat|chang|updat|refactor|generat|make|build)/.test(about);
+	// a name people would give it: what it works on + what it does ("Gas Finder", "Contract Reviewer")
+	const role = ([['audit', 'Auditor'], ['review', 'Reviewer'], ['explain', 'Explainer'], ['teach', 'Tutor'], ['document', 'Writer'], ['fix', 'Fixer'], ['optimi', 'Optimizer'], ['check', 'Checker'], ['find', 'Finder'], ['deploy', 'Helper'], ['write', 'Writer'], ['test', 'Tester']] as const).find(([verb]) => new RegExp(`\\b${verb}`).test(about))?.[1];
+	const topic = ([['gas', 'Gas'], ['secur', 'Security'], ['test', 'Test'], ['doc', 'Docs'], ['readme', 'Docs'], ['token', 'Token'], ['contract', 'Contract'], ['deploy', 'Deploy']] as const).find(([word, label]) => new RegExp(`\\b${word}`).test(about) && !role?.startsWith(label))?.[1];
+	const plain = (words.match(/[A-Za-z][A-Za-z0-9-]*/g) ?? []).filter(w => w.length > 2 && !/^(that|which|and|the|for|with|our|all|any|where|what|when|how|each|every|before|after|find|check|make|help|does|can|should|will)$/i.test(w)).slice(0, 2).map(w => w[0].toUpperCase() + w.slice(1).toLowerCase()).join(' ');
+	const name = (role ? `${topic ?? plain.split(' ')[0] ?? ''} ${role}`.trim() : topic ? `${topic} Helper` : plain) || 'New agent';
+	const sentence = words ? words[0].toUpperCase() + words.slice(1) : '';
+	return {
+		name: name.slice(0, 40),
+		summary: (sentence.length > 110 ? sentence.slice(0, 107) + '…' : sentence).replace(/\.$/, ''),
+		role: sentence ? `${sentence.replace(/\.$/, '')}.${readOnly ? ' Never change files; answer in the chat.' : ''}` : '',
+		rules: [],
+		access: readOnly ? 'answer' : 'suggest',
+		starters: [],
+	};
+}
+
+/** Asks the model to design an agent from a description. */
+export function draftPrompt(description: string): string {
+	return [
+		'Design a coding helper ("agent") for Lightchain Studio, an IDE for building smart contracts (Solidity, Foundry) on the Lightchain AI blockchain.',
+		`The user describes the helper they want: "${description.trim().slice(0, 600)}"`,
+		'',
+		'Reply with ONLY a JSON object, no other text:',
+		'{"name": "2-3 words", "summary": "one short line", "role": "2-4 sentences telling the agent what to do, addressed to the agent", "rules": ["up to 4 short rules"], "access": "answer | suggest | auto", "starters": ["2-3 example requests a user could click"]}',
+		'',
+		'access: "answer" if it should only read and explain and never change files; "suggest" if it changes files and the user approves each change (the default); "auto" only if the user clearly asks for it to work without asking.',
+	].join('\n');
+}
+
+/** Reads the model's reply to `draftPrompt`; undefined when it is not usable. */
+export function parseDraft(reply: string): AgentDraft | undefined {
+	const start = reply.indexOf('{');
+	const end = reply.lastIndexOf('}');
+	if (start < 0 || end <= start) {
+		return undefined;
+	}
+	try {
+		const raw = JSON.parse(reply.slice(start, end + 1));
+		const str = (v: unknown, max: number) => typeof v === 'string' ? v.trim().slice(0, max) : '';
+		const list = (v: unknown, n: number, max: number) => Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && !!x.trim()).map(x => x.trim().slice(0, max)).slice(0, n) : [];
+		const name = str(raw.name, 40);
+		const role = str(raw.role, 2_000);
+		if (!name || !role) {
+			return undefined;
+		}
+		const access = String(raw.access ?? '').trim().toLowerCase();
+		return { name, summary: str(raw.summary, 120), role, rules: list(raw.rules, 6, 200), access: access === 'answer' || access === 'auto' ? access : 'suggest', starters: list(raw.starters, 3, 120) };
+	} catch {
+		return undefined;
+	}
+}
+
+/** A full agent from a draft. */
+export function profileFromDraft(id: string, d: AgentDraft): AgentProfile {
+	const base: AgentProfile = { id, name: d.name || 'New agent', color: '#7130C3', glyph: (d.name || 'NA').slice(0, 2).toUpperCase(), summary: d.summary, role: d.role, rules: d.rules, can: { read: true, write: false, build: true, test: false, run: false }, approval: 'ask', check: false, starters: d.starters };
+	return withAccess(base, d.access);
 }

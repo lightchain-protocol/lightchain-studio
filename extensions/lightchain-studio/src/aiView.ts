@@ -792,7 +792,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	postAgents(): void {
 		const all = this.profiles?.all ?? [];
 		const cur = this.profile();
-		const strip = (p: AgentProfile) => ({ id: p.id, edited: BUILTIN_IDS.has(p.id) && !!this.profiles?.isCustomized(p.id), custom: !BUILTIN_IDS.has(p.id), name: p.name, glyph: p.glyph, color: p.color, summary: p.summary, starters: p.starters.filter(Boolean), steps: flow(p).filter(s => s.on).map(s => ({ id: s.id, label: s.label })) });
+		const strip = (p: AgentProfile) => ({ id: p.id, edited: BUILTIN_IDS.has(p.id) && !!this.profiles?.isCustomized(p.id), custom: !BUILTIN_IDS.has(p.id), name: p.name, glyph: p.glyph, color: p.color, summary: p.summary, starters: p.starters.filter(Boolean), steps: flow(p).filter(s => s.on).map(s => ({ id: s.id, label: s.short })) });
 		this.view?.webview.postMessage({ type: 'agents', agents: all.map(strip), current: cur ? strip(cur) : undefined });
 	}
 

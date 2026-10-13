@@ -76,12 +76,12 @@ export function activate(context: vscode.ExtensionContext): void {
 	const localIndex = new WorkspaceIndex();
 	ai.rules = rules;
 	ai.localSearch = async (query, exclude) => localIndex.enabled ? localIndex.search(query, exclude) : [];
-	const studio = new AgentStudio(context.extensionUri, profiles, rules, localIndex, () => ai.modelNames(), (id, prompt) => ai.useAgent(id, prompt), () => ai.projectMap?.() ?? Promise.resolve(''));
+	const studio = new AgentStudio(context.extensionUri, profiles, rules, localIndex, () => ai.modelNames(), (id, prompt) => ai.useAgent(id, prompt), () => ai.projectMap?.() ?? Promise.resolve(''), () => ai.sideProvider());
 	context.subscriptions.push(profiles, rules, studio, profiles.onDidChange(() => ai.postAgents()),
 		vscode.commands.registerCommand('lightchain.rules.open', (id?: string) => studio.open(undefined, 'rules', typeof id === 'string' ? id : undefined)),
 		vscode.commands.registerCommand('lightchain.rules.new', () => studio.createRule()),
 		vscode.commands.registerCommand('lightchain.agents.open', (id?: string) => studio.open(typeof id === 'string' ? id : undefined)),
-		vscode.commands.registerCommand('lightchain.agents.new', () => studio.create()));
+		vscode.commands.registerCommand('lightchain.agents.new', () => studio.startNew()));
 	const tasks = new TaskStore();
 	ai.tasks = tasks;
 	const board = new BoardPanel(context.extensionUri, tasks, t => ai.runTask(t), goal => ai.plan(goal));

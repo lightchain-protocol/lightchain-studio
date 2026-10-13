@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
-import { AGENTS_DIR, AgentProfile, AgentProfiles, BUILTIN_AGENTS, flow } from './agent/profiles';
+import { AGENTS_DIR, AGENT_TEMPLATES, AgentDraft, AgentProfile, AgentProfiles, BUILTIN_AGENTS, draftFromText, draftPrompt, flow, parseDraft, profileFromDraft } from './agent/profiles';
+import type { InferenceProvider } from './agent/agent';
 import { RULES_BUDGET, RULES_DIR, Rule, RuleStore, renderRules } from './agent/rules';
 import { WorkspaceIndex } from './agent/workspaceIndex';
 import { estimateTokens } from './agent/memory';
@@ -32,6 +33,8 @@ export class AgentStudio implements vscode.Disposable {
 		private readonly models: () => string[],
 		private readonly use: (id: string, prompt?: string) => Promise<void>,
 		private readonly projectMap: () => Promise<string>,
+		/** A one-off Lightchain AI request (drafting an agent); undefined without a wallet or model. */
+		private readonly sideProvider: () => InferenceProvider | undefined = () => undefined,
 	) {
 		this.disposables.push(profiles.onDidChange(() => this.push()), rules.onDidChange(() => this.push()));
 	}
@@ -71,6 +74,41 @@ export class AgentStudio implements vscode.Disposable {
 		this.open(id);
 	}
 
+	/** Opens the Studio on the guided "new agent" setup. */
+	startNew(): void {
+		this.open(undefined, 'agents');
+		void this.panel?.webview.postMessage({ type: 'wizard' });
+	}
+
+	/**
+	 * Turns a description into a draft agent: Lightchain AI writes it when a wallet
+	 * is connected (one request); otherwise, or if that fails, it is drafted here.
+	 */
+	private async draft(description: string): Promise<void> {
+		const post = (draft: AgentDraft, by: 'ai' | 'local', note?: string) => void this.panel?.webview.postMessage({ type: 'drafted', draft, by, note });
+		if (!description.trim()) {
+			return;
+		}
+		const provider = this.sideProvider();
+		if (!provider) {
+			return post(draftFromText(description), 'local');
+		}
+		const abort = new AbortController();
+		const timer = setTimeout(() => abort.abort(), 90_000);
+		try {
+			let reply = '';
+			for await (const delta of provider.chat([{ role: 'user', content: draftPrompt(description) }], abort.signal, status => void this.panel?.webview.postMessage({ type: 'draftStatus', text: status }))) {
+				reply += delta;
+			}
+			const draft = parseDraft(reply);
+			post(draft ?? draftFromText(description), draft ? 'ai' : 'local', draft ? undefined : 'Lightchain AI answered in a form Studio could not read, so this is a simple draft. Adjust it below.');
+		} catch (err) {
+			post(draftFromText(description), 'local', `Lightchain AI was not available (${(err as Error).message.split('\n')[0].slice(0, 120)}), so this is a simple draft. Adjust it below.`);
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
 	/** A new instruction file, opened for writing. */
 	async createRule(): Promise<void> {
 		const rule = await this.rules.create();
@@ -97,6 +135,7 @@ export class AgentStudio implements vscode.Disposable {
 		void this.panel?.webview.postMessage({
 			type: 'state', tab: this.tab, agents, selected: this.selected, models: this.models(), hasProject: !!vscode.workspace.workspaceFolders?.length,
 			rules, selectedRule: this.selectedRule, budget: RULES_BUDGET, used: sent.text.length, rulesDir: RULES_DIR,
+			templates: AGENT_TEMPLATES, canDraftWithAi: !!this.sideProvider(),
 		});
 	}
 
@@ -123,6 +162,20 @@ export class AgentStudio implements vscode.Disposable {
 			switch (m?.type) {
 				case 'ready':
 					return this.push();
+				case 'newAgent':
+					// the guided setup, e.g. from the chat's "+ New agent"
+					this.open(undefined, 'agents');
+					void this.panel?.webview.postMessage({ type: 'wizard' });
+					return;
+				case 'draft':
+					return this.draft(String(m.description ?? ''));
+				case 'createFrom': {
+					const d = m.draft as AgentDraft;
+					const id = this.profiles.newId(String(d?.name || 'New agent'));
+					await this.profiles.put(profileFromDraft(id, { name: String(d?.name || 'New agent'), summary: String(d?.summary ?? ''), role: String(d?.role ?? ''), rules: Array.isArray(d?.rules) ? d.rules : [], access: d?.access === 'answer' || d?.access === 'auto' ? d.access : 'suggest', starters: Array.isArray(d?.starters) ? d.starters : [] }));
+					this.selected = id;
+					return this.push();
+				}
 				case 'tab':
 					this.tab = m.tab === 'rules' || m.tab === 'context' ? m.tab : 'agents';
 					this.push();
@@ -295,6 +348,39 @@ export class AgentStudio implements vscode.Disposable {
 	.manage { display: flex; gap: 8px; flex-wrap: wrap; }
 	.path { display: block; margin-bottom: 10px; color: var(--lc-text-secondary); font-size: 12px; word-break: break-all; }
 
+	/* plain-language summary of the selected agent */
+	.say { max-width: 580px; margin: 0 0 20px; padding: 12px 16px; border-radius: 14px; border: 1px solid var(--zap); background: rgba(91, 75, 255, 0.06); color: var(--lc-text-primary); font-size: 13.5px; line-height: 1.55; }
+	/* one plain choice instead of five switches */
+	.choice { display: flex; align-items: flex-start; gap: 12px; width: 100%; margin-bottom: 8px; padding: 11px 12px; border: 1px solid var(--zap); border-radius: 12px; background: transparent; color: var(--lc-text-primary); text-align: left; cursor: pointer; transition: border-color .2s ease, background .2s ease; }
+	.choice:last-child { margin-bottom: 0; }
+	.choice:hover { border-color: var(--zap-strong); }
+	.choice.on { border-color: var(--lc-accent); background: rgba(91, 75, 255, 0.1); }
+	.choice .dot { flex: none; width: 16px; height: 16px; margin-top: 2px; border: 2px solid var(--lc-rule-strong); border-radius: 50%; transition: all .2s ease; }
+	.choice.on .dot { border-color: var(--lc-accent); background: radial-gradient(var(--lc-accent) 45%, transparent 50%); }
+	.choice__text { display: flex; flex-direction: column; }
+	.choice__title { font-size: 13.5px; font-weight: 500; line-height: 1.4; }
+	.choice__help { color: var(--lc-text-tertiary); font-size: 12px; line-height: 1.45; }
+	.more { display: flex; align-items: center; justify-content: space-between; width: 100%; padding: 10px 16px; border: 1px dashed var(--zap-strong); border-radius: 14px; background: transparent; color: var(--lc-text-secondary); font-size: 13px; cursor: pointer; transition: border-color .2s ease, color .2s ease; }
+	.more:hover { border-color: var(--lc-accent); color: var(--lc-text-strong); }
+	.more small { color: var(--lc-text-tertiary); font-size: 12px; }
+
+	/* new agent: describe it, or start from a ready-made one */
+	.wiz { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; padding: 20px; background: rgba(7, 7, 16, 0.78); backdrop-filter: blur(6px); animation: fadeIn var(--lc-motion) ease; }
+	.wiz__card { width: 100%; max-width: 620px; max-height: 100%; overflow-y: auto; padding: 24px; border: 1px solid var(--lc-rule-strong); border-radius: 16px; background: var(--lc-surface-2); box-shadow: 0 24px 80px rgba(0, 0, 0, 0.5); }
+	.wiz__card h2 { margin: 0 0 4px; color: var(--lc-text-strong); font-size: 20px; font-weight: 600; letter-spacing: -0.02em; }
+	.wiz__card > p { margin: 0 0 16px; color: var(--lc-text-tertiary); font-size: 13px; }
+	.wiz label { display: block; margin: 16px 0 6px; color: var(--lc-text-secondary); font-size: 12px; }
+	.wiz textarea.input { min-height: 76px; }
+	.wiz__row { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+	.wiz__hint { flex: 1; color: var(--lc-text-tertiary); font-size: 12px; line-height: 1.45; }
+	.wiz__hint.warn { color: var(--lc-warning); }
+	.ideas { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 8px; }
+	.idea { padding: 10px 12px; border: 1px solid var(--zap); border-radius: 12px; background: transparent; color: var(--lc-text-primary); text-align: left; cursor: pointer; transition: border-color .2s ease, background .2s ease; }
+	.idea:hover, .idea.on { border-color: var(--lc-accent); background: rgba(91, 75, 255, 0.1); }
+	.idea b { display: block; font-size: 13px; font-weight: 500; }
+	.idea span { display: block; margin-top: 2px; color: var(--lc-text-tertiary); font-size: 12px; line-height: 1.4; }
+	.wiz__foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+
 	/* instructions: list, editor, what the AI receives */
 	.pill.warn { border-color: transparent; background: rgba(255, 143, 60, 0.14); color: var(--lc-warning); }
 	.r-edit { display: flex; flex-direction: column; gap: 12px; min-height: 0; padding: 22px 28px 24px; overflow-y: auto; }
@@ -375,17 +461,20 @@ export class AgentStudio implements vscode.Disposable {
 		<div class="c-main" id="cmain"></div>
 		<div class="s-props" id="cside"></div>
 	</div>
+<div class="wiz" id="wiz" hidden></div>
 <script nonce="${nonce}">
 	const vscode = acquireVsCodeApi();
 	${IDENTICON_JS}
 	const $ = id => document.getElementById(id);
 	const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
-	let state = { tab: 'agents', agents: [], selected: null, models: [], hasProject: true, rules: [], selectedRule: null, budget: 2400, used: 0, rulesDir: '' };
+	let state = { tab: 'agents', agents: [], selected: null, models: [], hasProject: true, rules: [], selectedRule: null, budget: 2400, used: 0, rulesDir: '', templates: [], canDraftWithAi: false };
 	let draft = null, focusSec = null, saveTimer = null;
 	let ruleDraft = null, ruleTimer = null;
+	let advanced = !!(vscode.getState() || {}).advanced;
+	let wiz = null; // the new-agent setup: { description, draft, busy, note, by, picked }
 	let context = null, hits = null, query = '', searchTimer = null;
 	const LEADS = {
-		agents: 'See how each agent works and change it with switches and sentences. No code.',
+		agents: 'Agents are helpers with a job. Pick one to see how it works, change it in plain words, or make your own.',
 		rules: 'What every agent keeps in mind in this project. Plain Markdown files your team shares through git.',
 		context: 'What Lightchain AI knows about your code. Found on this machine, never uploaded.',
 	};
@@ -429,24 +518,48 @@ export class AgentStudio implements vscode.Disposable {
 			const c = el('button', 's-card' + (a.id === state.selected ? ' sel' : ''));
 			const g = el('span', 'glyph'); g.innerHTML = lcIdenticon('agent:' + a.id);
 			const t = el('span', 's-card__text'); t.append(el('span', 's-card__name', a.name), el('span', 's-card__sum', a.summary || 'No description yet'));
-			const k = el('span', 's-card__kind'); k.append(el('span', 'pill', a.kind === 'builtin' ? 'Built-in' : a.kind === 'customized' ? 'Edited' : 'This project')); t.append(k);
+			const k = el('span', 's-card__kind'); k.append(el('span', 'pill', a.kind === 'builtin' ? 'Ready-made' : a.kind === 'customized' ? 'Changed by you' : 'Yours')); t.append(k);
 			c.append(g, t);
 			c.onclick = () => { if (a.id !== state.selected) { focusSec = null; vscode.postMessage({ type: 'select', id: a.id }); } };
 			box.append(c);
 		});
-		const n = el('button', 'button button-sm button-block s-new', '+ New agent'); n.onclick = () => vscode.postMessage({ type: 'create' }); box.append(n);
+		const n = el('button', 'button button-sm button-block s-new', '+ New agent'); n.onclick = () => openWizard(); box.append(n);
 	}
 
 	function computeFlow(p) {
 		return [
-			{ id: 'understand', label: 'Understand', detail: 'Reads your request, the open file and the project map', on: true, sec: 'job' },
-			{ id: 'read', label: 'Read code', detail: 'Opens and searches the project files it needs', on: p.can.read, sec: 'can' },
-			{ id: 'plan', label: 'Plan', detail: 'Decides what to do, following its rules', on: true, sec: 'rules' },
-			{ id: 'write', label: 'Change files', detail: p.can.write ? (p.approval === 'ask' ? 'Shows each change — you accept or reject' : 'Applies changes — you can undo them') : 'Not allowed: answers in the chat only', on: p.can.write, sec: 'safety' },
-			{ id: 'build', label: 'Build', detail: p.can.build ? (p.check ? 'Compiles after every contract change and fixes errors' : 'Compiles when it needs to') : 'Not allowed', on: p.can.build, sec: 'checks' },
-			{ id: 'test', label: 'Test', detail: p.can.test ? (p.check ? 'Runs the tests and fixes failures' : 'Runs tests when asked') : 'Not allowed', on: p.can.test, sec: 'checks' },
-			{ id: 'answer', label: 'Summarise', detail: 'Tells you what it did and what to try next', on: true, sec: 'job' },
+			{ id: 'understand', label: 'Understands your request', detail: 'Reads what you asked, the file you have open and the instructions of your project', on: true, sec: 'job' },
+			{ id: 'read', label: 'Looks at your project', detail: 'Opens and searches the files it needs', on: p.can.read, sec: 'access' },
+			{ id: 'plan', label: 'Makes a plan', detail: 'Decides what to do, following its rules', on: true, sec: 'rules' },
+			{ id: 'write', label: 'Changes your files', detail: p.can.write ? (p.approval === 'ask' ? 'Shows you each change — you accept or reject it' : 'Makes the changes — you can undo them') : 'Not allowed: it only answers in the chat', on: p.can.write, sec: 'access' },
+			{ id: 'build', label: 'Checks the code works', detail: p.can.build ? (p.check ? 'Compiles the contracts after every change and fixes errors' : 'Compiles the contracts when it needs to') : 'Not allowed', on: p.can.build, sec: 'access' },
+			{ id: 'test', label: 'Runs the tests', detail: p.can.test ? (p.check ? 'Runs your tests after every change and fixes failures' : 'Runs your tests when you ask') : 'Not allowed', on: p.can.test, sec: 'access' },
+			{ id: 'answer', label: 'Tells you what it did', detail: 'A short summary, and what to try next', on: true, sec: 'job' },
 		];
+	}
+	// the same wording as describeAgent / accessOf / withAccess in agent/profiles.ts
+	const accessOf = p => !p.can.write ? 'answer' : p.approval === 'auto' ? 'auto' : 'suggest';
+	function setAccess(p, a) {
+		if (a === 'answer') { p.can.read = true; p.can.write = false; p.can.test = false; p.approval = 'ask'; p.check = false; }
+		else { p.can.read = true; p.can.write = true; p.can.build = true; p.can.test = true; p.approval = a === 'auto' ? 'auto' : 'ask'; p.check = true; }
+	}
+	function describe(p) {
+		const checks = [p.can.build && 'checks that the code still works', p.can.test && 'runs the tests'].filter(Boolean).join(' and ');
+		if (!p.can.write) return 'It looks at your project' + (p.can.build ? ' and can check that the code works' : '') + ', and answers in the chat. It never changes your files.';
+		const after = p.check && checks ? ' After every change it ' + checks + ', and fixes what it broke.' : '';
+		return p.approval === 'auto' ? 'It makes changes on its own — you can undo any of them from the chat.' + after : 'It shows you each change and waits for your OK before anything is saved.' + after;
+	}
+	const ACCESS = [
+		['answer', 'Only answer', 'It reads your project and explains. It can never change a file.'],
+		['suggest', 'Suggest changes', 'It shows you each change and you accept or reject it.'],
+		['auto', 'Work on its own', 'It makes the changes right away. You can undo them from the chat.'],
+	];
+	function accessChoices(current, pick) {
+		return ACCESS.map(([key, title, help]) => {
+			const b = el('button', 'choice' + (current === key ? ' on' : '')); b.type = 'button';
+			const t = el('span', 'choice__text'); t.append(el('span', 'choice__title', title), el('span', 'choice__help', help));
+			b.append(el('span', 'dot'), t); b.onclick = () => pick(key); return b;
+		});
 	}
 
 	function renderFlow() {
@@ -455,6 +568,7 @@ export class AgentStudio implements vscode.Disposable {
 		const head = el('div', 's-flow__head'); const g = el('span', 'glyph'); g.innerHTML = lcIdenticon('agent:' + p.id);
 		const ht = el('div'); ht.append(el('div', 's-flow__name', p.name), el('div', 's-flow__role', p.role || 'Describe its job on the right to tell this agent what it is for.'));
 		head.append(g, ht); box.append(head);
+		box.append(el('div', 'say', describe(p)));
 		const steps = computeFlow(p);
 		steps.forEach((s, i) => {
 			if (i) box.append(el('div', 'link'));
@@ -469,7 +583,7 @@ export class AgentStudio implements vscode.Disposable {
 		});
 		const tr = el('div', 's-try zpanel'); tr.append(el('div', 'zlabel', 'Try ' + p.name));
 		const chips = el('div', 'chips');
-		(p.starters.length ? p.starters : ['Explain this project']).forEach(sx => { const c = el('button', 'tchip', sx); c.onclick = () => vscode.postMessage({ type: 'use', id: p.id, prompt: sx }); chips.append(c); });
+		(p.starters.filter(Boolean).length ? p.starters.filter(Boolean) : ['Explain this project']).forEach(sx => { const c = el('button', 'tchip', sx); c.onclick = () => vscode.postMessage({ type: 'use', id: p.id, prompt: sx }); chips.append(c); });
 		tr.append(chips); box.append(tr);
 	}
 
@@ -499,13 +613,16 @@ export class AgentStudio implements vscode.Disposable {
 			rr.append(ri, x); rules.append(rr);
 		});
 		if (p.rules.length < 12) { const add = el('button', 'button button-xs', '+ Add rule'); add.onclick = () => { change(d => { d.rules.push(''); }); renderProps(); const ins = document.querySelectorAll('[data-sec="rules"] input'); ins[ins.length - 1]?.focus(); }; rules.append(add); }
+		// one plain choice; the single switches live under "More settings"
+		const access = section('access', 'What may it do?', 'Pick how much this agent does on its own.');
+		access.append(...accessChoices(accessOf(p), key => { change(d => setAccess(d, key)); renderProps(); }));
 		// permissions
-		const can = section('can', 'What it may do', 'Switch off anything this agent should never touch.');
+		const can = section('can', 'Exactly what it may do', 'Switch off anything this agent should never touch.');
 		const perm = (k, title, help) => can.append(toggle(title, help, p.can[k], () => change(d => { d.can[k] = !d.can[k]; })));
-		perm('read', 'Read your code', 'Open and search files in the project');
+		perm('read', 'Look at your project', 'Open and search files');
 		perm('write', 'Change files', 'Create and edit contracts, tests and scripts');
-		perm('build', 'Build', 'Compile the contracts with Foundry');
-		perm('test', 'Run tests', 'Run forge test and read the results');
+		perm('build', 'Check the code works', 'Compile the contracts (forge build)');
+		perm('test', 'Run the tests', 'Run your tests and read the results (forge test)');
 		perm('run', 'Run terminal commands', 'Advanced — always asks you before each command');
 		// safety
 		const safety = section('safety', 'When it changes files');
@@ -515,10 +632,10 @@ export class AgentStudio implements vscode.Disposable {
 		safety.append(radio);
 		if (!p.can.write) safety.append(el('div', 'note', 'This agent may not change files, so this does not apply.'));
 		// checks
-		const checks = section('checks', 'Checks');
-		checks.append(toggle('Build and test after every change', 'Fixes compile errors and failing tests on its own (up to 2 rounds)', p.check, () => change(d => { d.check = !d.check; })));
+		const checks = section('checks', 'Double-checking');
+		checks.append(toggle('Check and test after every change', 'It fixes errors and failing tests on its own (up to 2 tries)', p.check, () => change(d => { d.check = !d.check; })));
 		// model
-		const model = section('model', 'Model');
+		const model = section('model', 'AI model', 'Which Lightchain model this agent thinks with.');
 		const ms = el('select', 'input'); const none = el('option', '', 'Same as the chat'); none.value = ''; ms.append(none);
 		state.models.forEach(m => { const o = el('option', '', m); o.value = m; o.selected = m === p.model; ms.append(o); });
 		ms.onchange = () => change(d => { d.model = ms.value || undefined; }); model.append(ms);
@@ -532,9 +649,68 @@ export class AgentStudio implements vscode.Disposable {
 		mrow.append(md, dup); mg.append(mrow);
 		if (p.kind !== 'builtin') { const rm = el('button', 'button button-xs', p.kind === 'customized' ? 'Reset to default' : 'Delete agent'); rm.onclick = () => vscode.postMessage({ type: 'remove', id: p.id }); mrow.append(rm); }
 		mg.append(el('div', 'note', p.kind === 'builtin' ? 'Built-in agent. Change anything here, or edit it as Markdown, and a copy is saved for this project.' : 'Saved as ' + p.file + ' — a Markdown file you can also write by hand and share through git.'));
-		box.append(id, job, rules, can, safety, checks, model, st, mg);
+		const more = el('button', 'more'); more.type = 'button';
+		more.append(el('span', '', advanced ? 'Fewer settings' : 'More settings'), el('small', '', advanced ? '' : 'single permissions, AI model, example requests'));
+		more.onclick = () => { advanced = !advanced; vscode.setState({ advanced }); renderProps(); };
+		box.append(id, job, rules, access, ...(advanced ? [can, safety, checks, model, st] : []), more, mg);
 		box.scrollTop = top;
 	}
+
+	// ---- new agent: describe it, or start from a ready-made one ----
+	function openWizard() {
+		wiz = { description: '', busy: false, note: '', warn: false, picked: null, draft: { name: '', summary: '', role: '', rules: [], access: 'suggest', starters: [] } };
+		renderWizard();
+		const first = document.getElementById('wizDesc'); if (first) first.focus();
+	}
+	function closeWizard() { wiz = null; $('wiz').hidden = true; $('wiz').replaceChildren(); }
+	function renderWizard() {
+		const box = $('wiz'); if (!wiz) { box.hidden = true; return; }
+		const keep = document.activeElement && document.activeElement.id; const caret = keep ? document.activeElement.selectionStart : null;
+		const card = el('div', 'wiz__card');
+		card.append(el('h2', '', 'New agent'), el('p', '', 'An agent is a helper with one job. Say what you need in your own words, or start from a ready-made one.'));
+		const dl = el('label', '', 'What should it help you with?'); dl.htmlFor = 'wizDesc';
+		const desc = el('textarea', 'input'); desc.id = 'wizDesc'; desc.value = wiz.description; desc.maxLength = 600; desc.placeholder = 'e.g. Check my contracts for mistakes before I deploy and explain each one simply';
+		desc.oninput = () => { wiz.description = desc.value; draftBtn.disabled = wiz.busy || !desc.value.trim(); };
+		const row = el('div', 'wiz__row');
+		const hint = el('span', 'wiz__hint' + (wiz.warn ? ' warn' : ''), wiz.note || (state.canDraftWithAi ? 'Lightchain AI writes the agent from your description (one request).' : 'Studio drafts the agent from your description. Connect a wallet to let Lightchain AI write it.'));
+		const draftBtn = el('button', 'button button-sm', wiz.busy ? 'Writing…' : 'Write it for me'); draftBtn.type = 'button'; draftBtn.disabled = wiz.busy || !wiz.description.trim();
+		draftBtn.onclick = () => { wiz.busy = true; wiz.note = 'Writing your agent…'; wiz.warn = false; renderWizard(); vscode.postMessage({ type: 'draft', description: wiz.description }); };
+		row.append(hint, draftBtn);
+		card.append(dl, desc, row);
+		card.append(el('label', '', 'Or start from a ready-made one'));
+		const ideas = el('div', 'ideas');
+		(state.templates || []).forEach(t => {
+			const b = el('button', 'idea' + (wiz.picked === t.id ? ' on' : '')); b.type = 'button'; b.append(el('b', '', t.name), el('span', '', t.summary));
+			b.onclick = () => { wiz.picked = t.id; wiz.draft = { name: t.name, summary: t.summary, role: t.role, rules: t.rules.slice(), access: t.access, starters: t.starters.slice() }; wiz.note = ''; wiz.warn = false; renderWizard(); };
+			ideas.append(b);
+		});
+		card.append(ideas);
+		const nl = el('label', '', 'Name'); nl.htmlFor = 'wizName';
+		const name = el('input', 'input'); name.id = 'wizName'; name.value = wiz.draft.name; name.maxLength = 40; name.placeholder = 'e.g. Safety Checker';
+		name.oninput = () => { wiz.draft.name = name.value; create.disabled = !name.value.trim(); };
+		card.append(nl, name);
+		if (wiz.draft.role) {
+			const jl = el('label', '', 'Its job'); jl.htmlFor = 'wizJob';
+			const job = el('textarea', 'input'); job.id = 'wizJob'; job.value = wiz.draft.role; job.maxLength = 2000; job.oninput = () => { wiz.draft.role = job.value; };
+			card.append(jl, job);
+		}
+		card.append(el('label', '', 'What may it do?'));
+		card.append(...accessChoices(wiz.draft.access, key => { wiz.draft.access = key; renderWizard(); }));
+		const foot = el('div', 'wiz__foot');
+		const cancel = el('button', 'button button-sm', 'Cancel'); cancel.type = 'button'; cancel.onclick = closeWizard;
+		const create = el('button', 'button button-primary button-sm', 'Create agent'); create.type = 'button'; create.disabled = !wiz.draft.name.trim();
+		create.onclick = () => {
+			const d = wiz.draft;
+			// nothing drafted yet: the description itself is the job
+			if (!d.role && wiz.description.trim()) { d.role = wiz.description.trim(); }
+			vscode.postMessage({ type: 'createFrom', draft: d }); closeWizard();
+		};
+		foot.append(cancel, create); card.append(foot);
+		box.replaceChildren(card); box.hidden = false;
+		box.onclick = e => { if (e.target === box) closeWizard(); };
+		if (keep) { const again = document.getElementById(keep); if (again) { again.focus(); if (caret !== null && again.setSelectionRange) again.setSelectionRange(caret, caret); } }
+	}
+	document.addEventListener('keydown', e => { if (e.key === 'Escape' && wiz) closeWizard(); });
 
 	// ---- instructions ----
 	const APPLY = { always: 'Always', files: 'Matching files', manual: 'On mention' };
@@ -667,6 +843,9 @@ export class AgentStudio implements vscode.Disposable {
 	};
 	window.addEventListener('message', e => {
 		const m = e.data; if (!m) return;
+		if (m.type === 'wizard') { openWizard(); return; }
+		if (m.type === 'draftStatus') { if (wiz && wiz.busy) { wiz.note = m.text; renderWizard(); } return; }
+		if (m.type === 'drafted') { if (wiz) { wiz.busy = false; wiz.draft = m.draft; wiz.picked = null; wiz.warn = !!m.note; wiz.note = m.note || (m.by === 'ai' ? 'Written by Lightchain AI. Change anything below, then create it.' : 'Drafted from your description. Change anything below, then create it.'); renderWizard(); } return; }
 		if (m.type === 'context') { context = m; if (state.tab === 'context') renderContext(); return; }
 		if (m.type === 'hits') { if (m.query === query) { hits = m.hits; if (state.tab === 'context') renderContext(); } return; }
 		if (m.type !== 'state') return;
