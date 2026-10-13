@@ -25,6 +25,9 @@ const JOB_REGISTRY_ABI = parseAbi([
 	'function setDelegateAllowance(address delegate, uint256 allowance)',
 ]);
 
+/** Escrowed per Lightchain AI job on testnet today (JobRegistry fee). */
+export const JOB_FEE_LCAI = 0.02;
+
 export interface CreditsSnapshot {
 	credits: bigint;      // prepaid LCAI (wei)
 	walletBalance: bigint;  // native LCAI (wei)

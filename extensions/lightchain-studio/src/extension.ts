@@ -12,14 +12,22 @@ import { NetworkState } from './networkState';
 import { Wallet, WalletAccount, isAddress } from './wallet';
 import { BrowserBridge } from './browserBridge';
 import { Credits, formatLcai } from './credits';
+import { WalletView } from './walletView';
 import { DeployedProgramsProvider, ProgramNode, shortAddress } from './deployedPrograms';
 import { MarketplaceProvider, installEntry, openEntry } from './marketplace';
 import { LightchainAiView } from './aiView';
 import { StartPage } from './startPage';
-import { newProject } from './newProject';
+import { PENDING_BUILD, PendingBuild, newProject, setPendingStore } from './newProject';
+import { NewProjectPanel } from './newProjectPanel';
 import { registerFoundry } from './foundry';
 import { LightchainProvider } from './lightchain/provider';
 import { EditorReview } from './editorReview';
+import { TaskStore } from './tasks';
+import { AgentProfiles } from './agent/profiles';
+import { AgentStudio } from './agentStudio';
+import { BoardPanel } from './boardPanel';
+import { WorkspaceView } from './workspaceView';
+import { commitWithAi } from './commitMessage';
 import { InlinePrompt } from './inlinePrompt';
 import { projectMap } from './agent/projectMap';
 import { mentionItems, resolveMention, solidityFiles } from './agent/mentions';
@@ -44,6 +52,103 @@ export function activate(context: vscode.ExtensionContext): void {
 	const ai = new LightchainAiView(context.extensionUri, wallet, network, credits, model => new LightchainProvider(wallet, network, model), proposals, context.globalState, context.workspaceState);
 
 	ai.review = review;
+	// lc-studio://lightchain.lightchain-studio/return — the wallet page's "Return to Lightchain Studio" button
+	context.subscriptions.push(vscode.window.registerUriHandler({
+		handleUri: uri => {
+			if (uri.path === '/return') {
+				void vscode.commands.executeCommand('lightchain.ai.focus');
+			}
+		},
+	}));
+	setPendingStore(context.globalState);
+	// a project created with "Describe your app": let Lightchain AI shape it now that it is open
+	const pending = context.globalState.get<PendingBuild>(PENDING_BUILD);
+	const here = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+	if (pending && here && pending.path === here) {
+		void context.globalState.update(PENDING_BUILD, undefined);
+		setTimeout(() => void ai.buildFromDescription(pending.description, pending.template), 1500);
+	}
+	const profiles = new AgentProfiles();
+	ai.profiles = profiles;
+	const studio = new AgentStudio(context.extensionUri, profiles, () => ai.modelNames(), (id, prompt) => ai.useAgent(id, prompt));
+	context.subscriptions.push(profiles, studio, profiles.onDidChange(() => ai.postAgents()),
+		vscode.commands.registerCommand('lightchain.agents.open', (id?: string) => studio.open(typeof id === 'string' ? id : undefined)),
+		vscode.commands.registerCommand('lightchain.agents.new', () => studio.create()));
+	const tasks = new TaskStore();
+	ai.tasks = tasks;
+	const board = new BoardPanel(context.extensionUri, tasks, t => ai.runTask(t), goal => ai.plan(goal));
+	const home = new WorkspaceView(context.extensionUri, ai, tasks);
+	// "Your first dApp": build → test → deploy → interact → ask Lightchain AI
+	const startKey = (k: string) => `lightchain.start.${k}`;
+	const markStep = async (k: string) => { await context.workspaceState.update(startKey(k), true); home.refreshSoon(); ai.refreshState(); };
+	home.account = async () => {
+		const acc = wallet.active;
+		if (!acc) {
+			return undefined;
+		}
+		const snap = await credits.read(acc, network.current).catch(() => undefined);
+		return { address: acc.address, network: network.current.label, credits: snap ? formatLcai(snap.credits) : undefined };
+	};
+	context.subscriptions.push(wallet.onDidChange(() => home.refreshSoon()), credits.onDidChange(() => home.refreshSoon()));
+	// Explorer: connected wallets and Lightchain AI credits, read from the chain (replaces Outline/Timeline)
+	const walletView = new WalletView(context.extensionUri, wallet, network, credits, context.globalState);
+	context.subscriptions.push(walletView, vscode.window.registerWebviewViewProvider('lightchain.walletView', walletView));
+		home.programs = () => {
+		const shape = (p: { name?: string; address: string }) => ({ name: p.name, address: p.address, used: programs.findReferences(p.address).length > 0 });
+		const relevant = programs.relevant;
+		return { network: network.current.label, items: relevant.map(shape), other: programs.all.filter(p => !relevant.includes(p)).map(shape) };
+	};
+	context.subscriptions.push(vscode.commands.registerCommand('lightchain.programs.openAddress', (address: string) =>
+		vscode.env.openExternal(vscode.Uri.parse(addressUrl(network.current, address)))), network.onDidChange(() => home.refreshSoon()));
+	ai.startSteps = () => home.steps?.() ?? Promise.resolve(undefined);
+	home.steps = async () => {
+		const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+		const exists = (p: string) => root ? Promise.resolve(vscode.workspace.fs.stat(vscode.Uri.joinPath(root, p))).then(() => true, () => false) : Promise.resolve(false);
+		if (!root || context.workspaceState.get(startKey('dismissed')) || !(await exists('foundry.toml'))) {
+			return undefined;
+		}
+		return [
+			{ id: 'build', title: 'Build the contracts', sub: 'Compile them with Foundry', done: await exists('out'), command: 'lightchain.foundry.build', action: 'Build' },
+			{ id: 'test', title: 'Run the tests', sub: 'Check the contract does what it should', done: !!context.workspaceState.get(startKey('test')), command: 'lightchain.foundry.test', action: 'Test' },
+			{ id: 'deploy', title: 'Deploy to testnet', sub: 'Free test LCAI, nothing real at stake', done: programs.relevant.length > 0, command: 'lightchain.deployContract', action: 'Deploy' },
+			{ id: 'interact', title: 'Call your contract', sub: 'Read and write it from the IDE', done: !!context.workspaceState.get(startKey('interact')), command: 'lightchain.start.interact', action: 'Open' },
+			{ id: 'ask', title: 'Change it with Lightchain AI', sub: 'Describe a feature; review the edit', done: ai.chatList().length > 0, command: 'lightchain.ai.focus', action: 'Ask' },
+		];
+	};
+	context.subscriptions.push(
+		vscode.tasks.onDidEndTaskProcess(e => {
+			const def = e.execution.task.definition;
+			if (def.type === 'lightchain' && e.exitCode === 0) {
+				if (def.task === 'Test') {
+					void markStep('test');
+				}
+				home.refreshSoon();
+				ai.refreshState();
+			}
+		}),
+		programs.onDidChangeTreeData(() => { home.refreshSoon(); ai.refreshState(); }),
+		vscode.commands.registerCommand('lightchain.start.dismiss', () => markStep('dismissed')),
+		vscode.commands.registerCommand('lightchain.start.interact', async () => {
+			const p = programs.relevant[programs.relevant.length - 1];
+			if (!p) {
+				vscode.window.showInformationMessage('Deploy a contract first, then call it from here.', 'Deploy').then(c => c && vscode.commands.executeCommand('lightchain.deployContract'));
+				return;
+			}
+			await vscode.commands.executeCommand('lightchain.programs.interactAddress', p.address, p.name);
+			await markStep('interact');
+		}),
+	);
+	context.subscriptions.push(tasks, board, home,
+		vscode.window.registerWebviewViewProvider('lightchain.workspace', home),
+		vscode.commands.registerCommand('lightchain.ai.commit', () => commitWithAi(() => ai.sideProvider())),
+		vscode.commands.registerCommand('lightchain.tasks.board', (id?: string) => board.open(typeof id === 'string' ? id : undefined)),
+		vscode.commands.registerCommand('lightchain.tasks.add', async () => {
+			const title = await vscode.window.showInputBox({ title: 'New task', placeHolder: 'What needs to be done?' });
+			if (title?.trim()) {
+				await tasks.add({ title });
+			}
+		}),
+	);
 	ai.inline = new InlinePrompt();
 	ai.projectMap = async () => {
 		const map = projectMap(await solidityFiles(), programs.relevant, network.current.label);
@@ -84,11 +189,14 @@ export function activate(context: vscode.ExtensionContext): void {
 		vscode.commands.registerCommand('lightchain.marketplace.open', openEntry),
 	);
 
+	const newProjectPanel = new NewProjectPanel(context.extensionUri);
+	context.subscriptions.push(newProjectPanel);
 	const start = new StartPage(context, newProject);
 	context.subscriptions.push(
 		start,
 		vscode.commands.registerCommand('lightchain.start.open', () => start.show()),
 		vscode.commands.registerCommand('lightchain.project.new', newProject),
+		vscode.commands.registerCommand('lightchain.project.newPanel', () => newProjectPanel.open()),
 	);
 	start.maybeShowOnStartup();
 	// First launch of a profile: open the Lightchain side bar (Deployed Programs + Lightchain AI).

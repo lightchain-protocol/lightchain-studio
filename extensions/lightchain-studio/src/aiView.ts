@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { claimTestnetLcai } from './faucet';
 import * as path from 'node:path';
 import { applyHunks, lineDiff } from './agent/lineDiff';
 import { ChatStore, ChatEvent } from './agent/chatStore';
@@ -7,6 +8,12 @@ import { StuckJobs } from './lightchain/stuckJobs';
 import { MentionItem, MentionResolver, PromptContext, buildContext, editorContext, mentionableFiles } from './agent/context';
 import { SLASH_COMMANDS, expandSlash, parseSlash } from './agent/commands';
 import { fixPrompt } from './failureWatcher';
+import { Task, TaskStore, parseChecklist, taskPrompt } from './tasks';
+import { AgentProfile, AgentProfiles, BUILTIN_AGENTS, flow } from './agent/profiles';
+import { IDENTICON_JS } from './ui/site';
+
+const BUILTIN_IDS = new Set(BUILTIN_AGENTS.map(a => a.id));
+import type { ChatSummary } from './workspaceView';
 import { outlineSolidity } from './agent/projectMap';
 import { AgentStuckError } from './agent/agent';
 import * as fs from 'node:fs';
@@ -14,7 +21,7 @@ import { NetworkState } from './networkState';
 import { Wallet } from './wallet';
 import { shortAddress } from './deployedPrograms';
 import { txUrl } from './networks';
-import { Credits, formatLcai } from './credits';
+import { Credits, formatLcai, JOB_FEE_LCAI } from './credits';
 import { Agent, InferenceProvider } from './agent/agent';
 import { ApprovalRequest, PartialApproval } from './agent/tools';
 import { ProposalStore } from './agent/proposals';
@@ -32,8 +39,6 @@ import { LightchainModel, fetchModels, pickDefault } from './lightchain/models';
 /** No answer this long after the job was submitted → suggest another model. */
 const SLOW_AFTER_MS = 45_000;
 
-/** Escrowed per job on testnet today (JobRegistry fee); used for the pre-send credit check. */
-const JOB_FEE_LCAI = 0.02;
 
 export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disposable {
 	private view?: vscode.WebviewView;
@@ -60,6 +65,19 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	/** Per turn: files the agent wrote, with their content before the turn (undefined = created). */
 	private checkpoints = new Map<string, Map<string, { before?: string; after: string }>>();
 	private turnOrder: string[] = []; // turns in the order they ran
+	/** The project's first-dApp steps (set by the extension); shown as the panel's next step. */
+	startSteps?: () => Promise<{ id: string; title: string; sub: string; done: boolean; command: string; action: string }[] | undefined>;
+	/** Agent profiles (set by the extension). */
+	profiles?: AgentProfiles;
+	private profile(): AgentProfile | undefined {
+		return this.profiles?.get(this.memento.get<string>('lightchain.ai.agent', 'builder'));
+	}
+	/** The project's task board (set by the extension). */
+	tasks?: TaskStore;
+	private plannedTasks: { title: string; description?: string }[] = [];
+	private lastTurnOk = false;
+	private readonly chatsChanged = new vscode.EventEmitter<void>();
+	readonly onDidChangeChats = this.chatsChanged.event;
 	private turnJobs: { jobId: string; txHash?: string }[] = []; // on-chain jobs of the running turn
 	private turnMarks = new Map<string, number>(); // user turn → agent history size before it
 	private currentTurn?: string;
@@ -126,6 +144,9 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	private post(msg: unknown): void {
 		this.view?.webview.postMessage(msg);
 		const m = msg as ChatEvent;
+		if (['user', 'turnEnd', 'checkpoint', 'cleared', 'checkpointUndone'].includes(m.type)) {
+			queueMicrotask(() => this.chatsChanged.fire());
+		}
 		if (m.type === 'turnEnd' || m.type === 'replyEnd' || m.type === 'toolStart') {
 			this.chats.closeAnswer();
 		}
@@ -155,6 +176,19 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 
 	private async onMessage(msg: any): Promise<void> {
 		switch (msg?.type) {
+			case 'agent':
+				if (typeof msg.id === 'string') {
+					await this.selectAgent(msg.id);
+				}
+				return;
+			case 'openFile': {
+				const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+				const rel = String(msg.path ?? '');
+				if (root && rel && !rel.split(/[\\/]/).includes('..')) {
+					await vscode.window.showTextDocument(vscode.Uri.joinPath(root, rel), { preview: true }).then(undefined, () => undefined);
+				}
+				return;
+			}
 			case 'openUrl': {
 				const url = String(msg.url ?? '');
 				if (url.startsWith(this.network.current.explorerUrl + '/')) {
@@ -162,6 +196,8 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				}
 				return;
 			}
+			case 'editAgent':
+				return void vscode.commands.executeCommand('lightchain.agents.open', String(msg.id ?? ''));
 			case 'command':
 				if (typeof msg.command === 'string' && msg.command.startsWith('lightchain.')) {
 					vscode.commands.executeCommand(msg.command);
@@ -232,17 +268,22 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				this.resetChat();
 				return;
 			case 'ready':
+				this.postAgents();
 				return this.replay();
 			case 'history':
 				this.post({ type: 'historyList', chats: this.chats.all().map(c => ({ id: c.id, title: c.title, updated: c.updated, current: c.id === this.chats.current()?.id })) });
 				return;
-			case 'openChat': {
-				if (typeof msg.id !== 'string' || this.abort) {
-					return;
+			case 'openChat':
+				return typeof msg.id === 'string' ? this.openChat(msg.id) : undefined;
+			case 'addPlan': {
+				const n = this.plannedTasks.length && this.tasks ? await this.tasks.addMany(this.plannedTasks) : 0;
+				this.plannedTasks = [];
+				this.post({ type: 'cardRemove', id: 'plan' });
+				if (n) {
+					this.post({ type: 'info', text: `Added ${n} task${n === 1 ? '' : 's'} to the board.` });
+					void vscode.commands.executeCommand('lightchain.tasks.board');
 				}
-				await this.chats.open(msg.id);
-				this.view?.webview.postMessage({ type: 'cleared' });
-				return this.replay();
+				return;
 			}
 			case 'deleteChat':
 				if (typeof msg.id === 'string') {
@@ -353,7 +394,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 					turn.set(file, { before: prev ? prev.before : before, after }); // keep the earliest "before"
 				}
 			},
-		});
+		}, this.profile());
 		this.abort = new AbortController();
 		const turnId = `t${++this.seq}`;
 		if (!retry) {
@@ -368,6 +409,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		let autoRetry: { text: string; model: string } | undefined;
 		this.currentTurn = turnId;
 		this.turnJobs = [];
+		this.lastTurnOk = false;
 		this.checkpoints.set(turnId, new Map());
 		const clearSlow = () => { clearTimeout(this.slowTimer); this.slowTimer = undefined; this.post({ type: 'cardRemove', id: 'slow' }); };
 		try {
@@ -390,6 +432,15 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 					}
 				},
 			}, this.abort.signal, instruction);
+			this.lastTurnOk = true;
+			// /plan: offer the checklist as board tasks
+			if (slash?.command.name === 'plan' && this.tasks) {
+				const items = parseChecklist(this.agent.lastReply());
+				if (items.length) {
+					this.plannedTasks = items;
+					this.post({ type: 'card', id: 'plan', title: `Add ${items.length} task${items.length === 1 ? '' : 's'} to the board?`, state: '', stateKind: 'info', detail: items.map(i => '• ' + i.title).join('\n'), actions: [{ label: `Add ${items.length} tasks`, command: 'addPlan' }] });
+				}
+			}
 			this.attached = this.refreshedThisTurn ? new Map() : attaching;
 		} catch (err) {
 			if (err instanceof WorkerError && err.jobId && this.wallet.active) {
@@ -600,6 +651,116 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		return outlineSolidity(text, false).find(u => !/interface|library/.test(u.kind))?.name;
 	}
 
+	// ---- for the Lightchain sidebar (WorkspaceView) and the board ----
+
+	chatList(): ChatSummary[] {
+		const current = this.chats.current()?.id;
+		return this.chats.all().map(c => ({
+			id: c.id, title: c.title, updated: c.updated, model: c.model, current: c.id === current,
+			files: new Set(c.events.filter(e => e.type === 'checkpoint').flatMap(e => (e.files as string[] | undefined) ?? [])).size,
+		}));
+	}
+
+	async openChat(id: string): Promise<void> {
+		await vscode.commands.executeCommand('lightchain.ai.focus');
+		if (this.abort || this.chats.current()?.id === id) {
+			return;
+		}
+		await this.chats.open(id);
+		this.view?.webview.postMessage({ type: 'cleared' });
+		this.replay();
+		this.chatsChanged.fire();
+	}
+
+	async newChat(): Promise<void> {
+		await vscode.commands.executeCommand('lightchain.ai.focus');
+		if (!this.abort) {
+			this.resetChat();
+		}
+	}
+
+	/** Hand a board task to Lightchain AI: In progress while it works, Review when it is done. */
+	async runTask(task: Task): Promise<void> {
+		if (this.abort) {
+			vscode.window.showInformationMessage('Lightchain AI is busy with another request.');
+			return;
+		}
+		await vscode.commands.executeCommand('lightchain.ai.focus');
+		const prefix = this.tasks?.prefix ?? 'LC';
+		await this.tasks?.update(task.id, { status: 'doing' });
+		await this.send(`${prefix}-${task.key} · ${task.title}`, false, undefined, taskPrompt(task, prefix));
+		await this.tasks?.update(task.id, { chat: this.chats.current()?.id, ...(this.lastTurnOk ? { status: 'review' } : {}) });
+	}
+
+	/** A project just created from a description: shape the starter into it. */
+	async buildFromDescription(description: string, template: string): Promise<void> {
+		await vscode.commands.executeCommand('lightchain.ai.focus');
+		const instruction = [
+			`This project was just created from the "${template}" starter. Turn it into: ${description}`,
+			'',
+			'First give a short plan (3 to 6 steps). Then change the contract in src/, its tests in test/ and the deploy script in script/ to match — complete files, simple and safe, for Lightchain testnet first. Rename files and contracts to fit the app. Then build and run the tests and fix any failures. Finish with how to deploy and try it.',
+		].join('\n');
+		await this.send(`Build: ${description}`, false, undefined, instruction);
+	}
+
+	modelNames(): string[] {
+		return this.models.map(m => m.name);
+	}
+
+	/** Switch the chat's agent; its role, rules and permissions apply from the next message. */
+	async selectAgent(id: string): Promise<void> {
+		const p = this.profiles?.get(id);
+		if (!p) {
+			return;
+		}
+		await this.memento.update('lightchain.ai.agent', p.id);
+		if (p.model && p.model !== this.model && this.models.some(m => m.name === p.model && m.available)) {
+			this.model = p.model;
+			await this.memento.update('lightchain.ai.model', p.model);
+			this.post({ type: 'models', models: this.models, selected: this.model });
+		}
+		if (this.agent && this.model) {
+			this.agent.setProfile(p);
+			this.agent.setProvider(this.chatProvider(this.model)); // a new session picks up the new instructions
+			this.attached = new Map();
+			this.post({ type: 'notice', message: `Agent: ${p.name}. The conversation continues.` });
+		}
+		this.postAgents();
+	}
+
+	/** Tells the panel which agents exist and which one is active. */
+	postAgents(): void {
+		const all = this.profiles?.all ?? [];
+		const cur = this.profile();
+		const strip = (p: AgentProfile) => ({ id: p.id, edited: BUILTIN_IDS.has(p.id) && !!this.profiles?.isCustomized(p.id), custom: !BUILTIN_IDS.has(p.id), name: p.name, glyph: p.glyph, color: p.color, summary: p.summary, starters: p.starters.filter(Boolean), steps: flow(p).filter(s => s.on).map(s => ({ id: s.id, label: s.label })) });
+		this.view?.webview.postMessage({ type: 'agents', agents: all.map(strip), current: cur ? strip(cur) : undefined });
+	}
+
+	/** Use an agent from Agent Studio (optionally sending one of its example requests). */
+	async useAgent(id: string, prompt?: string): Promise<void> {
+		await vscode.commands.executeCommand('lightchain.ai.focus');
+		await this.selectAgent(id);
+		if (prompt) {
+			await this.send(prompt, false, editorContext().file ? { ...editorContext(), mentions: [] } : undefined);
+		}
+	}
+
+	/** Re-reads credits and steps into the panel (e.g. after a build or deploy). */
+	refreshState(): void {
+		void this.postState();
+	}
+
+	/** A one-off provider for side jobs (commit messages); undefined without a wallet or model. */
+	sideProvider(): InferenceProvider | undefined {
+		return this.wallet.active && this.model ? this.provider(this.model) : undefined;
+	}
+
+	/** Plan with AI (from the board). */
+	async plan(goal: string): Promise<void> {
+		await vscode.commands.executeCommand('lightchain.ai.focus');
+		await this.send(`/plan ${goal}`);
+	}
+
 	/** /audit for one file (from the deploy wizard). */
 	async audit(file: string): Promise<void> {
 		await vscode.commands.executeCommand('lightchain.ai.focus');
@@ -636,20 +797,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			return;
 		}
 		this.post({ type: 'faucetState', busy: true });
-		let message: string;
-		let ok = false;
-		try {
-			const res = await fetch('https://lightfaucet.ai/api/claim', {
-				method: 'POST', headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ address: account.address, network: 'testnet' }),
-				signal: AbortSignal.timeout(60_000),
-			});
-			const body = await res.json().catch(() => ({})) as { message?: string };
-			ok = res.ok;
-			message = (body.message ?? (ok ? 'Testnet LCAI sent.' : `Faucet error (${res.status}).`)).replace(/^([^:]+):\s*/, '$1 — ');
-		} catch {
-			message = 'The faucet is unreachable right now. Try lightfaucet.ai in your browser.';
-		}
+		const { ok, message } = await claimTestnetLcai(account.address);
 		this.post({ type: 'faucetState', busy: false, ok, message });
 		if (ok) {
 			// the transfer needs a block or two
@@ -782,6 +930,10 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	}
 
 	private requestApproval(req: ApprovalRequest): Promise<boolean | PartialApproval> {
+		// "Apply automatically" agents: file changes go straight in (the turn's checkpoint can undo them)
+		if (req.kind !== 'command' && this.profile()?.approval === 'auto') {
+			return Promise.resolve(true);
+		}
 		const id = `a${++this.seq}`;
 		return new Promise(resolve => {
 			const entry: { resolve: typeof resolve; req: ApprovalRequest; review?: string } = { resolve, req };
@@ -838,6 +990,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			account: account ? shortAddress(account.address) : null, credits: null as string | null,
 			gas: null as number | null, creditsNum: null as number | null,
 			asked: this.memento.get<boolean>('lightchain.ai.asked', false),
+			steps: await this.startSteps?.().catch(() => undefined),
 		};
 		this.post(base);
 		if (account) {
@@ -883,6 +1036,46 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	.lc-top__right { margin-left: auto; display: flex; align-items: center; gap: 16px; }
 	/* model picker = lcai-chat-v2 components/model-picker.tsx (ModelSelect) + ui/dropdown-menu, dark tokens */
 	.lc-model { position: relative; flex: 1; min-width: 0; }
+	/* agent picker (site tokens: hairline square, greys) */
+	.lc-agent { position: relative; flex: none; }
+	.lc-agent__trigger { display: inline-flex; align-items: center; gap: 7px; height: 32px; max-width: 170px; padding: 0 6px; border: 0; background: transparent; color: #CCCEEF; font-family: "Inter", sans-serif; font-size: 12px; font-weight: 500; cursor: pointer; }
+	.lc-agent__trigger:hover { color: #f5f6ff; }
+	.lc-agent__glyph { flex: none; display: inline-flex; width: 20px; height: 20px; border-radius: 6px; overflow: hidden; background: #14152c; }
+	.lc-agent__glyph svg { width: 100%; height: 100%; display: block; }
+	.lc-agent__name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.lc-model__menu.lc-agent__menu { width: 320px; min-width: 0; max-width: calc(100vw - 32px); max-height: 420px; }
+	.lc-agent__item { position: relative; display: flex; align-items: flex-start; gap: 10px; width: 100%; padding: 8px; border-radius: 8px; background: transparent; text-align: left; cursor: pointer; outline: none; transition: background-color .15s; }
+	.lc-agent__item .lc-agent__glyph { width: 28px; height: 28px; margin-top: 1px; }
+	.lc-agent__item:hover, .lc-agent__item:focus-visible { background: #13131e; }
+	.lc-agent__item.sel { background: #13131e; box-shadow: inset 2px 0 0 #5b4bff; }
+	.lc-agent__item .t { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+	.lc-agent__item .n { display: flex; align-items: center; gap: 6px; color: #f5f6ff; font-family: "Inter", sans-serif; font-size: 13px; }
+	.lc-agent__item .s { color: #7376aa; font-family: "Inter", sans-serif; font-size: 11.5px; line-height: 1.45; }
+	.lc-agent__pill { padding: 0 6px; border: 1px solid rgba(91, 75, 255, 0.35); border-radius: 52px; color: #b1b3d0; font-size: 9.5px; font-weight: 500; letter-spacing: .5px; line-height: 15px; text-transform: uppercase; }
+	.lc-agent__edit { flex: none; align-self: center; display: inline-flex; align-items: center; gap: 5px; height: 26px; padding: 0 9px; border: 1px solid rgba(255, 255, 255, 0.2); border-radius: 8px; background: rgba(255, 255, 255, 0.06); color: #ccceef; font-family: "Inter", sans-serif; font-size: 11px; letter-spacing: .5px; text-transform: uppercase; cursor: pointer; opacity: 0; transition: opacity .15s, background-color .3s, border-color .3s; }
+	.lc-agent__item:hover .lc-agent__edit, .lc-agent__item:focus-within .lc-agent__edit, .lc-agent__item.sel .lc-agent__edit { opacity: 1; }
+	.lc-agent__edit:hover { border-color: #5b4bff; background: #5b4bff; color: #fff; }
+	.lc-agent__edit svg { width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+	.lc-agent__foot { display: flex; gap: 6px; margin-top: 6px; padding-top: 8px; border-top: 1px solid rgba(255, 255, 255, 0.1); }
+	.lc-agent__new, .lc-agent__manage { flex: 1; height: 30px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.2); border-radius: 8px; background: rgba(255, 255, 255, 0.06); color: #ccceef; font-family: "Inter", sans-serif; font-size: 11px; letter-spacing: .5px; text-transform: uppercase; cursor: pointer; transition: all .3s ease-in-out; }
+	.lc-agent__new:hover, .lc-agent__manage:hover { border-color: #5b4bff; background: #5b4bff; color: #fff; }
+	/* example requests for the chosen agent */
+	.lc-starters { display: flex; flex-direction: column; gap: 2px; margin-top: 18px; text-align: left; }
+	.lc-starters:empty { display: none; }
+	.lc-starters::before { content: "TRY"; padding: 0 0 6px 12px; color: #ccceef; opacity: .5; font-size: 12px; font-weight: 600; letter-spacing: 0.5px; }
+	.lc-starter { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border: 0; border-radius: 6px; background: transparent; color: #ccceef; font-family: "Inter", sans-serif; font-size: 14px; font-weight: 500; text-align: left; cursor: pointer; transition: all 400ms; }
+	.lc-starter svg { flex: none; width: 16px; height: 16px; fill: none; stroke: #7376aa; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; transition: all 400ms; }
+	.lc-starter:hover { background: #0f0f14; color: #5b4bff; }
+	.lc-starter:hover svg { stroke: #5b4bff; }
+	/* live agent flow: plain text steps, the current one underlined in magenta */
+	.lc-flow { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 2px 10px; padding: 10px 16px; border-bottom: 1px solid rgba(255, 255, 255, 0.1); zoom: 0.8125; }
+	.lc-flow[hidden] { display: none; }
+	.lc-flow__who { flex: none; display: inline-flex; align-items: center; gap: 7px; margin-right: 4px; color: #f5f6ff; font-size: 13px; font-weight: 500; white-space: nowrap; }
+	.lc-flow__step { flex: none; padding: 2px 0; border-bottom: 2px solid transparent; color: #7376aa; font-size: 13px; white-space: nowrap; }
+	.lc-flow__step.done { color: #b1b3d0; }
+	.lc-flow__step.now { color: #f5f6ff; border-bottom-color: #dd00ac; }
+	.lc-flow__step.skip { opacity: .45; text-decoration: line-through; }
+	.lc-flow__sep { flex: none; color: rgba(204, 206, 239, 0.3); font-size: 12px; }
 	.lc-model__trigger { display: inline-flex; align-items: center; gap: 8px; height: 32px; max-width: 100%; padding: 0 6px; border: 0; border-radius: 12px; background: transparent; color: #9798B6; font-family: "Inter", sans-serif; font-size: 12px; line-height: 16px; font-weight: 500; cursor: pointer; transition: background-color .15s; }
 	.lc-model__trigger:hover, .lc-model__trigger[aria-expanded="true"] { background: rgba(204, 206, 239, 0.04); }
 	.lc-model__name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -921,24 +1114,42 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	.lc-banner[hidden] { display: none; }
 	.lc-banner span { flex: 1; min-width: 0; }
 	.lc-thread { flex: 1; min-height: 0; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
-	.lc-empty { margin: auto 0; text-align: left; }
-	.lc-empty img { width: 176px; height: auto; display: block; margin-bottom: 16px; }
-	.lc-empty p { color: #b1b3d0; font-size: 14px; }
+	.lc-empty { margin: auto 0; text-align: center; }
+	.lc-empty h2 { margin: 0 0 6px; color: #ccceef; font-size: 24px; font-weight: 600; letter-spacing: -0.02em; }
+	.lc-empty img { width: 40px; height: auto; display: block; margin: 0 auto 16px; }
+	.lc-empty p { color: #7376aa; font-size: 14px; line-height: 1.6; }
 	/* first-run checklist */
-	.lc-setup { margin-top: 20px; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 10px; background: #020203; overflow: hidden; }
+	.lc-setup { margin-top: 24px; padding: 14px 16px; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 10px; background: #0f0f14; text-align: left; }
+	.lc-next__top { display: flex; align-items: center; gap: 8px; color: #7376aa; font-size: 12px; }
+	.lc-next__bar { display: flex; gap: 3px; margin-left: auto; }
+	.lc-next__bar i { width: 10px; height: 2px; background: rgba(204, 206, 239, 0.16); }
+	.lc-next__bar i.on { background: #b1b3d0; }
+	.lc-next__bar i.now { background: #5b4bff; }
+	.lc-next__x { padding: 0 0 0 4px; border: 0; background: none; color: #7376aa; font-size: 15px; line-height: 1; cursor: pointer; }
+	.lc-next__x:hover { color: #f5f6ff; }
+	.lc-next__row { display: flex; align-items: center; gap: 12px; margin-top: 6px; }
+	.lc-next__text { flex: 1; min-width: 0; }
+	.lc-next__title { color: #ccceef; font-size: 15px; font-weight: 500; }
+	.lc-next__note { color: #7376aa; font-size: 12.5px; line-height: 1.45; }
 	.lc-setup[hidden] { display: none; }
-	.lc-setup__title { padding: 10px 12px 6px; color: #f5f6ff; font-size: 13px; font-weight: 500; }
-	.lc-setup__row { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-top: 1px solid rgba(255, 255, 255, 0.06); font-size: 13px; color: #b1b3d0; }
-	.lc-setup__n { flex: none; width: 18px; height: 18px; border-radius: 50%; border: 1px solid rgba(204, 206, 239, 0.25); display: inline-flex; align-items: center; justify-content: center; font-size: 11px; color: #7376aa; }
+	.lc-setup__title { margin: 12px 12px 8px; padding-left: 10px; border-left: 3px solid #dd00ac; color: #b1b3d0; font-size: 13px; font-weight: 500; line-height: 1.2; text-transform: uppercase; }
+	.lc-setup__row { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-top: 1px solid rgba(255, 255, 255, 0.1); font-size: 13px; color: #ccceef; }
+	.lc-setup__n { flex: none; width: 16px; height: 16px; border: 1px solid rgba(204, 206, 239, 0.16); display: inline-flex; align-items: center; justify-content: center; font-size: 10px; color: #7376aa; }
 	.lc-setup__row.done { color: #7376aa; }
-	.lc-setup__row.done .lc-setup__n { border-color: #3eb75e; color: #3eb75e; }
+	.lc-setup__row.done .lc-setup__n { border-color: #ccceef; background: #ccceef; color: #070710; }
 	.lc-setup__row .t { flex: 1; min-width: 0; }
 	.lc-setup__row .t small { display: block; color: #7376aa; font-size: 11px; }
 	/* Chat layout in the style of Cursor / Claude, with lightchain.ai colours and type */
 	.lc-thread > * { flex: none; } /* never squash blocks; the thread scrolls instead */
 	.lc-msg-user { position: relative; }
+	.lc-edits { margin: 0 0 8px; padding: 6px 10px; border: 1px solid rgba(204, 206, 239, 0.16); background: #020203; }
+	.lc-edits[hidden] { display: none; }
+	.lc-edits__head { display: flex; align-items: center; gap: 8px; }
+	.lc-edits__toggle { flex: 1; min-width: 0; border: 0; background: none; color: #CCCEEF; font-family: "Inter", sans-serif; font-size: 12.5px; text-align: left; cursor: pointer; padding: 2px 0; }
+	.lc-edits__list { display: flex; flex-direction: column; margin-top: 4px; }
+	.lc-edits__file { border: 0; background: none; color: #9798B6; font-family: Menlo, Monaco, "Courier New", monospace; font-size: 11.5px; text-align: left; padding: 3px 4px; border-radius: 6px; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.lc-edits__file:hover { background: rgba(204, 206, 239, 0.06); color: #f5f6ff; }
 	.lc-jobs { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: -4px; color: #7376aa; font-size: 11px; }
-	.lc-jobs__dot { width: 6px; height: 6px; border-radius: 9999px; background: oklch(69.6% 0.17 162.48); }
 	.lc-jobs a { color: #9798B6; text-decoration: none; font-family: Menlo, Monaco, "Courier New", monospace; }
 	.lc-jobs a:hover { color: #f5f6ff; text-decoration: underline; }
 	.lc-msg-edit { position: absolute; top: 6px; right: 8px; padding: 2px 8px; border: 0; border-radius: 6px; background: rgba(204, 206, 239, 0.08); color: #b1b3d0; font-family: "Inter", sans-serif; font-size: 11px; cursor: pointer; opacity: 0; transition: opacity .15s; }
@@ -994,9 +1205,11 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	.lc-edit__cmd { padding: 10px 12px; font-family: Menlo, Monaco, "Courier New", monospace; font-size: 12px; color: #ccceef; white-space: pre-wrap; word-break: break-all; }
 
 	/* small inline actions (not page buttons) */
-	.lc-btn { display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 10px; border: 0; border-radius: 6px; background: transparent; color: #b1b3d0; font-family: "Inter", sans-serif; font-size: 12px; font-weight: 500; cursor: pointer; white-space: nowrap; }
-	.lc-btn:hover { background: rgba(204, 206, 239, 0.08); color: #f5f6ff; }
-	.lc-btn.primary { background: linear-gradient(90deg, #df04ae 0%, #412ffd 100%); color: #fff; }
+	/* P2P app .button.button-sm: glass, hairline, uppercase, 8px; hover fills with the accent */
+	.lc-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; flex: none; height: 28px; padding: 0 12px; border: 1px solid rgba(255, 255, 255, 0.2); border-radius: 8px; background: rgba(255, 255, 255, 0.14); color: #ccceef; font-family: "Inter", sans-serif; font-size: 11px; font-weight: 400; letter-spacing: 0.5px; text-transform: uppercase; line-height: 1; cursor: pointer; white-space: nowrap; transition: all 300ms ease-in-out; }
+	.lc-btn:hover { border-color: #5b4bff; background: #5b4bff; color: #ccceef; }
+	.lc-btn.primary:hover { background: linear-gradient(90deg, #df04ae 0%, #412ffd 100%); box-shadow: 0 0 20px 5px rgba(112, 100, 233, 0.1); filter: brightness(125%); }
+	.lc-btn.primary { border: 0; background: linear-gradient(90deg, #df04ae 0%, #412ffd 100%); color: #fff; }
 	.lc-btn.primary:hover { filter: brightness(1.1); }
 	.lc-btn:disabled { opacity: .5; cursor: default; }
 	.lc-kbd { font-size: 11px; opacity: .75; }
@@ -1005,7 +1218,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	.lc-note { padding: 10px 12px; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 10px; background: #020203; font-size: 13px; }
 	.lc-note__head { display: flex; align-items: flex-start; gap: 8px; color: #f5f6ff; font-weight: 500; }
 	.lc-note__head .lc-ico { margin-top: 3px; }
-	.lc-note__text { margin: 4px 0 0 22px; color: #b1b3d0; line-height: 1.5; }
+	.lc-note__text { margin: 4px 0 0 22px; color: #b1b3d0; line-height: 1.5; white-space: pre-line; }
 	.lc-note__actions { display: flex; flex-wrap: wrap; gap: 4px; margin: 8px 0 0 16px; }
 
 	/* composer: one box, model picker and round send button inside */
@@ -1055,19 +1268,26 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		<div class="lc-history" id="history" hidden></div>
 	</div>
 	<div class="lc-banner" id="banner" hidden></div>
+	<div class="lc-flow" id="flowStrip" hidden></div>
 	<div class="lc-thread" id="thread">
 		<div class="lc-empty" id="empty">
-			<img src="${media('logo.svg')}" alt="Lightchain AI">
-			<p>Ask Lightchain AI to write contracts, tests and scripts, explain code or fix build errors. It reads your project and proposes changes you approve.</p>
+			<img src="${media('lightchain-tab.svg')}" alt=""><h2>Ask Lightchain AI</h2>
+			<p>Build, test and ship contracts with Lightchain AI. It reads your project and every change waits for your approval.</p>
 			<div class="lc-setup" id="setup" hidden></div>
+			<div class="lc-starters" id="starters"></div>
 		</div>
 	</div>
 	<div class="lc-form">
+		<div class="lc-edits" id="edits" hidden></div>
 		<div class="lc-composer">
 			<div class="lc-mention" id="mention" hidden></div>
 			<div class="lc-chips" id="chips"></div>
 			<textarea id="input" rows="2" placeholder="Ask Lightchain AI… @ to add context, / for commands"></textarea>
 			<div class="lc-form__row">
+				<div class="lc-agent" id="agentBox">
+					<button class="lc-agent__trigger" id="agentBtn" type="button" title="Choose the agent"><span class="lc-agent__glyph" id="agentGlyph">CB</span><span class="lc-agent__name" id="agentName">Contract Builder</span><svg class="lc-chev" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
+					<div class="lc-model__menu lc-agent__menu" id="agentMenu" hidden></div>
+				</div>
 				<div class="lc-model" id="modelBox">
 					<button class="lc-model__trigger" id="modelBtn" type="button" aria-haspopup="listbox" aria-expanded="false"><span class="lc-dot" id="modelDot"></span><span id="modelLogo"></span><span class="lc-model__name" id="modelLabel">Select model</span><svg class="lc-chev" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
 					<div class="lc-model__menu" id="modelMenu" role="listbox" hidden></div>
@@ -1078,6 +1298,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	</div>
 <script nonce="${nonce}">
 	const vscode = acquireVsCodeApi();
+	${IDENTICON_JS}
 	const $ = id => document.getElementById(id);
 	const thread = $('thread');
 	let busy = false, current = null, currentText = '';
@@ -1160,6 +1381,85 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		return add(step);
 	}
 	let lastTool = null;
+	// ---- agents: picker, starters, live flow ----
+	let agentState = { agents: [], current: null };
+	const agentMenu = $('agentMenu');
+	function renderAgent() {
+		const a = agentState.current; if (!a) return;
+		$('agentBox').style.setProperty('--ac', a.color);
+		$('agentGlyph').innerHTML = lcIdenticon('agent:' + a.id); $('agentName').textContent = a.name;
+		const st = $('starters'); // only in the empty state
+		if (st) st.replaceChildren();
+		if (st) a.starters.forEach(s => { const b = el('button', 'lc-starter'); b.innerHTML = '<svg viewBox="0 0 24 24"><path d="M7 17 17 7M8 7h9v9"/></svg>'; b.append(document.createTextNode(s)); b.onclick = () => { input.value = s; autosize(); syncSend(); input.focus(); }; st.append(b); });
+		agentMenu.replaceChildren(Object.assign(document.createElement('div'), { className: 'lc-model__label', textContent: 'Agents' }));
+		agentState.agents.forEach(x => {
+			const row = el('div', 'lc-agent__item' + (x.id === a.id ? ' sel' : ''));
+			row.tabIndex = 0; row.setAttribute('role', 'button');
+			const g = el('span', 'lc-agent__glyph'); g.innerHTML = lcIdenticon('agent:' + x.id);
+			const t = el('span', 't'); const n = el('span', 'n', x.name);
+			if (x.edited) n.append(el('span', 'lc-agent__pill', 'Edited'));
+			else if (x.custom) n.append(el('span', 'lc-agent__pill', 'Yours'));
+			t.append(n, el('span', 's', x.summary));
+			const edit = el('button', 'lc-agent__edit'); edit.type = 'button'; edit.title = 'Edit ' + x.name;
+			edit.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg><span>Edit</span>';
+			edit.onclick = e => { e.stopPropagation(); agentMenu.hidden = true; vscode.postMessage({ type: 'editAgent', id: x.id }); };
+			row.append(g, t, edit);
+			const pick = () => { agentMenu.hidden = true; vscode.postMessage({ type: 'agent', id: x.id }); };
+			row.onclick = pick; row.onkeydown = e => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), pick());
+			agentMenu.append(row);
+		});
+		const foot = el('div', 'lc-agent__foot');
+		const nw = el('button', 'lc-agent__new', '+ New agent'); nw.type = 'button';
+		nw.onclick = () => { agentMenu.hidden = true; vscode.postMessage({ type: 'command', command: 'lightchain.agents.new' }); };
+		const m = el('button', 'lc-agent__manage', 'Agent Studio'); m.type = 'button';
+		m.onclick = () => { agentMenu.hidden = true; vscode.postMessage({ type: 'command', command: 'lightchain.agents.open' }); };
+		foot.append(nw, m);
+		agentMenu.append(foot);
+	}
+	$('agentBtn').onclick = e => { e.stopPropagation(); agentMenu.hidden = !agentMenu.hidden; };
+	document.addEventListener('click', e => { if (!$('agentBox').contains(e.target)) agentMenu.hidden = true; });
+	// the strip lights up the step the agent is on
+	let flowIdx = -1, flowSteps = [], flowSeen = new Set();
+	function startFlow() {
+		const a = agentState.current; if (!a) return;
+		flowSteps = a.steps; flowIdx = 0; flowSeen = new Set([a.steps[0] && a.steps[0].id]);
+		const s = $('flowStrip'); s.style.setProperty('--ac', a.color); s.hidden = false; drawFlow();
+	}
+	function drawFlow(finished) {
+		const s = $('flowStrip'); const a = agentState.current; if (!a || !flowSteps.length) return;
+		s.replaceChildren();
+		const who = el('span', 'lc-flow__who'); const g = el('span', 'lc-agent__glyph'); g.innerHTML = lcIdenticon('agent:' + a.id); who.append(g, el('span', '', a.name)); s.append(who);
+		flowSteps.forEach((st, i) => {
+			if (i) s.append(el('span', 'lc-flow__sep', '›'));
+			const seen = flowSeen.has(st.id) || (finished && st.id === 'answer');
+			s.append(el('span', 'lc-flow__step' + (i === flowIdx && !finished ? ' now' : seen && (finished || i < flowIdx) ? ' done' : (finished || i < flowIdx) ? ' skip' : ''), st.label));
+		});
+	}
+	function flowTo(id) {
+		const i = flowSteps.findIndex(s => s.id === id);
+		if (i >= 0 && i >= flowIdx) { flowIdx = i; flowSeen.add(id); drawFlow(); }
+	}
+	const TOOL_STEP = { read_file: 'read', list_dir: 'read', search: 'read', write_file: 'write', forge_build: 'build', forge_test: 'test' };
+	// files Lightchain AI changed in this chat (checkpoint id → files)
+	const sessionEdits = {};
+	let editsOpen = false;
+	function renderEdits() {
+		const box = $('edits');
+		const files = [...new Set(Object.values(sessionEdits).flat())];
+		if (!files.length) { box.hidden = true; return; }
+		box.hidden = false; box.replaceChildren();
+		const head = el('div', 'lc-edits__head');
+		const toggle = el('button', 'lc-edits__toggle', (editsOpen ? '– ' : '+ ') + files.length + ' file' + (files.length === 1 ? '' : 's') + ' changed in this chat');
+		toggle.onclick = () => { editsOpen = !editsOpen; renderEdits(); };
+		const commit = el('button', 'lc-btn', 'Commit with AI'); commit.title = 'Lightchain AI writes the commit message; you review and commit in Source Control';
+		commit.onclick = () => vscode.postMessage({ type: 'command', command: 'lightchain.ai.commit' });
+		head.append(toggle, commit); box.append(head);
+		if (editsOpen) {
+			const list = el('div', 'lc-edits__list');
+			files.forEach(f => { const b = el('button', 'lc-edits__file', f); b.title = 'Open ' + f; b.onclick = () => vscode.postMessage({ type: 'openFile', path: f }); list.append(b); });
+			box.append(list);
+		}
+	}
 	const approvalUi = {}; // approval id → { done(ok, declined), inEditor() }
 	let pending = null; // the approval waiting for Accept / Reject
 
@@ -1183,18 +1483,24 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		if (s.testnet) steps.push({ title: 'Get testnet LCAI', note: faucet.message || 'Free test tokens pay for gas — 2 LCAI per day', done: s.gas !== null && s.gas >= 0.05, action: s.account ? [faucet.busy ? 'Claiming…' : 'Claim', () => vscode.postMessage({ type: 'faucet' }), faucet.busy] : null });
 		steps.push({ title: 'Add credits for Lightchain AI', note: 'Prompts are paid from credits on ' + s.network, done: s.creditsNum !== null && s.creditsNum >= 0.05, action: s.account ? ['Top up', () => vscode.postMessage({ type: 'command', command: 'lightchain.credits.topUp' })] : null });
 		steps.push({ title: 'Ask your first question', done: !!s.asked, action: ['Start', () => input.focus()] });
-		const allDone = steps.every(x => x.done);
-		box.hidden = allDone;
-		if (allDone) return;
-		box.replaceChildren(el('div', 'lc-setup__title', 'Get started'));
-		steps.forEach((x, i) => {
-			const row = el('div', 'lc-setup__row' + (x.done ? ' done' : ''));
-			const n = el('span', 'lc-setup__n', x.done ? '✓' : String(i + 1));
-			const t = el('span', 't', x.title); if (x.note && !x.done) t.append(el('small', '', x.note));
-			row.append(n, t);
-			if (!x.done && x.action) { const b = smallBtn(x.action[0], i === steps.findIndex(y => !y.done), x.action[1]); if (x.action[2]) b.disabled = true; row.append(b); }
-			box.append(row);
-		});
+		// then the project's own first-dApp steps (build, test, deploy, call)
+		const project = (s.steps || []).filter(x => x.id !== 'ask');
+		project.forEach(x => steps.push({ title: x.title, note: x.sub, done: x.done, action: [x.action, () => vscode.postMessage({ type: 'command', command: x.command })], dismiss: true }));
+		const next = steps.find(x => !x.done);
+		box.hidden = !next;
+		if (!next) return;
+		// one quiet line: only what to do next
+		const i = steps.indexOf(next);
+		box.replaceChildren();
+		const top = el('div', 'lc-next__top');
+		top.append(el('span', '', 'Next step · ' + (i + 1) + ' of ' + steps.length));
+		const bar = el('span', 'lc-next__bar'); steps.forEach(x => bar.append(el('i', x.done ? 'on' : x === next ? 'now' : ''))); top.append(bar);
+		if (next.dismiss) { const x = el('button', 'lc-next__x', '×'); x.title = 'Hide the project guide'; x.onclick = () => vscode.postMessage({ type: 'command', command: 'lightchain.start.dismiss' }); top.append(x); }
+		const row = el('div', 'lc-next__row');
+		const t = el('div', 'lc-next__text'); t.append(el('div', 'lc-next__title', next.title)); if (next.note) t.append(el('div', 'lc-next__note', next.note));
+		row.append(t);
+		if (next.action) { const b = smallBtn(next.action[0], true, next.action[1]); if (next.action[2]) b.disabled = true; row.append(b); }
+		box.append(top, row);
 	}
 
 	// ---- context chips + @-mentions ----
@@ -1387,6 +1693,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			}
 			case 'info': closeBubble(); add(el('div', 'lc-checkpoint', m.text)); break;
 			case 'checkpoint': {
+				sessionEdits[m.id] = m.files; renderEdits();
 				closeBubble(); clearStatus();
 				const row = el('div', 'lc-checkpoint'); row.dataset.checkpoint = m.id;
 				row.append(el('span', 'files', 'Changed ' + m.files.map(base).join(', ')));
@@ -1404,6 +1711,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			case 'checkpointUndone': {
 				const row = thread.querySelector('[data-checkpoint="' + m.id + '"]');
 				if (row) { row.classList.add('undone'); row.querySelector('button')?.remove(); row.append(el('span', '', 'Undone')); }
+				delete sessionEdits[m.id]; renderEdits();
 				break;
 			}
 			case 'context':
@@ -1415,8 +1723,8 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			case 'ai': { const b = aiBubble(); currentText = m.text || ''; b.innerHTML = render(currentText); closeBubble(); break; }
 			case 'focusInput': input.focus(); break;
 			case 'restoreInput': if (!input.value.trim()) { input.value = m.text; autosize(); syncSend(); } break;
-			case 'delta': { const b = aiBubble(); currentText += m.text; b.innerHTML = render(currentText); scroll(); break; }
-			case 'toolStart': clearStatus(); lastTool = toolCard(m.name, m.summary); break;
+			case 'delta': { if (flowIdx >= 0 && flowIdx < flowSteps.length) flowTo(flowIdx <= 1 ? 'plan' : flowSteps[flowIdx].id); const b = aiBubble(); currentText += m.text; b.innerHTML = render(currentText); scroll(); break; }
+			case 'toolStart': clearStatus(); lastTool = toolCard(m.name, m.summary); if (TOOL_STEP[m.name]) flowTo(TOOL_STEP[m.name]); break;
 			case 'toolEnd': {
 				if (!lastTool) break;
 				const row = lastTool.querySelector('.lc-step__row');
@@ -1527,7 +1835,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			case 'jobs': {
 				closeBubble();
 				const row = el('div', 'lc-jobs');
-				row.append(el('span', 'lc-jobs__dot'), el('span', '', 'Verified on Lightchain · ' + m.count + ' job' + (m.count === 1 ? '' : 's') + ' · ≈' + m.cost + ' LCAI'));
+				row.append(el('span', '', 'Verified on Lightchain · ' + m.count + ' job' + (m.count === 1 ? '' : 's') + ' · ≈' + m.cost + ' LCAI'));
 				m.jobs.slice(-3).forEach(j => {
 					const a = el('a', '', '#' + j.id);
 					if (j.url) { a.href = '#'; a.title = 'Open the job transaction on Lightscan'; a.onclick = e => { e.preventDefault(); vscode.postMessage({ type: 'openUrl', url: j.url }); }; }
@@ -1537,7 +1845,8 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				break;
 			}
 			case 'status': setStatus(m.text, m.walletPrompt); break;
-			case 'busy': setBusy(m.busy); if (!m.busy) { closeBubble(); clearStatus(); } break;
+			case 'busy': setBusy(m.busy); if (m.busy) startFlow(); else { closeBubble(); clearStatus(); if (flowSteps.length) { flowIdx = flowSteps.length; drawFlow(true); } } break;
+			case 'agents': agentState = m; renderAgent(); break;
 			case 'error': card({ title: m.message, state: 'Failed', stateKind: 'err' }); break;
 			case 'card': card(m); break;
 			case 'cardRemove': thread.querySelector('[data-card="' + m.id + '"]')?.remove(); break;
@@ -1547,7 +1856,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				break;
 			}
 			case 'notice': card({ title: m.message, state: 'Done', stateKind: 'ok' }); break;
-			case 'cleared': thread.replaceChildren(emptyState); current = null; lastTool = null; break;
+			case 'cleared': thread.replaceChildren(emptyState); current = null; lastTool = null; for (const k in sessionEdits) delete sessionEdits[k]; renderEdits(); $('flowStrip').hidden = true; flowSteps = []; flowIdx = -1; break;
 		}
 	});
 </script>

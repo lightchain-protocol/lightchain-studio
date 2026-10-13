@@ -20,7 +20,22 @@
 				"**/cache": {
 					"when": "foundry.toml"
 				}
-			}
+			},
+			"breadcrumbs.enabled": false,
+			"editor.smoothScrolling": true,
+			"editor.cursorSmoothCaretAnimation": "on",
+			"editor.cursorBlinking": "smooth",
+			"editor.renderLineHighlight": "gutter",
+			"editor.overviewRulerBorder": false,
+			"editor.hideCursorInOverviewRuler": true,
+			"editor.padding.top": 14,
+			"editor.lineHeight": 1.65,
+			"editor.guides.indentation": false,
+			"workbench.list.smoothScrolling": true,
+			"workbench.tree.renderIndentGuides": "none",
+			"terminal.integrated.smoothScrolling": true,
+			"terminal.integrated.enablePersistentSessions": false,
+			"workbench.reduceMotion": "off"
 		}
 	}
 }

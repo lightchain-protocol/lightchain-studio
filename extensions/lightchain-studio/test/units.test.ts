@@ -1,11 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { claimedFile, codeBlockAsWrite, parseToolCalls } from '../src/agent/agent';
+import { claimedFile, codeBlockAsWrite, parseToolCalls, systemPrompt } from '../src/agent/agent';
 import { looseReplace, truncatedRewrite } from '../src/agent/tools';
 import { applyHunks, diffOps, lineDiff } from '../src/agent/lineDiff';
 import { reviewText } from '../src/editorReview';
 import { projectMap } from '../src/agent/projectMap';
 import { expandSlash, parseSlash } from '../src/agent/commands';
+import { normalize, parseChecklist, taskPrompt } from '../src/tasks';
+import { templateFor } from '../src/newProject';
+import { cleanMessage, commitPrompt } from '../src/commitMessage';
+import { BUILTIN_AGENTS, allowedTools, flow, normalizeProfile, profilePrompt } from '../src/agent/profiles';
 import { changedFiles, estimateTokens, recap, sessionNotes } from '../src/agent/memory';
 import { buildInlinePrompt, extractReplacement, trimEcho } from '../src/agent/inlineEdit';
 import { AGENT_MODELS, fetchModels, pickDefault } from '../src/lightchain/models';
@@ -180,4 +184,48 @@ test('slash commands: parse, expand with scope and extra text, ignore unknown', 
 	assert.match(e, /Also: check the fee math$/);
 	assert.match(expandSlash('/test', 'lines 3–9 of src/A.sol')!, /tests in test\/ for lines 3–9 of src\/A\.sol/);
 	assert.equal(expandSlash('/deploy', 'x'), undefined); // opens the wizard instead
+});
+
+test('tasks: checklist parsing and file normalisation', () => {
+	const items = parseChecklist('Here is the plan:\n- [ ] Write the Raffle contract — tickets in LCAI, weekly draw\n- [ ] **Add tests**: buying, drawing, refunds\n1. Deploy to testnet\nSome closing text.');
+	assert.deepEqual(items.map(i => i.title), ['Write the Raffle contract', 'Add tests', 'Deploy to testnet']);
+	assert.equal(items[0].description, 'tickets in LCAI, weekly draw');
+	const f = normalize({ tasks: [{ id: 'a', title: 'x', status: 'weird', key: 4 }, { id: 'b', title: 'y', priority: 'high' }, { nope: 1 }] });
+	assert.equal(f.tasks.length, 2);
+	assert.equal(f.tasks[0].status, 'todo');
+	assert.equal(f.tasks[1].priority, 'high');
+	assert.equal(f.next, 5); // after the highest key
+	assert.match(taskPrompt({ ...f.tasks[0], description: 'details' }), /^Work on task LC-4: x\n\ndetails/);
+});
+
+test('templateFor: the starter closest to a description', () => {
+	assert.equal(templateFor('A weekly raffle where people buy tickets and one winner gets the pot'), 'coinflip');
+	assert.equal(templateFor('An NFT collection of pixel art badges'), 'nft');
+	assert.equal(templateFor('A reward token for my community with staking'), 'token');
+	assert.equal(templateFor('Freelance payments held until the client approves'), 'escrow');
+	assert.equal(templateFor('Something that stores a number'), 'counter');
+});
+
+test('commit message: prompt carries the diff, reply is cleaned', () => {
+	const p = commitPrompt('diff --git a/src/A.sol b/src/A.sol\n+uint fee;', ['src/B.sol']);
+	assert.match(p, /New files: src\/B\.sol/);
+	assert.match(p, /```diff\ndiff --git/);
+	assert.equal(cleanMessage('Here is the commit message:\n```\nAdd fee to A\n\n- store a fee\n```'), 'Add fee to A\n\n- store a fee');
+	assert.equal(cleanMessage('"Fix the build"'), 'Fix the build');
+});
+
+test('agent profiles: tools, prompt and flow follow the switches', () => {
+	const auditor = BUILTIN_AGENTS.find(a => a.id === 'auditor')!;
+	assert.deepEqual(allowedTools(auditor), ['list_dir', 'read_file', 'search', 'forge_build']);
+	assert.match(profilePrompt(auditor), /must not change any files/);
+	const sys = systemPrompt('demo', auditor);
+	assert.doesNotMatch(sys, /- write_file:/);
+	assert.match(sys, /"Auditor" agent/);
+	assert.match(systemPrompt('demo'), /- write_file:/); // no profile: everything
+	assert.deepEqual(flow(auditor).filter(s => !s.on).map(s => s.id), ['write', 'test']);
+	const p = normalizeProfile({ id: 'x', name: 'Mine', color: 'red', rules: ['a', '', 7], can: { write: true } })!;
+	assert.equal(p.color, '#7130C3');
+	assert.deepEqual(p.rules, ['a']);
+	assert.deepEqual(p.can, { read: true, write: true, build: false, test: false, run: false });
+	assert.equal(normalizeProfile({ name: 'no id' }), undefined);
 });

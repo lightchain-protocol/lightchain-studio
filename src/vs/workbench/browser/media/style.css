@@ -16,6 +16,18 @@
 @font-face { font-family: "Inter"; src: url("./fonts/Inter-latin-ext.woff2") format("woff2"); font-weight: 100 900; font-display: block; unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF; }
 
 .monaco-workbench.mac { font-family: "Inter", -apple-system, BlinkMacSystemFont, sans-serif; }
+/* Lightchain chrome: less IDE furniture, so it reads as Lightchain Studio and not VS Code */
+.modern-ui .monaco-sash:not(.disabled)::after { display: none !important; }
+.monaco-workbench .part.sidebar > .title > .title-label { display: none !important; }
+.monaco-workbench .part.statusbar #status\.editor\.indentation,
+.monaco-workbench .part.statusbar #status\.editor\.encoding,
+.monaco-workbench .part.statusbar #status\.editor\.eol,
+.monaco-workbench .part.statusbar #status\.editor\.mode,
+.monaco-workbench .part.statusbar #status\.notifications { display: none !important; }
+.monaco-workbench .part.statusbar { font-size: 11px; }
+.monaco-workbench .monaco-list .monaco-list-row,
+.monaco-workbench .action-item .action-label,
+.monaco-workbench .tabs-container .tab { transition: background-color .12s ease, color .12s ease; }
 .monaco-workbench.mac:lang(zh-Hans) { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", sans-serif; }
 .monaco-workbench.mac:lang(zh-Hant) { font-family: -apple-system, BlinkMacSystemFont, "PingFang TC", sans-serif; }
 .monaco-workbench.mac:lang(ja) { font-family: -apple-system, BlinkMacSystemFont, "Hiragino Kaku Gothic Pro", sans-serif; }

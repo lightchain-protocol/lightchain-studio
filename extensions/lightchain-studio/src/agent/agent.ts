@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { TOOLS, ToolCall, ToolContext, ToolResult } from './tools';
+import { AgentProfile, allowedTools, profilePrompt } from './profiles';
 
 /**
  * Lightchain AI coding agent.
@@ -47,28 +48,33 @@ const TOOL_BLOCK = /```tool\s*\n([\s\S]*?)\n```/g;
  */
 const AGENT_TOOLS = TOOLS.filter(t => t.name !== 'edit_file');
 
-export function systemPrompt(workspaceName: string): string {
-	const tools = AGENT_TOOLS.map(t => `- ${t.name}: ${t.description}\n  args: ${t.args}`).join('\n');
+export function systemPrompt(workspaceName: string, profile?: AgentProfile): string {
+	const allowed = profile ? allowedTools(profile) : undefined;
+	const tools = AGENT_TOOLS.filter(t => !allowed || allowed.includes(t.name)).map(t => `- ${t.name}: ${t.description}\n  args: ${t.args}`).join('\n');
+	const canWrite = !profile || profile.can.write;
 	return [
 		`You are Lightchain AI, the coding agent inside Lightchain Studio — the IDE for building on the Lightchain AI blockchain (EVM, Solidity, Foundry). Testnet chain id 8200, mainnet 9200, native token LCAI.`,
 		`You are working in the project "${workspaceName}". Paths are relative to the project root.`,
+		...(profile ? ['', profilePrompt(profile)] : []),
 		``,
 		`You can use tools. To call one, reply with a fenced block exactly like:`,
 		'```tool',
 		`{"name": "read_file", "args": {"path": "src/Counter.sol"}}`,
 		'```',
 		`Call one or more tools per reply, then STOP and wait for the results. Do not invent tool results.`,
-		`When the task is done, reply normally without any tool block and summarize what you changed.`,
+		`When the task is done, reply normally without any tool block and summarize ${canWrite ? 'what you changed' : 'your answer'}.`,
 		``,
 		`Tools:`,
 		tools,
-		``,
-		`Example — to create a file, reply with:`,
-		'```tool',
-		`{"name": "write_file", "args": {"path": "src/Hello.sol", "content": "// SPDX-License-Identifier: MIT\\npragma solidity ^0.8.24;\\n\\ncontract Hello {}\\n"}}`,
-		'```',
-		``,
-		`Rules: a file only exists after a write_file result says "Wrote …" — never claim you created or changed a file otherwise. To change a file, read_file it, then write_file the COMPLETE new file (never a fragment); write complete, compilable Solidity (pragma ^0.8.24, SPDX header); prefer Foundry conventions (src/, test/, script/); keep changes minimal and explain them briefly.`,
+		...(canWrite ? [
+			``,
+			`Example — to create a file, reply with:`,
+			'```tool',
+			`{"name": "write_file", "args": {"path": "src/Hello.sol", "content": "// SPDX-License-Identifier: MIT\\npragma solidity ^0.8.24;\\n\\ncontract Hello {}\\n"}}`,
+			'```',
+			``,
+			`Rules: a file only exists after a write_file result says "Wrote …" — never claim you created or changed a file otherwise. To change a file, read_file it, then write_file the COMPLETE new file (never a fragment); write complete, compilable Solidity (pragma ^0.8.24, SPDX header); prefer Foundry conventions (src/, test/, script/); keep changes minimal and explain them briefly.`,
+		] : []),
 	].join('\n');
 }
 
@@ -156,13 +162,34 @@ const MAX_FIX_ROUNDS = 2;
 export class Agent {
 	private history: ChatMessage[];
 
-	constructor(private provider: InferenceProvider, private readonly ctx: ToolContext) {
-		this.history = [{ role: 'system', content: systemPrompt(vscode.workspace.name ?? 'workspace') }];
+	constructor(private provider: InferenceProvider, private readonly ctx: ToolContext, private profile?: AgentProfile) {
+		this.history = [{ role: 'system', content: systemPrompt(vscode.workspace.name ?? 'workspace', profile) }];
+	}
+
+	/** Switch to another agent profile; takes effect with the next worker session. */
+	setProfile(profile: AgentProfile): void {
+		this.profile = profile;
+		this.history[0] = { ...this.history[0], content: systemPrompt(vscode.workspace.name ?? 'workspace', profile) };
+	}
+
+	private get tools() {
+		const allowed = this.profile ? allowedTools(this.profile) : undefined;
+		return AGENT_TOOLS.filter(t => !allowed || allowed.includes(t.name));
 	}
 
 	/** The current project map; sent at the start of a session and again when it changes. */
 	setProjectMap(map: string): void {
 		this.history[0].map = map || undefined;
+	}
+
+	/** The model's latest reply (without tool results). */
+	lastReply(): string {
+		for (let i = this.history.length - 1; i > 0; i--) {
+			if (this.history[i].role === 'assistant') {
+				return this.history[i].content;
+			}
+		}
+		return '';
 	}
 
 	/** Number of messages so far (a mark to rewind to). */
@@ -213,10 +240,10 @@ export class Agent {
 			this.history.push({ role: 'assistant', content: reply });
 			const calls = parseToolCalls(reply);
 			if (!calls.length) {
-				const apply = codeBlockAsWrite(reply);
+				const apply = this.profile && !this.profile.can.write ? undefined : codeBlockAsWrite(reply);
 				if (!apply) {
 					// Small models often say they created a file without calling write_file.
-					const claimed = claimedFile(reply);
+					const claimed = this.profile && !this.profile.can.write ? undefined : claimedFile(reply);
 					if (claimed && !wrote && !nudged) {
 						nudged = true;
 						events.onStatus(`The model described ${claimed} without writing it — asking it to write the file…`);
@@ -224,7 +251,7 @@ export class Agent {
 						continue;
 					}
 					// Build-and-fix: compile what was written; feed errors back (max 2 rounds).
-					if (unbuilt && this.ctx.forgePath && !signal.aborted) {
+					if (unbuilt && this.ctx.forgePath && !signal.aborted && (!this.profile || (this.profile.check && this.profile.can.build))) {
 						const build = TOOLS.find(t => t.name === 'forge_build')!;
 						const call: ToolCall = { name: 'forge_build', args: {} };
 						events.onToolStart(call);
@@ -238,7 +265,7 @@ export class Agent {
 							continue;
 						}
 						// it builds: run the project's tests too, and fix what broke
-						if (result.ok && hasTests(this.ctx.root) && !signal.aborted) {
+						if (result.ok && hasTests(this.ctx.root) && !signal.aborted && (!this.profile || this.profile.can.test)) {
 							const test = TOOLS.find(t => t.name === 'forge_test')!;
 							const tcall: ToolCall = { name: 'forge_test', args: {} };
 							events.onToolStart(tcall);
@@ -262,12 +289,12 @@ export class Agent {
 				if (signal.aborted) {
 					break;
 				}
-				const tool = AGENT_TOOLS.find(t => t.name === call.name);
+				const tool = this.tools.find(t => t.name === call.name);
 				if (!tool) {
 					// a slip the model corrects itself: tell it, don't show it as a failed step
 					const output = call.name === 'edit_file'
 						? `edit_file is not available. Call read_file on ${String(call.args.path ?? 'the file')} if needed, then write_file with its complete new content.`
-						: call.name === '__invalid__' ? 'Invalid tool JSON — use {"name": ..., "args": {...}} inside a ```tool block.' : `Unknown tool "${call.name}". Available: ${AGENT_TOOLS.map(t => t.name).join(', ')}.`;
+						: call.name === '__invalid__' ? 'Invalid tool JSON — use {"name": ..., "args": {...}} inside a ```tool block.' : `Tool "${call.name}" is not available to this agent. Available: ${this.tools.map(t => t.name).join(', ')}.`;
 					events.onToolEnd(call, { ok: false, output }, true);
 					if (!results.some(r => r.includes(output))) {
 						results.push(`Result of ${call.name} (error):\n${output}`);

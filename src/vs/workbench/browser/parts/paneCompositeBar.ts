@@ -690,7 +690,19 @@ export class PaneCompositeBar extends Disposable {
 	}
 
 	private getStoredPinnedViewContainersValue(): string {
-		return this.storageService.get(this.options.pinnedViewContainersKey, StorageScope.PROFILE, '[]');
+		const stored = this.storageService.get(this.options.pinnedViewContainersKey, StorageScope.PROFILE, '[]');
+		const trimmedKey = `lightchain.activity.trimmed.${this.options.pinnedViewContainersKey}`;
+		if (this.storageService.getBoolean(trimmedKey, StorageScope.PROFILE, false)) {
+			return stored;
+		}
+		this.storageService.store(trimmedKey, true, StorageScope.PROFILE, StorageTarget.MACHINE);
+		let pinned: IPinnedViewContainer[] = JSON.parse(stored);
+		for (const id of ['workbench.view.scm', 'workbench.view.debug', 'workbench.view.extensions']) {
+			pinned = pinned.some(p => p.id === id) ? pinned.map(p => p.id === id ? { ...p, pinned: false } : p) : [...pinned, { id, pinned: false, visible: false }];
+		}
+		const value = JSON.stringify(pinned);
+		this.storageService.store(this.options.pinnedViewContainersKey, value, StorageScope.PROFILE, StorageTarget.USER);
+		return value;
 	}
 
 	private setStoredPinnedViewContainersValue(value: string): void {

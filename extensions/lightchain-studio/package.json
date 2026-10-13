@@ -11,7 +11,8 @@
 	"main": "./dist/extension.js",
 	"activationEvents": [
 		"onStartupFinished",
-		"workspaceContains:foundry.toml"
+		"workspaceContains:foundry.toml",
+		"onUri"
 	],
 	"capabilities": {
 		"untrustedWorkspaces": {
@@ -28,13 +29,27 @@
 					"title": "Lightchain",
 					"icon": "media/lightchain.svg"
 				}
+			],
+			"activitybar": [
+				{
+					"id": "lightchain-home",
+					"title": "Lightchain",
+					"icon": "media/lightchain.svg"
+				}
+			],
+			"panel": [
+				{
+					"id": "lightchain-panel",
+					"title": "Lightchain AI",
+					"icon": "media/lightchain.svg"
+				}
 			]
 		},
 		"views": {
 			"lightchain": [
 				{
 					"id": "lightchain.deployedPrograms",
-					"name": "Deployed Programs",
+					"name": "Deployed contracts",
 					"icon": "media/lightchain.svg",
 					"initialSize": 1
 				},
@@ -43,13 +58,29 @@
 					"type": "webview",
 					"name": "Lightchain AI",
 					"icon": "media/lightchain.svg",
-					"initialSize": 2
+					"initialSize": 3
 				}
 			],
 			"extensions": [
 				{
 					"id": "lightchain.marketplace",
 					"name": "Lightchain Marketplace"
+				}
+			],
+			"lightchain-home": [
+				{
+					"type": "webview",
+					"id": "lightchain.workspace",
+					"name": "Lightchain"
+				}
+			],
+			"lightchain-panel": [],
+			"explorer": [
+				{
+					"type": "webview",
+					"id": "lightchain.walletView",
+					"name": "Wallet",
+					"icon": "media/lightchain.svg"
 				}
 			]
 		},
@@ -298,6 +329,28 @@
 				"command": "lightchain.ai.audit",
 				"title": "Audit with Lightchain AI",
 				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.tasks.board",
+				"title": "Open Task Board",
+				"category": "Lightchain",
+				"icon": "$(project)"
+			},
+			{
+				"command": "lightchain.tasks.add",
+				"title": "New Task",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.ai.commit",
+				"title": "Commit with Lightchain AI",
+				"category": "Lightchain",
+				"icon": "$(sparkle)"
+			},
+			{
+				"command": "lightchain.agents.open",
+				"title": "Open Agent Studio",
+				"category": "Lightchain"
 			}
 		],
 		"menus": {
@@ -472,6 +525,13 @@
 					"group": "navigation",
 					"when": "commentController == lightchain.inline"
 				}
+			],
+			"scm/title": [
+				{
+					"command": "lightchain.ai.commit",
+					"group": "navigation@0",
+					"when": "scmProvider == git"
+				}
 			]
 		},
 		"configuration": {
@@ -515,6 +575,16 @@
 					"default": 8192,
 					"minimum": 2048,
 					"markdownDescription": "How much conversation (in tokens) a Lightchain AI session may hold before Studio continues it in a fresh session with a recap. Match it to the model's context window."
+				},
+				"lightchain.explorer.outline": {
+					"type": "boolean",
+					"default": false,
+					"description": "Show the Outline section (the symbols of the open file) under Files."
+				},
+				"lightchain.explorer.timeline": {
+					"type": "boolean",
+					"default": false,
+					"description": "Show the Timeline section (the file's local history) under Files."
 				}
 			}
 		},

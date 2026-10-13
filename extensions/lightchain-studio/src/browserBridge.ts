@@ -171,7 +171,7 @@ export class BrowserBridge implements vscode.Disposable {
 				'Referrer-Policy': 'no-referrer',
 				'Content-Security-Policy': `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'self' 'nonce-${nonce}'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
 			});
-			res.end(connectPageHtml({ nonce, networks: Object.values(NETWORKS).map(chainParams), known: this.context.globalState.get<{ address: string; wallet: string }>('lightchain.wallet.browser') }));
+			res.end(connectPageHtml({ nonce, networks: Object.values(NETWORKS).map(chainParams), known: this.context.globalState.get<{ address: string; wallet: string }>('lightchain.wallet.browser'), ideUrl: `${vscode.env.uriScheme}://lightchain.lightchain-studio/return` }));
 			return;
 		}
 		if (action === 'events' && req.method === 'GET') {

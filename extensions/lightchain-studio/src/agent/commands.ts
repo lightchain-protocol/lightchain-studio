@@ -25,6 +25,10 @@ export const SLASH_COMMANDS: SlashCommand[] = [
 		name: 'doc', hint: 'Add NatSpec comments',
 		prompt: (scope, extra) => `Add NatSpec documentation (@title, @notice, @dev, @param, @return) to ${scope} without changing any code.${extra}`,
 	},
+	{
+		name: 'plan', hint: 'Break a goal into tasks for the board',
+		prompt: (_scope, extra) => `Break this goal into 3 to 10 small, concrete tasks for a Lightchain project (EVM, Solidity, Foundry; testnet first): ${extra || 'the next steps for this project'}\n\nReply ONLY with a checklist, one task per line, in this exact form:\n- [ ] Short task title — one sentence on what done looks like\n\nOrder them so each can be done and tested on its own. Do not change any files and do not call tools.`,
+	},
 	{ name: 'deploy', hint: 'Deploy a contract (wizard)' },
 ];
 
@@ -41,5 +45,6 @@ export function expandSlash(text: string, scope: string): string | undefined {
 	if (!parsed?.command.prompt) {
 		return undefined;
 	}
-	return parsed.command.prompt(scope, parsed.extra ? `\n\nAlso: ${parsed.extra}` : '');
+	// /plan takes the goal itself; the others take extra instructions
+	return parsed.command.prompt(scope, parsed.command.name === 'plan' ? parsed.extra : parsed.extra ? `\n\nAlso: ${parsed.extra}` : '');
 }

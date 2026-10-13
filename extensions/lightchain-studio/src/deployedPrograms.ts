@@ -77,6 +77,11 @@ export class DeployedProgramsProvider implements vscode.TreeDataProvider<TreeNod
 		await this.context.workspaceState.update(this.stateKey(), { ...this.state, ...update });
 	}
 
+	/** Every program known on the current network. */
+	get all(): Program[] {
+		return this.programs;
+	}
+
 	/** Programs this project names or references (the folded "Other deployments" are left out). */
 	get relevant(): Program[] {
 		return this.programs.filter(p => p.name || this.references.has(p.address.toLowerCase()));

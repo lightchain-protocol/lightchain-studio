@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { Agent, AgentStuckError, ChatMessage, InferenceProvider } from '../src/agent/agent';
+import { BUILTIN_AGENTS } from '../src/agent/profiles';
 
 const fence = '```';
 const tool = (o: object) => `${fence}tool\n${JSON.stringify(o)}\n${fence}`;
@@ -116,4 +117,19 @@ test('test-and-fix: after a successful build the tests run, and a failure goes b
 		'start write_file', 'end write_file ok', 'start forge_build', 'end forge_build ok', 'start forge_test', 'end forge_test ok', 'turnEnd',
 	]);
 	assert.match(m.seen[2], /forge test failed:[\s\S]*10 != 5/);
+});
+
+test('profiles are enforced: a read-only agent cannot write, even if the model tries', async () => {
+	const { root, forge } = project();
+	const auditor = BUILTIN_AGENTS.find(a => a.id === 'auditor')!;
+	const m = fakeModel([
+		tool({ name: 'write_file', args: { path: 'src/Evil.sol', content: 'contract Evil {}' } }),
+		'Finding: no issues of high severity.',
+	]);
+	const log: string[] = [];
+	const agent = new Agent(m.provider, { root, forgePath: forge, approve: async () => true }, auditor);
+	await agent.run('audit src', events(log), new AbortController().signal);
+	assert.deepEqual(log, ['end write_file fail soft', 'turnEnd']);
+	assert.match(m.seen[1], /not available to this agent/);
+	assert.equal(fs.existsSync(path.join(root, 'src/Evil.sol')), false);
 });

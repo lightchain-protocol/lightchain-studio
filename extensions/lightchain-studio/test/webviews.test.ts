@@ -5,6 +5,11 @@ import { LightchainAiView } from '../src/aiView';
 import { StartPage } from '../src/startPage';
 import { InteractPanels } from '../src/interact';
 import { connectPageHtml } from '../src/connectPage';
+import { WorkspaceView } from '../src/workspaceView';
+import { BoardPanel } from '../src/boardPanel';
+import { AgentStudio } from '../src/agentStudio';
+import { NewProjectPanel } from '../src/newProjectPanel';
+import { WalletView } from '../src/walletView';
 
 // The webview pages are HTML built in TypeScript template literals; a backslash that
 // is right in TS can be wrong in the page (e.g. '\n' becomes a real line break inside
@@ -43,4 +48,33 @@ test('Interact tab script compiles', () => {
 
 test('Wallet connect page script compiles', () => {
 	assertCompiles('connectPage', connectPageHtml({ nonce: 'n', networks: [], known: { address: '0x0', wallet: 'MetaMask' } }));
+});
+
+test('Lightchain sidebar (projects, tasks, chats) script compiles', () => {
+	const host = { onDidChangeChats: () => ({ dispose() { } }) } as never;
+	const tasks = { onDidChange: () => ({ dispose() { } }) } as never;
+	const v = new WorkspaceView(extUri, host, tasks) as unknown as { html(w: unknown): string };
+	assertCompiles('workspaceView', v.html(webview));
+});
+
+test('Wallet view script compiles', () => {
+	const v = new WalletView(extUri, stub, stub, stub, memento) as unknown as { html(w: unknown): string };
+	assertCompiles('walletView', v.html(webview));
+});
+
+test('Task board script compiles', () => {
+	const tasks = { onDidChange: () => ({ dispose() { } }) } as never;
+	const b = new BoardPanel(extUri, tasks, async () => { }, async () => { }) as unknown as { html(w: unknown): string };
+	assertCompiles('boardPanel', b.html(webview));
+});
+
+test('Agent Studio script compiles', () => {
+	const profiles = { onDidChange: () => ({ dispose() { } }) } as never;
+	const st = new AgentStudio(extUri, profiles, () => [], async () => { }) as unknown as { html(w: unknown): string };
+	assertCompiles('agentStudio', st.html(webview));
+});
+
+test('New project window script compiles', () => {
+	const panel = new NewProjectPanel(extUri) as unknown as { html(w: unknown): string };
+	assertCompiles('newProjectPanel', panel.html(webview));
 });
