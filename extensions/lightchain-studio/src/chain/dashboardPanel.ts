@@ -146,11 +146,11 @@ export const DASHBOARD_CSS = `
 	.row.flash .v { color: #ff6fdc; }
 	.ev { display: block; width: 100%; padding: 8px 10px; margin-top: 6px; border: 1px solid var(--zap); border-radius: 10px; background: transparent; color: var(--lc-text-primary); font-size: 12.5px; text-align: left; cursor: pointer; word-break: break-word; transition: border-color .2s ease, background .2s ease; }
 	.ev:hover { border-color: var(--zap-strong); background: rgba(91, 75, 255, 0.06); }
-	.ev.new { border-color: rgba(221, 0, 172, 0.5); }
+	.ev.new { border-color: rgba(221, 0, 172, 0.4); }
 	.ev small { display: block; margin-top: 2px; color: var(--lc-text-tertiary); font-size: 11.5px; }
 	.live { display: inline-flex; align-items: center; gap: 6px; color: var(--lc-text-tertiary); font-size: 12px; }
-	.live i { width: 7px; height: 7px; border-radius: 50%; background: var(--lc-success); animation: pulse 2s ease infinite; }
-	.live.off i { background: var(--lc-warning); animation: none; }
+	.live i { width: 7px; height: 7px; border-radius: 50%; background: var(--lc-accent); animation: pulse 2s ease infinite; }
+	.live.off i { background: var(--lc-text-tertiary); animation: none; }
 	@keyframes pulse { 50% { opacity: .35; } }
 	.toggle { display: flex; align-items: center; gap: 10px; margin-top: 10px; color: var(--lc-text-secondary); font-size: 12.5px; cursor: pointer; }
 `;
@@ -169,7 +169,7 @@ export const DASHBOARD_SCRIPT = `
 		const bal = panel('Holds'); bal.append(el('div', 'big', m.balance));
 		const live = el('span', 'live'); live.append(el('i'), 'Live · block ' + m.block.toLocaleString()); live.style.marginTop = '8px'; bal.append(live);
 		left.append(bal);
-		if (m.noCode) left.append(el('div', 'say bad', 'There is no contract at this address on ' + m.network + '. It may be on the other network.'));
+		if (m.noCode) left.append(el('div', 'notice error', 'There is no contract at this address on ' + m.network + '. It may be on the other network.'));
 		const vals = panel('Right now');
 		if (!m.hasAbi) vals.append(el('div', 'note', 'Build the project (or name this contract like the one in your code) to see its values here.'));
 		else if (!m.values.length) vals.append(el('div', 'note', 'This contract has no values that can be read without arguments.'));

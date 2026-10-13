@@ -42,7 +42,7 @@ export function generateApp(spec: AppSpec): string {
 <title>${esc(spec.name)} on Lightchain</title>
 <!-- Made with Lightchain Studio for ${esc(spec.name)} at ${esc(spec.address)} (Lightchain ${esc(spec.network.label)}). One file, no build step: edit it freely. -->
 <style>
-	:root { --bg: #070710; --card: #0f0f14; --raise: #14152c; --line: rgba(255, 255, 255, 0.1); --t1: #f5f6ff; --t2: #ccceef; --t3: #7376aa; --accent: #5b4bff; --grad: linear-gradient(90deg, #df04ae 0%, #412ffd 100%); --ok: #3eb75e; --bad: #ff6b69; }
+	:root { --bg: #070710; --card: #0f0f14; --raise: #14152c; --line: rgba(255, 255, 255, 0.1); --t1: #f5f6ff; --t2: #ccceef; --t3: #7376aa; --accent: #5b4bff; --grad: linear-gradient(90deg, #df04ae 0%, #412ffd 100%); --ok: #f5f6ff; --bad: #fecaca; }
 	* { box-sizing: border-box; }
 	body { margin: 0; background: var(--bg); color: var(--t2); font: 15px/1.6 Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; -webkit-font-smoothing: antialiased; }
 	main { max-width: 880px; margin: 0 auto; padding: 40px 20px 80px; }

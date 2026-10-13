@@ -24,21 +24,21 @@ export function page(webview: vscode.Webview, extensionUri: vscode.Uri, o: { tit
 	.p-top { flex: none; display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; padding: 24px 28px 18px; border-bottom: 1px solid var(--lc-rule); }
 	.p-top .eyebrow { margin-bottom: 12px; }
 	.p-top .title { color: var(--lc-text-strong); }
-	.p-top .lead { margin-top: 6px; color: var(--lc-text-tertiary); font-size: 14px; }
+	.p-top .lead { margin-top: 6px; color: var(--lc-text-tertiary); font-size: 14px; overflow-wrap: anywhere; }
 	.p-top .grow { flex: 1; min-width: 0; }
 	.p-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 	.p-body { flex: 1; min-height: 0; overflow-y: auto; padding: 22px 28px 40px; }
 	.p-col { display: flex; flex-direction: column; gap: 12px; max-width: 860px; }
 	.zpanel { padding: 14px 16px; border-radius: 14px; border: 1px solid var(--zap); background: rgba(204, 206, 239, 0.03); }
 	.zlabel { margin-bottom: 10px; color: var(--lc-text-tertiary); font-size: 12px; font-weight: 500; }
-	.say { padding: 14px 16px; border-radius: 14px; border: 1px solid var(--zap); background: rgba(91, 75, 255, 0.06); color: var(--lc-text-primary); font-size: 14px; line-height: 1.6; }
-	.say.bad { border-color: rgba(255, 42, 39, 0.35); background: rgba(255, 42, 39, 0.06); }
-	.say.good { border-color: rgba(62, 183, 94, 0.35); background: rgba(62, 183, 94, 0.06); }
+	.say { padding: 14px 16px; border-radius: 14px; border: 1px solid var(--zap); background: rgba(204, 206, 239, 0.03); color: var(--lc-text-primary); font-size: 14px; line-height: 1.6; }
+	/* notices: LCAIPresale .lc-bridge__notice (--warn, --error), copied value for value */
+	.notice { padding: 9px 14px; border-radius: 12px; border: 1px solid; font-size: 13px; line-height: 1.4; word-break: break-word; }
+	.notice.warn { border-color: rgba(234, 179, 8, 0.3); background: rgba(234, 179, 8, 0.1); color: #fde68a; }
+	.notice.error { border-color: rgba(239, 68, 68, 0.3); background: rgba(239, 68, 68, 0.1); color: #fecaca; }
 	.pill { display: inline-flex; align-items: center; padding: 1px 8px; border-radius: 999px; border: 1px solid rgba(112, 100, 233, 0.24); background: var(--lc-surface-hover); color: var(--lc-text-secondary); font-size: 11px; font-weight: 600; letter-spacing: .04em; white-space: nowrap; }
-	.pill.ok { border-color: transparent; background: rgba(62, 183, 94, 0.14); color: var(--lc-success); }
-	.pill.err { border-color: transparent; background: rgba(255, 42, 39, 0.14); color: #ff6b69; }
-	.pill.warn { border-color: transparent; background: rgba(255, 143, 60, 0.14); color: var(--lc-warning); }
-	.pill.hot { border-color: transparent; background: rgba(221, 0, 172, 0.15); color: #ff6fdc; }
+	/* the one highlighted pill: LCAIPresale's accent chip (the bridge card's "done" pink) */
+	.pill.on { border-color: transparent; background: rgba(221, 0, 172, 0.15); color: #ff6fdc; }
 	.row { display: flex; align-items: baseline; gap: 12px; padding: 7px 0; font-size: 13px; }
 	.row + .row { border-top: 1px solid rgba(112, 100, 233, 0.12); }
 	.row .k { flex: none; width: 120px; color: var(--lc-text-tertiary); font-size: 12px; }
@@ -47,6 +47,8 @@ export function page(webview: vscode.Webview, extensionUri: vscode.Uri, o: { tit
 	.empty { margin: 60px auto; max-width: 420px; text-align: center; }
 	.empty h2 { margin: 0 0 8px; color: var(--lc-text-strong); font-size: 18px; font-weight: 600; }
 	.empty p { margin: 0 0 18px; color: var(--lc-text-tertiary); font-size: 13px; line-height: 1.6; }
+	/* a narrow tab: the actions get their own row under the title instead of squeezing it */
+	@media (max-width: 1000px) { .p-top .grow { flex-basis: 100%; } }
 	@media (max-width: 700px) { .p-top { padding: 18px 20px 14px; } .p-body { padding: 18px 20px 32px; } .row .k { width: 92px; } }
 	${o.css ?? ''}
 </style>

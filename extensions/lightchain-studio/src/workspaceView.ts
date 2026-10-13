@@ -28,6 +28,11 @@ export class WorkspaceView implements vscode.WebviewViewProvider, vscode.Disposa
 	programs?: () => { network: string; items: { name?: string; address: string; used: boolean }[]; other: { name?: string; address: string; used: boolean }[] };
 	/** The first-dApp checklist for this project; undefined hides it (set by the extension). */
 	steps?: () => Promise<StartStep[] | undefined>;
+	/** The active wallet's own projects; undefined (no wallet, or none yet) falls back to recent ones (set by the extension). */
+	walletProjects?: () => Promise<{ label: string; detail: string; uri: string }[] | undefined>;
+	/** Every connected wallet, for the switcher on the account card (set by the extension). */
+	wallets?: () => { id: string; name: string; address: string; active: boolean }[];
+	selectWallet?: (id: string) => Promise<void>;
 	private readonly disposables: vscode.Disposable[] = [];
 	private timer?: ReturnType<typeof setTimeout>;
 
@@ -56,7 +61,12 @@ export class WorkspaceView implements vscode.WebviewViewProvider, vscode.Disposa
 		void this.view.webview.postMessage({
 			type: 'state',
 			project: folder ? { name: folder.name, path: folder.uri.fsPath } : null,
-			recent: (await recentProjects()).filter(r => r.uri !== folder?.uri.toString()),
+			...await (async () => {
+				const mine = await this.walletProjects?.().catch(() => undefined);
+				const list = mine?.length ? mine : await recentProjects();
+				return { recent: list.filter(r => r.uri !== folder?.uri.toString()), recentMine: !!mine?.length };
+			})(),
+			wallets: this.wallets?.() ?? [],
 			programs: this.programs?.(),
 			account: await this.account?.().catch(() => undefined),
 			tasks: this.tasks.all.map(t => ({ id: t.id, key: `${this.tasks.prefix}-${t.key}`, title: t.title, status: t.status, priority: t.priority })),
@@ -74,6 +84,8 @@ export class WorkspaceView implements vscode.WebviewViewProvider, vscode.Disposa
 					await vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.parse(m.uri), { forceReuseWindow: true });
 				}
 				return;
+			case 'wallet':
+				return typeof m.id === 'string' ? this.selectWallet?.(m.id) : undefined;
 			case 'openFolder':
 				return void vscode.commands.executeCommand('workbench.action.files.openFolder');
 			case 'newProject':
@@ -186,6 +198,8 @@ export class WorkspaceView implements vscode.WebviewViewProvider, vscode.Disposa
 	.project .chev { margin-left: auto; }
 	.menu { position: absolute; left: 8px; right: 8px; z-index: 20; padding: 6px; border: 1px solid var(--lc-rule); border-radius: var(--lc-radius-group); background: var(--lc-surface-2); box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5); animation: fadeIn var(--lc-motion) ease; }
 	.menu[hidden] { display: none; }
+	.menu.up { bottom: 64px; max-height: 60vh; overflow-y: auto; }
+	.nav-item .tick { margin-left: auto; color: var(--lc-accent); font-size: 12px; }
 	.menu .group { padding: 6px 6px 4px; }
 	.sep { height: 1px; margin: 6px 0; background: var(--lc-rule); }
 
@@ -274,6 +288,7 @@ export class WorkspaceView implements vscode.WebviewViewProvider, vscode.Disposa
 			<div class="lrow"><span>Show</span><span class="seg"><button data-t="left">Left</button><button data-t="bottom">Bottom</button><button data-t="rightSide">Right</button></span></div>
 			<div class="lfoot"><span class="more" id="layoutReset" style="padding:0">Reset to default</span><span class="more" id="layoutClose" style="padding:0">Done</span></div>
 		</div>
+		<div class="menu up" id="wmenu" hidden></div>
 		<div class="account" id="account"></div>
 	</div>
 
@@ -284,7 +299,7 @@ export class WorkspaceView implements vscode.WebviewViewProvider, vscode.Disposa
 	const $ = id => document.getElementById(id);
 	const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
 	${IDENTICON_JS}
-	let state = { project: null, recent: [], chats: [], tasks: [], now: Date.now() };
+	let state = { project: null, recent: [], recentMine: false, wallets: [], chats: [], tasks: [], now: Date.now() };
 	let query = '', showDone = false, showOther = false;
 	const STATUS = { todo: 'To do', doing: 'In progress', review: 'Review', done: 'Done' };
 	const match = s => !query || s.toLowerCase().includes(query);
@@ -330,8 +345,8 @@ export class WorkspaceView implements vscode.WebviewViewProvider, vscode.Disposa
 		p.append(t); p.insertAdjacentHTML('beforeend', svg(ICON.chev, 'nav-icon chev'));
 		p.title = state.project ? state.project.path : '';
 		const menu = $('menu'); menu.replaceChildren();
-		const g = el('div', 'group'); g.append(el('span', 'group-title', 'Recent projects')); menu.append(g);
-		if (!state.recent.length) menu.append(el('div', 'empty', 'No other recent projects yet.'));
+		const g = el('div', 'group'); g.append(el('span', 'group-title', state.recentMine ? 'Projects of this wallet' : 'Recent projects')); menu.append(g);
+		if (!state.recent.length) menu.append(el('div', 'empty', state.account ? 'No other projects for this wallet yet.' : 'No other recent projects yet.'));
 		state.recent.forEach(r => menu.append(item({ mark: lcIdenticon(r.label), name: r.label, sub: r.detail, click: () => switchTo(r) })));
 		menu.append(el('div', 'sep'));
 		menu.append(item({ icon: 'files', name: 'New project…', click: () => { menu.hidden = true; vscode.postMessage({ type: 'newProject' }); } }));
@@ -392,11 +407,23 @@ export class WorkspaceView implements vscode.WebviewViewProvider, vscode.Disposa
 		const acc = state.account;
 		const m = el('span', 'nav-mark'); m.innerHTML = acc ? lcIdenticon(acc.address) : ''; a.append(m);
 		const t = el('span', 'nav-body');
-		t.append(el('span', 'nav-name mono', acc ? short(acc.address) : 'Connect a wallet'), el('span', 'nav-sub', acc ? acc.network + (acc.credits ? ' · ' + acc.credits + ' credits' : '') : 'Needed for Lightchain AI and deploys'));
+		const mine = (state.wallets || []).find(w => w.active);
+		t.append(el('span', 'nav-name' + (mine ? '' : ' mono'), acc ? (mine ? mine.name : short(acc.address)) : 'Connect a wallet'), el('span', 'nav-sub', acc ? (mine ? short(acc.address) + ' · ' : '') + acc.network + (acc.credits ? ' · ' + acc.credits + ' credits' : '') : 'Needed for Lightchain AI and deploys'));
 		a.append(t);
 		const g = el('button', 'gear'); g.title = 'Settings'; g.innerHTML = svg(ICON.gear, ''); g.onclick = e => { e.stopPropagation(); vscode.postMessage({ type: 'run', command: 'workbench.action.openSettings' }); };
 		a.append(g);
-		a.onclick = () => vscode.postMessage({ type: 'run', command: 'lightchain.wallet.menu' });
+		// the account card switches wallets: each one has its own projects, agents, instructions and chats
+		const wm = $('wmenu'); wm.replaceChildren();
+		const wg = el('div', 'group'); wg.append(el('span', 'group-title', 'Wallets')); wm.append(wg);
+		(state.wallets || []).forEach(w => {
+			const b = item({ mark: lcIdenticon(w.address), name: w.name, sub: short(w.address), mono: true, click: () => { wm.hidden = true; if (!w.active) vscode.postMessage({ type: 'wallet', id: w.id }); } });
+			if (w.active) b.append(el('span', 'tick', 'Active'));
+			wm.append(b);
+		});
+		if ((state.wallets || []).length) wm.append(el('div', 'sep'));
+		wm.append(item({ icon: 'agents', name: 'Add or manage wallets…', click: () => { wm.hidden = true; vscode.postMessage({ type: 'run', command: 'lightchain.wallet.menu' }); } }));
+		a.title = (state.wallets || []).length > 1 ? 'Switch wallet: each has its own projects, agents and chats' : '';
+		a.onclick = e => { e.stopPropagation(); if ((state.wallets || []).length) { wm.hidden = !wm.hidden; } else { vscode.postMessage({ type: 'run', command: 'lightchain.wallet.menu' }); } };
 	}
 
 	// layout: where the AI chat, terminal and contracts live; what is shown
@@ -415,7 +442,7 @@ export class WorkspaceView implements vscode.WebviewViewProvider, vscode.Disposa
 	function render() { renderProject(); renderPrograms(); renderTasks(); renderFoot(); }
 
 	$('proj').onclick = e => { e.stopPropagation(); const m = $('menu'); m.style.top = ($('proj').offsetTop + $('proj').offsetHeight + 4 - $('scroll').scrollTop + $('scroll').offsetTop) + 'px'; m.hidden = !m.hidden; };
-	document.addEventListener('click', e => { if (!$('menu').contains(e.target)) $('menu').hidden = true; });
+	document.addEventListener('click', e => { if (!$('menu').contains(e.target)) $('menu').hidden = true; if (!$('wmenu').contains(e.target)) $('wmenu').hidden = true; });
 	document.addEventListener('keydown', e => { if (e.key === 'Escape') { $('menu').hidden = true; $('addForm').hidden = true; $('addRow').hidden = false; } });
 	$('searchBtn').onclick = () => { const s = $('search'); s.hidden = !s.hidden; if (!s.hidden) $('q').focus(); else { $('q').value = ''; query = ''; render(); } };
 	$('q').addEventListener('input', () => { query = $('q').value.trim().toLowerCase(); renderPrograms(); renderTasks(); });

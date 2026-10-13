@@ -15,6 +15,7 @@ import { MapPanel } from './chain/mapPanel';
 import { AppPanel } from './chain/appPanel';
 import { showLauncher } from './launcher';
 import { BackgroundAgents } from './backgroundRunner';
+import { WalletSpaces } from './walletSpace';
 import { JOB_FEE_LCAI } from './credits';
 import { describeSimulation, simulate } from './chain/simulate';
 import { findForge } from './foundry';
@@ -102,9 +103,11 @@ export function activate(context: vscode.ExtensionContext): void {
 		void context.globalState.update(PENDING_BUILD, undefined);
 		setTimeout(() => void ai.buildFromDescription(pending.description, pending.template), 1500);
 	}
-	const profiles = new AgentProfiles();
+	const spaces = new WalletSpaces(context, wallet);
+	context.subscriptions.push(spaces);
+	const profiles = new AgentProfiles(() => spaces.dir, spaces.onDidChange);
 	ai.profiles = profiles;
-	const rules = new RuleStore();
+	const rules = new RuleStore(() => spaces.dir, spaces.onDidChange);
 	const localIndex = new WorkspaceIndex();
 	ai.rules = rules;
 	ai.localSearch = async (query, exclude) => localIndex.enabled ? localIndex.search(query, exclude) : [];
@@ -123,6 +126,24 @@ export function activate(context: vscode.ExtensionContext): void {
 		vscode.commands.registerCommand('lightchain.tasks.backgroundMenu', () => background.menu()),
 		vscode.commands.registerCommand('lightchain.tasks.backgroundReview', (id: string) => background.review(id)));
 	const home = new WorkspaceView(context.extensionUri, ai, tasks);
+	// Wallet spaces: a project belongs to the wallets that worked in it, and reopens with the one used last.
+	const PROJECT_WALLET = 'lightchain.project.wallet';
+	const projectFolder = vscode.workspace.workspaceFolders?.[0];
+	const usedHere = context.workspaceState.get<string>(PROJECT_WALLET);
+	if (projectFolder && usedHere && wallet.active && wallet.active.id !== usedHere && wallet.all.some(a => a.id === usedHere)) {
+		void wallet.select(usedHere).then(() => vscode.window.setStatusBarMessage(`Switched to ${wallet.active?.name ?? 'the wallet'} — the wallet this project was last used with`, 6000));
+	}
+	const rememberProject = () => {
+		if (projectFolder && wallet.active) {
+			void context.workspaceState.update(PROJECT_WALLET, wallet.active.id);
+			void spaces.remember(projectFolder.uri, projectFolder.name).then(() => home.refreshSoon());
+		}
+	};
+	rememberProject();
+	context.subscriptions.push(spaces.onDidChange(() => { rememberProject(); home.refreshSoon(); }), wallet.onDidChange(() => home.refreshSoon()));
+	home.walletProjects = async () => wallet.active ? (await spaces.projects()).map(p => ({ label: p.name, detail: vscode.Uri.parse(p.path).fsPath.replace(/^\/Users\/[^/]+/, '~'), uri: p.path })) : undefined;
+	home.wallets = () => wallet.all.map(a => ({ id: a.id, name: a.name, address: a.address, active: a.id === wallet.active?.id }));
+	home.selectWallet = id => wallet.select(id);
 	// "Your first dApp": build → test → deploy → interact → ask Lightchain AI
 	const startKey = (k: string) => `lightchain.start.${k}`;
 	const markStep = async (k: string) => { await context.workspaceState.update(startKey(k), true); home.refreshSoon(); ai.refreshState(); };

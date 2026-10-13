@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { AGENTS_DIR, AGENT_TEMPLATES, AgentDraft, AgentProfile, AgentProfiles, BUILTIN_AGENTS, draftFromText, draftPrompt, flow, parseDraft, profileFromDraft } from './agent/profiles';
 import type { InferenceProvider } from './agent/agent';
-import { RULES_BUDGET, RULES_DIR, Rule, RuleStore, renderRules } from './agent/rules';
+import { PERSONAL_PREFIX, RULES_BUDGET, RULES_DIR, Rule, RuleStore, renderRules } from './agent/rules';
 import { WorkspaceIndex } from './agent/workspaceIndex';
 import { estimateTokens } from './agent/memory';
 import { IDENTICON_JS, siteCss } from './ui/site';
@@ -110,19 +110,20 @@ export class AgentStudio implements vscode.Disposable {
 	}
 
 	/** A new instruction file, opened for writing. */
-	async createRule(): Promise<void> {
-		const rule = await this.rules.create();
+	async createRule(scope?: 'project' | 'personal'): Promise<void> {
+		const rule = await this.rules.create(undefined, scope);
 		this.open(undefined, 'rules', rule.id);
 	}
 
-	private relFile(id: string): string {
-		return `${AGENTS_DIR}/${id}.md`;
+	/** Where an agent's file is, as shown to the user. */
+	private relFile(id: string, scope?: 'project' | 'personal'): string {
+		return scope === 'personal' ? `${PERSONAL_PREFIX}${id}.md` : `${AGENTS_DIR}/${id}.md`;
 	}
 
 	private push(): void {
 		const agents = this.profiles.all.map(p => ({
-			...p, flow: flow(p), file: this.relFile(p.id),
-			kind: p.builtin ? 'builtin' : this.profiles.isCustomized(p.id) ? 'customized' : 'project',
+			...p, flow: flow(p), file: this.relFile(p.id, p.scope),
+			kind: p.builtin ? 'builtin' : this.profiles.isCustomized(p.id) ? 'customized' : p.scope === 'personal' ? 'personal' : 'project',
 		}));
 		this.selected = agents.some(a => a.id === this.selected) ? this.selected : agents[0]?.id;
 		const all = this.rules.all;
@@ -134,6 +135,7 @@ export class AgentStudio implements vscode.Disposable {
 		});
 		void this.panel?.webview.postMessage({
 			type: 'state', tab: this.tab, agents, selected: this.selected, models: this.models(), hasProject: !!vscode.workspace.workspaceFolders?.length,
+			scopes: this.profiles.scopes, ruleScopes: this.rules.scopes,
 			rules, selectedRule: this.selectedRule, budget: RULES_BUDGET, used: sent.text.length, rulesDir: RULES_DIR,
 			templates: AGENT_TEMPLATES, canDraftWithAi: !!this.sideProvider(),
 		});
@@ -147,12 +149,13 @@ export class AgentStudio implements vscode.Disposable {
 		void this.panel?.webview.postMessage({ type: 'context', files: this.index.index.files, chunks: this.index.index.chunks, enabled: this.index.enabled, map, mapTokens: estimateTokens(map), window });
 	}
 
-	private async reveal(rel: string, line?: number): Promise<void> {
+	private async reveal(target: string | vscode.Uri | undefined, line?: number): Promise<void> {
 		const root = vscode.workspace.workspaceFolders?.[0]?.uri;
-		if (!root) {
+		const uri = typeof target === 'string' ? root && vscode.Uri.joinPath(root, target) : target;
+		if (!uri) {
 			return;
 		}
-		const doc = await vscode.workspace.openTextDocument(vscode.Uri.joinPath(root, rel));
+		const doc = await vscode.workspace.openTextDocument(uri);
 		const at = line ? new vscode.Range(line - 1, 0, line - 1, 0) : undefined;
 		await vscode.window.showTextDocument(doc, { viewColumn: vscode.ViewColumn.Beside, preview: false, selection: at });
 	}
@@ -172,7 +175,7 @@ export class AgentStudio implements vscode.Disposable {
 				case 'createFrom': {
 					const d = m.draft as AgentDraft;
 					const id = this.profiles.newId(String(d?.name || 'New agent'));
-					await this.profiles.put(profileFromDraft(id, { name: String(d?.name || 'New agent'), summary: String(d?.summary ?? ''), role: String(d?.role ?? ''), rules: Array.isArray(d?.rules) ? d.rules : [], access: d?.access === 'answer' || d?.access === 'auto' ? d.access : 'suggest', starters: Array.isArray(d?.starters) ? d.starters : [] }));
+					await this.profiles.put(profileFromDraft(id, { name: String(d?.name || 'New agent'), summary: String(d?.summary ?? ''), role: String(d?.role ?? ''), rules: Array.isArray(d?.rules) ? d.rules : [], access: d?.access === 'answer' || d?.access === 'auto' ? d.access : 'suggest', starters: Array.isArray(d?.starters) ? d.starters : [] }), m.scope === 'personal' || m.scope === 'project' ? m.scope : undefined);
 					this.selected = id;
 					return this.push();
 				}
@@ -184,7 +187,7 @@ export class AgentStudio implements vscode.Disposable {
 					this.selectedRule = String(m.id);
 					return this.push();
 				case 'createRule':
-					return this.createRule();
+					return this.createRule(m.scope === 'personal' || m.scope === 'project' ? m.scope : undefined);
 				case 'saveRule':
 					await this.rules.put(m.rule as Rule);
 					return;
@@ -197,7 +200,7 @@ export class AgentStudio implements vscode.Disposable {
 				}
 				case 'openRule': {
 					const r = this.rules.get(String(m.id));
-					return r ? this.reveal(r.file) : undefined;
+					return r ? this.reveal(this.rules.uri(r)) : undefined;
 				}
 				case 'openAgent': {
 					// a built-in has no file until it is saved for this project
@@ -205,7 +208,7 @@ export class AgentStudio implements vscode.Disposable {
 					if (p.builtin) {
 						await this.profiles.put(p);
 					}
-					return this.reveal(this.relFile(p.id));
+					return this.reveal(this.profiles.fileOf(p.id));
 				}
 				case 'openFile':
 					return this.reveal(String(m.path), typeof m.line === 'number' ? m.line : undefined);
@@ -224,7 +227,7 @@ export class AgentStudio implements vscode.Disposable {
 					return this.push();
 				case 'save':
 					// editing a built-in saves a project copy with the same id
-					await this.profiles.put(m.agent as AgentProfile);
+					await this.profiles.put(m.agent as AgentProfile, m.scope === 'personal' || m.scope === 'project' ? m.scope : undefined);
 					return;
 				case 'create':
 					return this.create(typeof m.from === 'string' ? m.from : undefined);
@@ -373,7 +376,7 @@ export class AgentStudio implements vscode.Disposable {
 	.wiz textarea.input { min-height: 76px; }
 	.wiz__row { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
 	.wiz__hint { flex: 1; color: var(--lc-text-tertiary); font-size: 12px; line-height: 1.45; }
-	.wiz__hint.warn { color: var(--lc-warning); }
+	.wiz__hint.warn { color: #fde68a; }
 	.ideas { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 8px; }
 	.idea { padding: 10px 12px; border: 1px solid var(--zap); border-radius: 12px; background: transparent; color: var(--lc-text-primary); text-align: left; cursor: pointer; transition: border-color .2s ease, background .2s ease; }
 	.idea:hover, .idea.on { border-color: var(--lc-accent); background: rgba(91, 75, 255, 0.1); }
@@ -382,7 +385,8 @@ export class AgentStudio implements vscode.Disposable {
 	.wiz__foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
 
 	/* instructions: list, editor, what the AI receives */
-	.pill.warn { border-color: transparent; background: rgba(255, 143, 60, 0.14); color: var(--lc-warning); }
+	/* LCAIPresale .lc-bridge__notice--warn colours */
+	.pill.warn { border-color: rgba(234, 179, 8, 0.3); background: rgba(234, 179, 8, 0.1); color: #fde68a; }
 	.r-edit { display: flex; flex-direction: column; gap: 12px; min-height: 0; padding: 22px 28px 24px; overflow-y: auto; }
 	.r-edit > *, .c-main > * { width: 100%; max-width: 760px; }
 	.r-title { height: 44px !important; font-size: 18px !important; font-weight: 600; color: var(--lc-text-strong) !important; }
@@ -395,7 +399,7 @@ export class AgentStudio implements vscode.Disposable {
 	.empty p { margin: 0 0 18px; color: var(--lc-text-tertiary); font-size: 13px; line-height: 1.6; }
 	.meter { height: 6px; margin: 4px 0 8px; border-radius: 999px; background: var(--lc-surface-3); overflow: hidden; }
 	.meter i { display: block; height: 100%; border-radius: 999px; background: var(--lc-accent); transition: width var(--lc-motion-base) ease; }
-	.meter.over i { background: var(--lc-warning); }
+	.meter.over i { background: #fde68a; }
 	.meter-text { color: var(--lc-text-secondary); font-size: 12px; }
 	.row { display: flex; align-items: center; gap: 8px; padding: 6px 0; color: var(--lc-text-primary); font-size: 13px; }
 	.row + .row { border-top: 1px solid rgba(112, 100, 233, 0.12); }
@@ -467,7 +471,7 @@ export class AgentStudio implements vscode.Disposable {
 	${IDENTICON_JS}
 	const $ = id => document.getElementById(id);
 	const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
-	let state = { tab: 'agents', agents: [], selected: null, models: [], hasProject: true, rules: [], selectedRule: null, budget: 2400, used: 0, rulesDir: '', templates: [], canDraftWithAi: false };
+	let state = { tab: 'agents', agents: [], selected: null, models: [], hasProject: true, rules: [], selectedRule: null, budget: 2400, used: 0, rulesDir: '', templates: [], canDraftWithAi: false, scopes: [], ruleScopes: [] };
 	let draft = null, focusSec = null, saveTimer = null;
 	let ruleDraft = null, ruleTimer = null;
 	let advanced = !!(vscode.getState() || {}).advanced;
@@ -495,7 +499,7 @@ export class AgentStudio implements vscode.Disposable {
 		$('lead').textContent = LEADS[state.tab];
 		const btn = $('useBtn');
 		btn.textContent = state.tab === 'agents' ? 'Use in chat' : state.tab === 'rules' ? 'New instruction' : 'Refresh';
-		btn.disabled = state.tab !== 'agents' && !state.hasProject;
+		btn.disabled = state.tab === 'rules' && !state.ruleScopes.length;
 		renderTabs();
 		if (state.tab === 'context') renderContext();
 	}
@@ -518,7 +522,7 @@ export class AgentStudio implements vscode.Disposable {
 			const c = el('button', 's-card' + (a.id === state.selected ? ' sel' : ''));
 			const g = el('span', 'glyph'); g.innerHTML = lcIdenticon('agent:' + a.id);
 			const t = el('span', 's-card__text'); t.append(el('span', 's-card__name', a.name), el('span', 's-card__sum', a.summary || 'No description yet'));
-			const k = el('span', 's-card__kind'); k.append(el('span', 'pill', a.kind === 'builtin' ? 'Ready-made' : a.kind === 'customized' ? 'Changed by you' : 'Yours')); t.append(k);
+			const k = el('span', 's-card__kind'); k.append(el('span', 'pill', a.kind === 'builtin' ? 'Ready-made' : a.kind === 'customized' ? 'Changed by you' : a.kind === 'personal' ? 'This wallet' : 'This project')); t.append(k);
 			c.append(g, t);
 			c.onclick = () => { if (a.id !== state.selected) { focusSec = null; vscode.postMessage({ type: 'select', id: a.id }); } };
 			box.append(c);
@@ -548,6 +552,18 @@ export class AgentStudio implements vscode.Disposable {
 		if (!p.can.write) return 'It looks at your project' + (p.can.build ? ' and can check that the code works' : '') + ', and answers in the chat. It never changes your files.';
 		const after = p.check && checks ? ' After every change it ' + checks + ', and fixes what it broke.' : '';
 		return p.approval === 'auto' ? 'It makes changes on its own — you can undo any of them from the chat.' + after : 'It shows you each change and waits for your OK before anything is saved.' + after;
+	}
+	// where something is saved: with the project (the team gets it through git) or with the wallet (yours, everywhere)
+	const PLACES = [
+		['project', 'This project', 'Saved in the project and shared with your team through git.'],
+		['personal', 'This wallet', 'Only yours: it follows this wallet into every project you open.'],
+	];
+	function placeChoices(available, current, pick) {
+		return PLACES.filter(([key]) => available.includes(key)).map(([key, title, help]) => {
+			const b = el('button', 'choice' + (current === key ? ' on' : '')); b.type = 'button';
+			const t = el('span', 'choice__text'); t.append(el('span', 'choice__title', title), el('span', 'choice__help', help));
+			b.append(el('span', 'dot'), t); b.onclick = () => pick(key); return b;
+		});
 	}
 	const ACCESS = [
 		['answer', 'Only answer', 'It reads your project and explains. It can never change a file.'],
@@ -640,6 +656,11 @@ export class AgentStudio implements vscode.Disposable {
 		state.models.forEach(m => { const o = el('option', '', m); o.value = m; o.selected = m === p.model; ms.append(o); });
 		ms.onchange = () => change(d => { d.model = ms.value || undefined; }); model.append(ms);
 		// starters
+		// where it lives (a ready-made agent has no file until it is changed)
+		const place = section('place', 'Where it lives', 'Move it between this project and your wallet at any time.');
+		if (p.kind !== 'builtin' && state.scopes.length > 1) {
+			place.append(...placeChoices(state.scopes, p.scope || 'project', key => { if (key === (p.scope || 'project')) return; draft.scope = key; const { flow, kind, file, ...agent } = draft; vscode.postMessage({ type: 'save', agent, scope: key }); flashSaved(); }));
+		}
 		const st = section('starters', 'Example requests', 'Shown as one-click suggestions when you pick this agent.');
 		[0, 1, 2].forEach(i => { const si2 = el('input', 'input'); si2.style.marginBottom = '6px'; si2.value = p.starters[i] || ''; si2.placeholder = 'e.g. Add a withdraw function'; si2.maxLength = 120; si2.oninput = () => change(d => { d.starters[i] = si2.value; d.starters = d.starters.map(s => s || '').slice(0, 3); }); st.append(si2); });
 		// manage
@@ -652,13 +673,13 @@ export class AgentStudio implements vscode.Disposable {
 		const more = el('button', 'more'); more.type = 'button';
 		more.append(el('span', '', advanced ? 'Fewer settings' : 'More settings'), el('small', '', advanced ? '' : 'single permissions, AI model, example requests'));
 		more.onclick = () => { advanced = !advanced; vscode.setState({ advanced }); renderProps(); };
-		box.append(id, job, rules, access, ...(advanced ? [can, safety, checks, model, st] : []), more, mg);
+		box.append(id, job, rules, access, ...(p.kind !== 'builtin' && state.scopes.length > 1 ? [place] : []), ...(advanced ? [can, safety, checks, model, st] : []), more, mg);
 		box.scrollTop = top;
 	}
 
 	// ---- new agent: describe it, or start from a ready-made one ----
 	function openWizard() {
-		wiz = { description: '', busy: false, note: '', warn: false, picked: null, draft: { name: '', summary: '', role: '', rules: [], access: 'suggest', starters: [] } };
+		wiz = { description: '', busy: false, note: '', warn: false, picked: null, scope: state.scopes[0] || 'project', draft: { name: '', summary: '', role: '', rules: [], access: 'suggest', starters: [] } };
 		renderWizard();
 		const first = document.getElementById('wizDesc'); if (first) first.focus();
 	}
@@ -694,6 +715,7 @@ export class AgentStudio implements vscode.Disposable {
 			const job = el('textarea', 'input'); job.id = 'wizJob'; job.value = wiz.draft.role; job.maxLength = 2000; job.oninput = () => { wiz.draft.role = job.value; };
 			card.append(jl, job);
 		}
+		if (state.scopes.length > 1) { card.append(el('label', '', 'Where should it live?')); card.append(...placeChoices(state.scopes, wiz.scope, key => { wiz.scope = key; renderWizard(); })); }
 		card.append(el('label', '', 'What may it do?'));
 		card.append(...accessChoices(wiz.draft.access, key => { wiz.draft.access = key; renderWizard(); }));
 		const foot = el('div', 'wiz__foot');
@@ -703,7 +725,7 @@ export class AgentStudio implements vscode.Disposable {
 			const d = wiz.draft;
 			// nothing drafted yet: the description itself is the job
 			if (!d.role && wiz.description.trim()) { d.role = wiz.description.trim(); }
-			vscode.postMessage({ type: 'createFrom', draft: d }); closeWizard();
+			vscode.postMessage({ type: 'createFrom', draft: d, scope: wiz.scope }); closeWizard();
 		};
 		foot.append(cancel, create); card.append(foot);
 		box.replaceChildren(card); box.hidden = false;
@@ -735,7 +757,7 @@ export class AgentStudio implements vscode.Disposable {
 			c.onclick = () => { if (r.id !== state.selectedRule) vscode.postMessage({ type: 'selectRule', id: r.id }); };
 			box.append(c);
 		});
-		if (state.hasProject) { const n = el('button', 'button button-sm button-block s-new', '+ New instruction'); n.onclick = () => vscode.postMessage({ type: 'createRule' }); box.append(n); }
+		if (state.ruleScopes.length) { const n = el('button', 'button button-sm button-block s-new', '+ New instruction'); n.onclick = () => vscode.postMessage({ type: 'createRule' }); box.append(n); }
 	}
 
 	function renderRuleEdit() {
@@ -743,14 +765,15 @@ export class AgentStudio implements vscode.Disposable {
 		const r = ruleDraft;
 		if (!r) {
 			const e = el('div', 'empty');
-			e.append(el('h2', '', state.hasProject ? 'No instructions yet' : 'Open a project first'),
-				el('p', '', state.hasProject ? 'Tell Lightchain AI how this project is built: the Solidity version, the libraries you use, what must always be tested, what must never happen. Every agent follows them.' : 'Instructions are saved with a project, so open or create one.'));
-			if (state.hasProject) { const b = el('button', 'button button-primary', 'Write the first instruction'); b.onclick = () => vscode.postMessage({ type: 'createRule' }); e.append(b); }
+			e.append(el('h2', '', state.ruleScopes.length ? 'No instructions yet' : 'Open a project or connect a wallet first'),
+				el('p', '', state.ruleScopes.length ? 'Tell Lightchain AI how this project is built: the Solidity version, the libraries you use, what must always be tested, what must never happen. Every agent follows them.' : 'Instructions are saved with a project (shared with your team) or with your wallet (yours everywhere).'));
+			if (state.ruleScopes.length) { const b = el('button', 'button button-primary', 'Write the first instruction'); b.onclick = () => vscode.postMessage({ type: 'createRule' }); e.append(b); }
 			box.append(e); return;
 		}
 		const ti = el('input', 'input r-title'); ti.value = r.title; ti.maxLength = 60; ti.placeholder = 'Name this instruction'; ti.disabled = !!r.fixed; ti.oninput = () => changeRule(d => { d.title = ti.value; });
 		box.append(ti);
 		if (!r.fixed) { const di = el('input', 'input'); di.value = r.description || ''; di.maxLength = 160; di.placeholder = 'Short description (optional)'; di.oninput = () => changeRule(d => { d.description = di.value; }); box.append(di); }
+		let placeAfter = null;
 		const when = el('div', 'zpanel'); when.append(el('div', 'zlabel', 'When it applies'));
 		if (r.fixed) {
 			when.append(el('div', 'note', r.file + ' always applies. It is the file other tools read too, so it stays one plain Markdown file.'));
@@ -764,8 +787,10 @@ export class AgentStudio implements vscode.Disposable {
 				when.append(gi);
 			}
 			when.append(opt('manual', 'Only when mentioned', 'Type @ in the chat and pick it'));
+			if (state.ruleScopes.length > 1) { const pl = el('div', 'zpanel'); pl.append(el('div', 'zlabel', 'Where it lives')); pl.append(...placeChoices(state.ruleScopes, r.scope || 'project', key => { changeRule(d => { d.scope = key; }); renderRuleEdit(); })); placeAfter = pl; }
 		}
 		box.append(when);
+		if (placeAfter) box.append(placeAfter);
 		const body = el('div', 'r-body zpanel'); body.append(el('div', 'zlabel', 'Instruction'));
 		const ta = el('textarea', 'input'); ta.value = r.body; ta.spellcheck = false; ta.placeholder = 'Plain sentences or Markdown. For example: Use Solidity ^0.8.24. Every external function needs a test.';
 		const count = el('span', '', num(r.body.trim().length) + ' characters');

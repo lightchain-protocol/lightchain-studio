@@ -332,3 +332,86 @@ test('write_file: writing the same content again is refused without asking the u
 		fs.rmSync(root, { recursive: true, force: true });
 	}
 });
+
+test('wallet spaces: each wallet has its own agents and instructions next to the project\'s', async () => {
+	const { root, done } = project();
+	const walletA = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-wallet-a-'));
+	const walletB = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-wallet-b-'));
+	try {
+		let active = walletA;
+		const space = () => vscode.Uri.file(active);
+		const listeners: (() => void)[] = [];
+		const onSwitch = ((fn: () => void) => { listeners.push(fn); return { dispose() { } }; }) as never;
+		const agents = new AgentProfiles(space, onSwitch);
+		const rules = new RuleStore(space, onSwitch);
+		await agents.ready(); await rules.ready();
+		assert.deepEqual(agents.scopes, ['project', 'personal']);
+
+		// one agent for the team, one just for wallet A
+		await agents.put({ ...BUILTIN_AGENTS[1], id: 'team-auditor', name: 'Team Auditor', builtin: undefined }, 'project');
+		await agents.put({ ...BUILTIN_AGENTS[3], id: 'my-tutor', name: 'My Tutor', builtin: undefined }, 'personal');
+		assert.ok(fs.existsSync(path.join(root, '.lightchain/agents/team-auditor.md')));
+		assert.ok(fs.existsSync(path.join(walletA, 'agents/my-tutor.md')));
+		assert.ok(!fs.existsSync(path.join(root, '.lightchain/agents/my-tutor.md')), 'a personal agent never lands in the project');
+		assert.deepEqual(agents.all.filter(a => a.scope).map(a => [a.id, a.scope]), [['my-tutor', 'personal'], ['team-auditor', 'project']]);
+		assert.equal(agents.fileOf('my-tutor')!.fsPath, path.join(walletA, 'agents/my-tutor.md'));
+
+		const mine = await rules.create('How I like it', 'personal');
+		await rules.put({ ...mine, body: 'Explain every change in one sentence.' });
+		const team = await rules.create('House style', 'project');
+		assert.equal(mine.file, 'Your wallet · how-i-like-it.md');
+		assert.ok(fs.existsSync(path.join(walletA, 'rules/how-i-like-it.md')) && fs.existsSync(path.join(root, '.lightchain/rules/house-style.md')));
+		assert.deepEqual(rules.always().map(r => [r.id, r.scope]), [['how-i-like-it', 'personal'], ['house-style', 'project']]);
+
+		// another wallet: the project's things stay, the personal ones are that wallet's own
+		active = walletB; listeners.forEach(fn => fn());
+		await agents.ready(); await rules.ready();
+		assert.deepEqual(agents.all.filter(a => a.scope).map(a => a.id), ['team-auditor']);
+		assert.deepEqual(rules.all.map(r => r.id), ['house-style']);
+		await agents.put({ ...BUILTIN_AGENTS[0], id: 'my-tutor', name: 'B Tutor', builtin: undefined }, 'personal');
+		active = walletA; listeners.forEach(fn => fn());
+		await agents.ready(); await rules.ready();
+		assert.equal(agents.get('my-tutor').name, 'My Tutor');
+		assert.equal(rules.get('how-i-like-it')!.body, 'Explain every change in one sentence.');
+
+		// moving between the wallet and the project keeps one copy
+		await agents.put(agents.get('my-tutor'), 'project');
+		assert.ok(fs.existsSync(path.join(root, '.lightchain/agents/my-tutor.md')) && !fs.existsSync(path.join(walletA, 'agents/my-tutor.md')));
+		await rules.put({ ...rules.get('house-style')!, scope: 'personal' });
+		assert.ok(fs.existsSync(path.join(walletA, 'rules/house-style.md')) && !fs.existsSync(path.join(root, '.lightchain/rules/house-style.md')));
+		assert.equal(rules.get('house-style')!.file, 'Your wallet · house-style.md');
+		await agents.remove('my-tutor');
+		assert.ok(!fs.existsSync(path.join(root, '.lightchain/agents/my-tutor.md')));
+		agents.dispose(); rules.dispose();
+	} finally {
+		done();
+		fs.rmSync(walletA, { recursive: true, force: true }); fs.rmSync(walletB, { recursive: true, force: true });
+	}
+});
+
+test('wallet spaces: chats and project lists are kept per wallet', async () => {
+	const { ChatStore } = await import('../src/agent/chatStore');
+	const { touchProject } = await import('../src/walletSpace');
+	const data = new Map<string, unknown>();
+	const state = { get: (k: string, d?: unknown) => data.has(k) ? data.get(k) : d, update: async (k: string, v: unknown) => { v === undefined ? data.delete(k) : data.set(k, v); }, keys: () => [...data.keys()] } as never;
+	let wallet: string | undefined;
+	const chats = new ChatStore(state, () => wallet);
+	chats.record({ type: 'user', text: 'before wallets' });
+	wallet = '0xaaa';
+	assert.deepEqual(chats.all().map(c => c.title), ['before wallets'], 'older chats stay visible to the first wallet');
+	await chats.startNew();
+	chats.record({ type: 'user', text: 'from wallet A' });
+	wallet = '0xbbb';
+	assert.deepEqual(chats.all().map(c => c.title), ['before wallets']);
+	await chats.startNew();
+	chats.record({ type: 'user', text: 'from wallet B' });
+	assert.ok(chats.all().some(c => c.title === 'from wallet B') && !chats.all().some(c => c.title === 'from wallet A'));
+	assert.equal(chats.current()?.title, 'from wallet B');
+	wallet = '0xaaa';
+	assert.ok(chats.all().some(c => c.title === 'from wallet A') && !chats.all().some(c => c.title === 'from wallet B'));
+	assert.equal(chats.current()?.title, 'from wallet A');
+
+	const list = touchProject([{ path: 'file:///a', name: 'a', last: 1 }, { path: 'file:///b', name: 'b', last: 2 }], { path: 'file:///a', name: 'a', last: 3 });
+	assert.deepEqual(list.map(p => p.path), ['file:///a', 'file:///b']);
+	assert.equal(touchProject(list, { path: 'file:///c', name: 'c', last: 4 }, 2).length, 2);
+});

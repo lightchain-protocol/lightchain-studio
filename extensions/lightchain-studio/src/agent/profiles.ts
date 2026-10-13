@@ -24,7 +24,11 @@ export interface AgentProfile {
 	model?: string;         // preferred model (empty: the one picked in the chat)
 	starters: string[];     // example requests shown in the chat
 	builtin?: boolean;
+	/** Where a saved agent lives: with the project (shared through git) or with the wallet (personal, in all its projects). */
+	scope?: Scope;
 }
+
+export type Scope = 'project' | 'personal';
 
 export const BUILTIN_AGENTS: AgentProfile[] = [
 	{
@@ -181,15 +185,32 @@ export class AgentProfiles implements vscode.Disposable {
 	private readonly changed = new vscode.EventEmitter<void>();
 	readonly onDidChange = this.changed.event;
 	private readonly disposables: vscode.Disposable[] = [this.changed];
+	private personalWatch?: vscode.Disposable;
 	private writing = false;
 	private loading?: Promise<void>;
 
-	constructor() {
+	/**
+	 * `personalDir`: the active wallet's folder for personal agents (undefined without a wallet);
+	 * `onSpaceChange`: fires when another wallet becomes active.
+	 */
+	constructor(private readonly personalDir: () => vscode.Uri | undefined = () => undefined, onSpaceChange?: vscode.Event<void>) {
 		const root = this.root;
+		const reload = () => { if (!this.writing) { void this.load(); } };
 		if (root) {
 			const w = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(root, '.lightchain/{agents.json,agents/*.md}'));
-			const reload = () => { if (!this.writing) { void this.load(); } };
 			this.disposables.push(w, w.onDidChange(reload), w.onDidCreate(reload), w.onDidDelete(reload));
+		}
+		const watchPersonal = () => {
+			this.personalWatch?.dispose();
+			const dir = this.personalFolder;
+			if (dir) {
+				const w = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(dir, '*.md'));
+				this.personalWatch = vscode.Disposable.from(w, w.onDidChange(reload), w.onDidCreate(reload), w.onDidDelete(reload));
+			}
+		};
+		watchPersonal();
+		if (onSpaceChange) {
+			this.disposables.push(onSpaceChange(() => { watchPersonal(); void this.load(); }));
 		}
 		void this.load();
 	}
@@ -198,11 +219,22 @@ export class AgentProfiles implements vscode.Disposable {
 		return vscode.workspace.workspaceFolders?.[0]?.uri;
 	}
 
+	private get personalFolder(): vscode.Uri | undefined {
+		const dir = this.personalDir();
+		return dir && vscode.Uri.joinPath(dir, 'agents');
+	}
+
+	/** Which places an agent can be saved to right now. */
+	get scopes(): Scope[] {
+		return [...(this.root ? ['project' as const] : []), ...(this.personalFolder ? ['personal' as const] : [])];
+	}
+
 	get all(): AgentProfile[] {
-		// a project agent with a built-in's id overrides it
+		// a saved agent with a built-in's id overrides it
 		return [
 			...BUILTIN_AGENTS.map(b => this.custom.find(c => c.id === b.id) ?? b), // edited built-ins keep their place
-			...this.custom.filter(c => !BUILTIN_AGENTS.some(b => b.id === c.id)),
+			// then the wallet's own, then the project's
+			...this.custom.filter(c => !BUILTIN_AGENTS.some(b => b.id === c.id)).sort((a, b) => Number(a.scope !== 'personal') - Number(b.scope !== 'personal')),
 		];
 	}
 
@@ -210,9 +242,14 @@ export class AgentProfiles implements vscode.Disposable {
 		return this.all.find(p => p.id === id) ?? BUILTIN_AGENTS[0];
 	}
 
-	/** The agent's Markdown file (it exists once the agent has been saved for this project). */
-	fileOf(id: string): vscode.Uri | undefined {
-		return this.root && vscode.Uri.joinPath(this.root, AGENTS_DIR, `${slug(id, 'agent')}.md`);
+	private folder(scope: Scope): vscode.Uri | undefined {
+		return scope === 'personal' ? this.personalFolder : this.root && vscode.Uri.joinPath(this.root, AGENTS_DIR);
+	}
+
+	/** The agent's Markdown file (it exists once the agent has been saved). */
+	fileOf(id: string, scope?: Scope): vscode.Uri | undefined {
+		const where = this.folder(scope ?? this.custom.find(c => c.id === id)?.scope ?? this.scopes[0] ?? 'project');
+		return where && vscode.Uri.joinPath(where, `${slug(id, 'agent')}.md`);
 	}
 
 	/** An id for a new agent called `name`, free among the existing ones. */
@@ -220,7 +257,7 @@ export class AgentProfiles implements vscode.Disposable {
 		return uniqueSlug(name, this.all.map(p => p.id), 'agent');
 	}
 
-	/** Resolves once the project's agents have been read. */
+	/** Resolves once the saved agents have been read. */
 	ready(): Promise<void> {
 		return this.loading ?? Promise.resolve();
 	}
@@ -229,32 +266,38 @@ export class AgentProfiles implements vscode.Disposable {
 		return this.loading = this.read().finally(() => this.changed.fire());
 	}
 
-	private async read(): Promise<void> {
-		const root = this.root;
-		const found = new Map<string, AgentProfile>();
-		this.legacy = new Set();
-		if (!root) {
-			this.custom = [];
+	private async readFolder(dir: vscode.Uri | undefined, scope: Scope, found: Map<string, AgentProfile>): Promise<void> {
+		if (!dir) {
 			return;
 		}
 		try {
-			const raw = JSON.parse(new TextDecoder().decode(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(root, LEGACY_FILE))));
-			for (const p of (Array.isArray(raw?.agents) ? raw.agents.map(normalizeProfile).filter(Boolean) : []) as AgentProfile[]) {
-				found.set(p.id, p);
-				this.legacy.add(p.id);
-			}
-		} catch { /* no legacy file */ }
-		try {
-			const dir = vscode.Uri.joinPath(root, AGENTS_DIR);
 			const names = (await vscode.workspace.fs.readDirectory(dir)).filter(([n, t]) => t !== vscode.FileType.Directory && n.toLowerCase().endsWith('.md')).map(([n]) => n).sort();
 			for (const name of names) {
 				const id = slug(name.replace(/\.md$/i, ''), 'agent');
 				const p = profileFromMarkdown(id, new TextDecoder().decode(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(dir, name))));
 				if (p) {
-					found.set(id, p); // a Markdown file wins over the legacy entry
+					found.set(id, { ...p, scope });
 				}
 			}
-		} catch { /* no agents folder */ }
+		} catch { /* no such folder yet */ }
+	}
+
+	private async read(): Promise<void> {
+		const root = this.root;
+		const found = new Map<string, AgentProfile>();
+		this.legacy = new Set();
+		// the wallet's own agents first; a project's agent with the same id wins (the team's version)
+		await this.readFolder(this.personalFolder, 'personal', found);
+		if (root) {
+			try {
+				const raw = JSON.parse(new TextDecoder().decode(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(root, LEGACY_FILE))));
+				for (const p of (Array.isArray(raw?.agents) ? raw.agents.map(normalizeProfile).filter(Boolean) : []) as AgentProfile[]) {
+					found.set(p.id, { ...p, scope: 'project' });
+					this.legacy.add(p.id);
+				}
+			} catch { /* no legacy file */ }
+			await this.readFolder(vscode.Uri.joinPath(root, AGENTS_DIR), 'project', found);
+		}
 		this.custom = [...found.values()];
 	}
 
@@ -272,53 +315,65 @@ export class AgentProfiles implements vscode.Disposable {
 		const file = vscode.Uri.joinPath(root, LEGACY_FILE);
 		const left = this.custom.filter(c => this.legacy.has(c.id));
 		if (left.length) {
-			await vscode.workspace.fs.writeFile(file, new TextEncoder().encode(JSON.stringify({ version: 1, agents: left.map(({ builtin: _b, ...p }) => p) }, null, '\t') + '\n'));
+			await vscode.workspace.fs.writeFile(file, new TextEncoder().encode(JSON.stringify({ version: 1, agents: left.map(({ builtin: _b, scope: _s, ...p }) => p) }, null, '\t') + '\n'));
 		} else {
 			await Promise.resolve(vscode.workspace.fs.delete(file)).catch(() => undefined);
 		}
 	}
 
-	/** Saves an agent as .lightchain/agents/<id>.md (a changed built-in becomes a project copy with the same id). */
-	async put(p: AgentProfile): Promise<void> {
+	/**
+	 * Saves an agent as Markdown, with the project (.lightchain/agents/<id>.md) or with the wallet.
+	 * Without `scope` it stays where it is; a new one goes to the project when one is open.
+	 * A changed built-in becomes a saved copy with the same id.
+	 */
+	async put(p: AgentProfile, scope?: Scope): Promise<void> {
 		const clean = normalizeProfile({ ...p, id: slug(String(p?.id ?? ''), 'agent') });
-		const root = this.root;
 		if (!clean) {
 			return;
 		}
-		if (!root) {
-			throw new Error('Open a project to save agents with it.');
+		const had = this.custom.find(c => c.id === clean.id);
+		const where = scope ?? had?.scope ?? this.scopes[0];
+		const dir = where && this.folder(where);
+		if (!where || !dir) {
+			throw new Error(scope === 'personal' ? 'Connect a wallet to keep agents with it.' : 'Open a project or connect a wallet to save agents.');
 		}
-		const i = this.custom.findIndex(c => c.id === clean.id);
-		if (i >= 0) {
-			this.custom[i] = clean;
-		} else {
-			this.custom.push(clean);
-		}
+		const saved: AgentProfile = { ...clean, scope: where };
+		this.custom = had ? this.custom.map(c => c.id === clean.id ? saved : c) : [...this.custom, saved];
 		await this.hold(async () => {
-			await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(root, AGENTS_DIR));
-			await vscode.workspace.fs.writeFile(this.fileOf(clean.id)!, new TextEncoder().encode(profileToMarkdown(clean)));
-			if (this.legacy.delete(clean.id)) {
-				await this.saveLegacy(root);
+			await vscode.workspace.fs.createDirectory(dir);
+			await vscode.workspace.fs.writeFile(vscode.Uri.joinPath(dir, `${clean.id}.md`), new TextEncoder().encode(profileToMarkdown(clean)));
+			// moved between the project and the wallet: it lives in one place only
+			if (had?.scope && had.scope !== where) {
+				const old = this.folder(had.scope);
+				if (old) {
+					await Promise.resolve(vscode.workspace.fs.delete(vscode.Uri.joinPath(old, `${clean.id}.md`))).catch(() => undefined);
+				}
+			}
+			if (this.legacy.delete(clean.id) && this.root) {
+				await this.saveLegacy(this.root);
 			}
 		});
 		this.changed.fire();
 	}
 
 	async remove(id: string): Promise<void> {
-		const root = this.root;
+		const had = this.custom.find(c => c.id === id);
 		this.custom = this.custom.filter(c => c.id !== id);
-		if (root) {
-			await this.hold(async () => {
-				await Promise.resolve(vscode.workspace.fs.delete(this.fileOf(id)!)).catch(() => undefined);
-				if (this.legacy.delete(id)) {
-					await this.saveLegacy(root);
-				}
-			});
-		}
-		this.changed.fire();
+		await this.hold(async () => {
+			const dir = had?.scope && this.folder(had.scope);
+			if (dir) {
+				await Promise.resolve(vscode.workspace.fs.delete(vscode.Uri.joinPath(dir, `${slug(id, 'agent')}.md`))).catch(() => undefined);
+			}
+			if (this.legacy.delete(id) && this.root) {
+				await this.saveLegacy(this.root);
+			}
+		});
+		// the same id may exist in the other place (a wallet's agent under a project's): show it again
+		await this.load();
 	}
 
 	dispose(): void {
+		this.personalWatch?.dispose();
 		this.disposables.forEach(d => d.dispose());
 	}
 

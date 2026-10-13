@@ -39,6 +39,7 @@ The builds are not signed yet. On first launch macOS asks via System Settings â†
   - **Live dashboard.** A deployed contract's balance, current values and events, refreshed while the tab is open, with optional notifications.
   - **App for a contract.** *Lightchain: Make an App for a Contract* writes a one-file web app (`app/<Name>/index.html`) that reads the contract and calls it through a browser wallet, previews it in a tab, and lets Lightchain AI reshape it.
 - **Launcher.** The search box in the title bar opens *What do you want to do?*: Lightchain actions in plain words, with files and every editor command still one step away.
+- **Wallet spaces.** Connect several wallets and switch between them from the account card. Each wallet keeps its own list of projects, its own agents and instructions (used in all of its projects), its own chats and its own choice of model and agent. A project's agents and instructions stay shared through git; *Where it lives* in Agent Studio moves an agent or instruction between *This project* and *This wallet*. A project reopens with the wallet it was last used with.
 - **Lightchain home** (left side bar): switch projects in one click, search your chats grouped by day, and keep the project's tasks at hand.
 - **Task board.** To do / In progress / Review / Done with drag and drop, priorities and labels, stored in `.lightchain/tasks.json` so a team shares it through git. Hand a task to Lightchain AI with *Do with AI*, or let `/plan` break a goal into tasks.
 - **Background agents.** *Do it in the background* on a task (or *Lightchain: Do a Task in the Background*) lets Lightchain AI work while you keep going: on its own git branch in a separate working copy, so your files are untouched. It never runs terminal commands and has a request limit. When it is done you see the changes side by side, then merge or discard them.
@@ -178,6 +179,7 @@ Network settings live in `extensions/lightchain-studio/src/networks.ts`.
   - `src/newProjectPanel.ts`, `src/templates.ts`, `src/deployWizard.ts`, `src/commitMessage.ts`: new project window, templates, deploy wizard and commit messages.
   - `src/chain/`: the on-chain tools â€” `security.ts` (the checks), `simulate.ts` (private fork), `txDebug.ts`, `abiIndex.ts` (decoding calls, events and reverts), `gas.ts`, `graph.ts` (contract map), `appTemplate.ts`, and their tabs.
   - `src/launcher.ts`: the title bar launcher.
+  - `src/walletSpace.ts`: a wallet's own space (projects, personal agents and instructions on this machine).
   - `src/agent/background.ts`, `src/backgroundRunner.ts`: background work on a git worktree, and its review / merge / discard flow.
   - `src/ui/site.ts`: the shared Lightchain design tokens and components for the webviews.
   - `test/`: unit tests, run with `npm test` in `tools/`.

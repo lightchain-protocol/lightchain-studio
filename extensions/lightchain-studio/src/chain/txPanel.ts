@@ -106,7 +106,7 @@ export class TxPanel implements vscode.Disposable {
 export const TX_CSS = `
 	.trace { font-size: 12.5px; line-height: 1.7; }
 	.trace div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--lc-text-secondary); }
-	.trace .bad { color: #ff6b69; }
+	.trace .bad { color: #fecaca; }
 	.trace b { color: var(--lc-text-primary); font-weight: 500; }
 	.ev { padding: 6px 0; font-size: 13px; color: var(--lc-text-primary); word-break: break-word; }
 	.ev + .ev { border-top: 1px solid rgba(112, 100, 233, 0.12); }
@@ -114,19 +114,20 @@ export const TX_CSS = `
 `;
 
 export const TX_SCRIPT = `
-	const STATUS = { success: ['Worked', 'ok'], failed: ['Failed', 'err'], pending: ['Waiting', 'warn'], missing: ['Not found', 'warn'] };
 	window.addEventListener('message', e => {
 		const m = e.data; if (!m || m.type !== 'state') return;
 		const body = $('body'), actions = $('actions'); body.replaceChildren(); actions.replaceChildren();
-		$('lead').textContent = 'Lightchain ' + m.network + ' · ' + m.hash;
+		$('lead').textContent = 'Lightchain ' + m.network + ' · ' + m.hash.slice(0, 12) + '…' + m.hash.slice(-10);
 		const col = el('div', 'p-col'); body.append(col);
 		actions.append(btn('Another transaction', false, () => post('another')));
 		if (m.loading) { col.append(el('div', 'say', 'Reading the transaction from the network…')); return; }
-		if (m.error) { col.append(el('div', 'say bad', m.error)); return; }
+		if (m.error) { col.append(el('div', 'notice error', m.error)); return; }
 		const r = m.report;
 		if (r.status !== 'missing') { actions.append(btn('Open on Lightscan', false, () => post('explorer')), btn(r.status === 'failed' ? 'Ask Lightchain AI to fix it' : 'Explain with Lightchain AI', true, () => post('explain'))); }
-		const head = el('div', 'say ' + (r.status === 'failed' ? 'bad' : r.status === 'success' ? 'good' : ''));
-		const st = STATUS[r.status]; const p = el('span', 'pill ' + st[1], st[0]); p.style.marginRight = '10px'; head.append(p, r.summary); col.append(head);
+		// a failure or something still open is a notice; a success is said plainly, with the accent chip
+		const head = el('div', r.status === 'failed' ? 'notice error' : r.status === 'success' ? 'say' : 'notice warn');
+		if (r.status === 'success') { const p = el('span', 'pill on', 'Worked'); p.style.marginRight = '10px'; head.append(p); }
+		head.append(r.summary); col.append(head);
 		if (r.status === 'missing') return;
 		if (r.revert) {
 			const why = panel('Why it failed'); why.append(row('In plain words', r.revert.plain), row('The contract said', r.revert.text, true));
@@ -135,6 +136,7 @@ export const TX_SCRIPT = `
 			col.append(why);
 		}
 		const what = panel('What was sent');
+		what.append(row('Transaction', r.hash, true));
 		what.append(row('From', r.from, true));
 		if (r.to) what.append(row('To', (r.toName ? r.toName + ' · ' : '') + r.to, true));
 		if (r.created) what.append(row('Created', r.created, true));

@@ -77,7 +77,35 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	/** Local project search: code related to a request, without the files it already carries (set by the extension). */
 	localSearch?: (query: string, exclude: string[]) => Promise<Hit[]>;
 	private profile(): AgentProfile | undefined {
-		return this.profiles?.get(this.memento.get<string>('lightchain.ai.agent', 'builder'));
+		return this.profiles?.get(this.pref<string>('lightchain.ai.agent') ?? 'builder');
+	}
+	private spaceOf?: string; // the wallet whose chats and choices are shown
+	/** A choice that belongs to the active wallet (falls back to the one made before wallets had their own). */
+	private pref<T>(name: string): T | undefined {
+		const w = this.wallet.active?.address.toLowerCase();
+		return (w ? this.memento.get<T>(`${name}:${w}`) : undefined) ?? this.memento.get<T>(name);
+	}
+	private setPref(name: string, value: unknown): Thenable<void> {
+		const w = this.wallet.active?.address.toLowerCase();
+		return this.memento.update(w ? `${name}:${w}` : name, value);
+	}
+	/** Another wallet became active: show its conversation, model and agent instead. */
+	private switchSpace(): void {
+		const now = this.wallet.active?.address.toLowerCase();
+		if (now === this.spaceOf) {
+			return;
+		}
+		this.spaceOf = now;
+		this.abort?.abort();
+		this.agent = undefined;
+		this.recap = undefined;
+		this.attached = new Map();
+		this.brokenTurn = undefined;
+		this.post({ type: 'cleared' });
+		this.replay();
+		void this.refreshModels();
+		this.postAgents();
+		this.chatsChanged.fire();
 	}
 	/** The project's task board (set by the extension). */
 	tasks?: TaskStore;
@@ -108,7 +136,8 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		private readonly memento: vscode.Memento,
 		workspaceState: vscode.Memento,
 	) {
-		this.chats = new ChatStore(workspaceState);
+		this.chats = new ChatStore(workspaceState, () => this.wallet.active?.address.toLowerCase());
+		this.spaceOf = this.wallet.active?.address.toLowerCase();
 		this.stuck = new StuckJobs(memento, wallet);
 		// A request waiting in the browser wallet is easy to miss from the IDE: say so in the chat, with the way there.
 		this.disposables.push(wallet.bridge.onDidChangePending(({ count, purpose }) => {
@@ -122,7 +151,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				this.post({ type: 'cardRemove', id: 'wallet-wait' });
 			}
 		}));
-		this.disposables.push(wallet.onDidChange(() => this.postState()), network.onDidChange(() => { this.resetChat(); this.refreshModels(); this.postState(); }), credits.onDidChange(() => this.postState()));
+		this.disposables.push(wallet.onDidChange(() => { this.switchSpace(); void this.postState(); }), network.onDidChange(() => { this.resetChat(); this.refreshModels(); this.postState(); }), credits.onDidChange(() => this.postState()));
 	}
 
 	resolveWebviewView(view: vscode.WebviewView): void {
@@ -146,7 +175,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		} catch {
 			return; // offline — keep the last list
 		}
-		const chosen = this.memento.get<string>('lightchain.ai.model');
+		const chosen = this.pref<string>('lightchain.ai.model');
 		// Keep the user's pick while it is still served (availability shows as its dot);
 		// only fall back when nothing was picked or the model is gone.
 		this.model = chosen && this.models.some(m => m.name === chosen) ? chosen : pickDefault(this.models, chosen);
@@ -267,7 +296,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				this.abort?.abort();
 				await this.until(() => !this.abort);
 				this.model = msg.name;
-				await this.memento.update('lightchain.ai.model', msg.name);
+				await this.setPref('lightchain.ai.model', msg.name);
 				this.agent?.setProvider(this.chatProvider(msg.name)); // same conversation, new model
 				this.attached = new Map(); // the new session has not seen any file
 				this.post({ type: 'models', models: this.models, selected: this.model });
@@ -353,7 +382,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			case 'model':
 				if (typeof msg.name === 'string' && msg.name !== this.model) {
 					this.model = msg.name;
-					await this.memento.update('lightchain.ai.model', msg.name);
+					await this.setPref('lightchain.ai.model', msg.name);
 					// a Lightchain session is bound to one model: the next prompt opens a new one with a recap
 					this.agent?.setProvider(this.chatProvider(msg.name));
 					this.attached = new Map(); // the new session has not seen any file
@@ -802,10 +831,10 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		if (!p) {
 			return;
 		}
-		await this.memento.update('lightchain.ai.agent', p.id);
+		await this.setPref('lightchain.ai.agent', p.id);
 		if (p.model && p.model !== this.model && this.models.some(m => m.name === p.model && m.available)) {
 			this.model = p.model;
-			await this.memento.update('lightchain.ai.model', p.model);
+			await this.setPref('lightchain.ai.model', p.model);
 			this.post({ type: 'models', models: this.models, selected: this.model });
 		}
 		if (this.agent && this.model) {
@@ -1140,8 +1169,8 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	.lc-credit__row .lc-credit__go { flex: 1; border: 0; background: linear-gradient(90deg, #df04ae 0%, #412ffd 100%); color: #fff; letter-spacing: .5px; text-transform: uppercase; font-size: 12px; }
 	.lc-credit__row button:disabled { opacity: .5; cursor: not-allowed; }
 	.lc-credit__note { margin-top: 10px; color: #b1b3d0; font-size: 12.5px; line-height: 1.45; }
-	.lc-credit__note.err { color: #ff8f3c; }
-	.lc-credit__note.ok { color: #3eb75e; }
+	.lc-credit__note.err { color: #fecaca; }
+	.lc-credit__note.ok { color: #f5f6ff; }
 	.lc-credit__foot { display: flex; gap: 14px; margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255, 255, 255, 0.1); }
 	.lc-credit__foot button { padding: 0; border: 0; background: none; color: #7376aa; font: inherit; font-size: 12.5px; cursor: pointer; }
 	.lc-credit__foot button:hover { color: #f5f6ff; }

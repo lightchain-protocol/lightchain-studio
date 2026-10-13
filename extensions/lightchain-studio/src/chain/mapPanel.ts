@@ -104,8 +104,8 @@ export const MAP_CSS = `
 	.linkchip { padding: 2px 10px; border: 1px solid rgba(112, 100, 233, 0.24); border-radius: 999px; background: var(--lc-surface-hover); color: var(--lc-text-secondary); font-size: 12px; cursor: pointer; transition: border-color .2s ease; }
 	.linkchip:hover { border-color: var(--zap-strong); }
 	.linkchip.static { cursor: default; }
-	.warn { display: flex; align-items: center; gap: 10px; margin: 12px 16px 0; padding: 8px 12px; border-radius: 10px; background: rgba(255, 42, 39, 0.08); color: #ff8a88; font-size: 12.5px; }
-	.warn span { flex: 1; }
+	.card .notice { display: flex; align-items: center; gap: 10px; margin: 12px 16px 0; }
+	.card .notice span { flex: 1; }
 	.group { margin-top: 14px; padding: 0 8px; }
 	.group__title { padding: 0 8px 4px; color: var(--lc-text-tertiary); font-size: 11px; font-weight: 600; letter-spacing: .5px; text-transform: uppercase; }
 	.fn { display: flex; align-items: baseline; gap: 10px; width: 100%; padding: 6px 8px; border: 0; border-radius: var(--lc-radius-sm); background: transparent; color: var(--lc-text-primary); font-size: 13.5px; text-align: left; cursor: pointer; transition: background .2s ease; }
@@ -133,7 +133,7 @@ export const MAP_SCRIPT = `
 			const card = el('div', 'card'); card.dataset.contract = c.name;
 			const head = el('div', 'card__head'); const mark = el('span', 'card__mark'); mark.innerHTML = lcIdenticon('contract:' + c.name);
 			const t = el('div'); t.append(el('div', 'card__name', c.name), el('div', 'card__sub', KIND[c.kind] + ' · ' + c.file));
-			head.append(mark, t); if (c.deployed) { const p = el('span', 'pill ok', 'Live'); p.title = 'Deployed at ' + c.deployed; p.style.marginLeft = 'auto'; head.append(p); }
+			head.append(mark, t); if (c.deployed) { const p = el('span', 'pill on', 'Live'); p.title = 'Deployed at ' + c.deployed; p.style.marginLeft = 'auto'; head.append(p); }
 			card.append(head, el('div', 'card__about', c.about));
 			if (c.bases.length || c.uses.length) {
 				const links = el('div', 'links');
@@ -141,7 +141,7 @@ export const MAP_SCRIPT = `
 				c.bases.forEach(b => links.append(chip('Builds on', b))); c.uses.forEach(u => links.append(chip('Uses', u)));
 				card.append(links);
 			}
-			if (c.problems) { const w = el('div', 'warn'); w.append(el('span', '', c.problems + ' serious security problem' + (c.problems === 1 ? '' : 's') + ' in this file')); const b = el('button', 'button button-xs', 'Fix with AI'); b.onclick = () => post('fix', { file: c.file }); w.append(b); card.append(w); }
+			if (c.problems) { const w = el('div', 'notice error'); w.append(el('span', '', c.problems + ' serious security problem' + (c.problems === 1 ? '' : 's') + ' in this file')); const b = el('button', 'button button-xs', 'Fix with AI'); b.onclick = () => post('fix', { file: c.file }); w.append(b); card.append(w); }
 			GROUPS.forEach(([who, title]) => {
 				const fns = c.functions.filter(f => f.who === who); if (!fns.length) return;
 				const g = el('div', 'group'); g.append(el('div', 'group__title', title));
