@@ -5,6 +5,19 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { InteractPanels } from './interact';
 import { DeployCodeLens, deployWizard } from './deployWizard';
+import { SecurityWatch } from './chain/securityWatch';
+import { GasLens } from './chain/gasLens';
+import { describeFindings } from './chain/security';
+import { ProjectAbis } from './chain/projectAbis';
+import { TxPanel } from './chain/txPanel';
+import { DashboardPanel } from './chain/dashboardPanel';
+import { MapPanel } from './chain/mapPanel';
+import { AppPanel } from './chain/appPanel';
+import { showLauncher } from './launcher';
+import { describeSimulation, simulate } from './chain/simulate';
+import { findForge } from './foundry';
+import * as nodePath from 'node:path';
+import * as nodeFs from 'node:fs';
 import { LightchainCodeActions } from './agent/quickFix';
 import { setLog as setInferenceLog } from './lightchain/inference';
 import { addressUrl } from './networks';
@@ -42,6 +55,23 @@ export function activate(context: vscode.ExtensionContext): void {
 	const wallet = new Wallet(context, bridge);
 	const credits = new Credits(wallet);
 	const programs = new DeployedProgramsProvider(context, network, () => wallet.active?.address);
+	const security = new SecurityWatch();
+	const projectAbis = new ProjectAbis();
+	const deployedNames = () => new Map(programs.relevant.filter(p => p.name).map(p => [p.address.toLowerCase(), p.name!]));
+	const txPanel = new TxPanel(context.extensionUri, network, projectAbis, deployedNames, request => ai.ask(request));
+	const dashboard = new DashboardPanel(context.extensionUri, network, projectAbis);
+	const contractMapPanel = new MapPanel(context.extensionUri, () => solidityFiles(), () => programs.relevant, (request, file) => ai.ask(request, file), async file => (await security.findings(file)).filter(f => f.severity === 'high').length);
+	const appPanel = new AppPanel(context.extensionUri, network, projectAbis, () => programs.relevant, (request, file) => ai.ask(request, file));
+	// simulate before signing: what a transaction would change, tried on a private copy of the network
+	wallet.preview = async (account, net, tx) => {
+		const forge = findForge();
+		const anvil = forge ? nodePath.join(nodePath.dirname(forge), process.platform === 'win32' ? 'anvil.exe' : 'anvil') : undefined;
+		const abis = await projectAbis.index();
+		const name = tx.to ? deployedNames().get(tx.to.toLowerCase()) ?? abis.decodeCall(tx.data)?.contract : undefined;
+		return vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Checking what this transaction will do…' }, async () =>
+			describeSimulation(await simulate({ rpcUrl: net.rpcUrl, anvil: anvil && nodeFs.existsSync(anvil) ? anvil : undefined, abis, abi: name ? abis.byName(name)?.abi : undefined, toLabel: name, tx: { from: account.address, to: tx.to, data: tx.data, value: tx.value } })));
+	};
+	const gasLens = new GasLens(wallet, network);
 	const marketplace = new MarketplaceProvider();
 	const proposals = new ProposalStore();
 	const aiLog = vscode.window.createOutputChannel('Lightchain AI', { log: true });
@@ -184,8 +214,40 @@ export function activate(context: vscode.ExtensionContext): void {
 		network, bridge, wallet, credits, programs, marketplace, ai, programsView,
 		vscode.window.createTreeView('lightchain.marketplace', { treeDataProvider: marketplace }),
 		vscode.window.registerWebviewViewProvider('lightchain.ai', ai),
-		vscode.commands.registerCommand('lightchain.deployContract', (contractName?: string) => deployWizard(wallet, network, programs, typeof contractName === 'string' ? contractName : undefined)),
+		vscode.commands.registerCommand('lightchain.deployContract', (contractName?: string) => deployWizard(wallet, network, programs, typeof contractName === 'string' ? contractName : undefined, file => security.findings(file))),
 		vscode.languages.registerCodeLensProvider({ language: 'solidity', scheme: 'file' }, new DeployCodeLens()),
+		security, gasLens, projectAbis, txPanel, dashboard, contractMapPanel, appPanel,
+		vscode.commands.registerCommand('lightchain.launcher', () => showLauncher(() => network.current.id)),
+		vscode.commands.registerCommand('lightchain.app.preview', (target?: unknown) => appPanel.open((target as { program?: { address: `0x${string}`; name?: string } } | undefined)?.program)),
+		vscode.commands.registerCommand('lightchain.tx.debug', (hash?: string) => txPanel.open(typeof hash === 'string' ? hash : undefined)),
+		vscode.commands.registerCommand('lightchain.map.open', () => contractMapPanel.open()),
+		vscode.commands.registerCommand('lightchain.dashboard.open', async (target?: unknown, name?: string) => {
+			// from the Deployed contracts list (a node), from a panel (address, name), or picked
+			const node = target as { program?: { address: `0x${string}`; name?: string } } | undefined;
+			const chosen = typeof target === 'string' ? { address: target as `0x${string}`, name } : node?.program ?? await (async () => {
+				const other = { label: '$(edit) Another address…', description: 'Any contract on this network', program: undefined };
+				const pick = await vscode.window.showQuickPick([...programs.relevant.map(p => ({ label: p.name ?? p.address, description: p.name ? p.address : undefined, program: p as { address: `0x${string}`; name?: string } | undefined })), other], { title: 'Open a contract\'s dashboard', placeHolder: 'Pick a deployed contract' });
+				if (pick !== other) {
+					return pick?.program;
+				}
+				const address = await vscode.window.showInputBox({ title: 'Open a contract\'s dashboard', prompt: `Contract address on Lightchain ${network.current.label}`, placeHolder: '0x…', ignoreFocusOut: true, validateInput: v => /^0x[0-9a-fA-F]{40}$/.test(v.trim()) ? undefined : 'An address is 0x followed by 40 characters.' });
+				return address ? { address: address.trim() as `0x${string}`, name: undefined } : undefined;
+			})();
+			if (chosen) {
+				dashboard.open({ address: chosen.address, name: chosen.name });
+			}
+		}),
+		vscode.languages.registerCodeLensProvider({ pattern: '**/src/**/*.sol', scheme: 'file' }, gasLens),
+		vscode.commands.registerCommand('lightchain.gas.cheaper', (file: string, fn: string, gas?: number) => ai.ask(`Make ${fn}() in ${file} cheaper to call${gas ? ` (it costs about ${Math.round(gas).toLocaleString('en-US')} gas now)` : ''}. Explain each saving in plain words first, and do not change what it does.`, file)),
+		vscode.commands.registerCommand('lightchain.security.fixAll', async (file?: string) => {
+			const target = typeof file === 'string' ? file : vscode.window.activeTextEditor ? vscode.workspace.asRelativePath(vscode.window.activeTextEditor.document.uri, false) : undefined;
+			const found = target ? await security.findings(target) : [];
+			if (!target || !found.length) {
+				vscode.window.showInformationMessage('The security check found nothing to fix in this file.');
+				return;
+			}
+			await ai.ask(`Fix these security problems in ${target}, one by one, and say what you changed:\n${describeFindings(target, found)}`, target);
+		}),
 		vscode.languages.registerCodeActionsProvider({ scheme: 'file' }, new LightchainCodeActions(), { providedCodeActionKinds: LightchainCodeActions.kinds }),
 		vscode.commands.registerCommand('lightchain.ai.fix', (uri: vscode.Uri, problems: { line: number; endLine: number; message: string }[]) => ai.fixProblems(uri, problems)),
 		vscode.commands.registerCommand('lightchain.ai.askSelection', () => ai.askAboutSelection()),

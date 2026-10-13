@@ -234,13 +234,24 @@ export class Wallet implements vscode.Disposable {
 	}
 
 	/**
+	 * What a transaction would do, as a few plain lines (set by the extension: it runs the
+	 * transaction on a private copy of the network). Undefined when it cannot be told.
+	 */
+	preview?: (account: WalletAccount, network: LightchainNetwork, tx: { to?: `0x${string}`; data?: Hex; value?: bigint }, purpose?: string) => Promise<string[] | undefined>;
+
+	/**
 	 * Mainnet guard: real LCAI is at stake, so every mainnet transaction gets an explicit
-	 * confirmation with what it does, the value and the estimated fee. Throws if declined.
+	 * confirmation with what it does, what it would change, the value and the estimated fee.
+	 * With "lightchain.simulate.before": "always" testnet transactions are previewed the same way.
+	 * Throws if declined.
 	 */
 	async confirmMainnet(account: WalletAccount, network: LightchainNetwork, tx: { to?: `0x${string}`; data?: Hex; value?: bigint; gas?: bigint }, purpose?: string): Promise<void> {
-		if (network.id !== 'mainnet') {
+		const mode = vscode.workspace.getConfiguration('lightchain.simulate').get<string>('before', 'mainnet');
+		const mainnet = network.id === 'mainnet';
+		if (!mainnet && mode !== 'always') {
 			return;
 		}
+		const effects = mode === 'never' ? undefined : await this.preview?.(account, network, tx, purpose).catch(() => undefined);
 		let fee = 'unknown';
 		try {
 			const client = this.publicClient(network);
@@ -255,10 +266,14 @@ export class Wallet implements vscode.Disposable {
 			`From: ${account.name} (${account.address})`,
 			...(tx.value ? [`Value: ${formatEther(tx.value)} LCAI`] : []),
 			`Network fee: ${fee}`,
+			...(effects?.length ? ['', 'What will happen:', ...effects.map(l => `• ${l}`)] : []),
 		];
-		const ok = await vscode.window.showWarningMessage('Send this transaction on Lightchain Mainnet?', { modal: true, detail: `${lines.join('\n')}\n\nThis uses real LCAI and cannot be undone.` }, 'Send on Mainnet');
-		if (ok !== 'Send on Mainnet') {
-			throw new Error('Cancelled — the mainnet transaction was not sent.');
+		const wouldFail = !!effects?.[0]?.includes('would FAIL');
+		const send = wouldFail ? 'Send Anyway' : mainnet ? 'Send on Mainnet' : 'Send';
+		const title = wouldFail ? 'This transaction would fail' : `Send this transaction on Lightchain ${network.label}?`;
+		const ok = await vscode.window.showWarningMessage(title, { modal: true, detail: `${lines.join('\n')}${mainnet ? '\n\nThis uses real LCAI and cannot be undone.' : ''}` }, send);
+		if (ok !== send) {
+			throw new Error(`Cancelled — the ${mainnet ? 'mainnet ' : ''}transaction was not sent.`);
 		}
 	}
 
@@ -284,6 +299,8 @@ export class Wallet implements vscode.Disposable {
 		}
 		const receipt = await this.publicClient(network).waitForTransactionReceipt({ hash, timeout: 120_000 });
 		if (receipt.status !== 'success') {
+			// the debugger can say why
+			void vscode.window.showErrorMessage('The transaction was sent but failed on chain.', 'Why Did It Fail?').then(pick => pick && vscode.commands.executeCommand('lightchain.tx.debug', hash));
 			throw new Error(`Transaction reverted: ${hash}`);
 		}
 		return hash;

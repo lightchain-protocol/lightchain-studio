@@ -30,6 +30,15 @@ The builds are not signed yet. On first launch macOS asks via System Settings â†
   - **Instructions.** What every agent keeps in mind: always, only for matching files (globs), or only when you `@`-mention it. A meter shows how much of the model's small window the always-on instructions use.
   - **Project context.** What every conversation starts with (instructions, contracts, deployed addresses), the local index, and a box to try what a request would find.
   - **Everything is Markdown** in `.lightchain/`, so you can write it by hand and share it through git: one file per agent in `.lightchain/agents/` and per instruction in `.lightchain/rules/`. `.lightchain/rules.md` and a root `AGENTS.md` are read too.
+- **On-chain tools built into the editor.**
+  - **Security check as you type.** The mistakes that lose funds most often (reentrancy, functions anyone can call, ignored payment results, predictable randomness, tx.origin, selfdestruct, unbounded loops) show up as problems with a plain explanation and a fix; *Fix with Lightchain AI* applies it. Serious findings stop a deploy until you have seen them.
+  - **Simulate before signing.** Every mainnet transaction is first tried on a private copy of the network (an anvil fork that lives for a few seconds), and the confirmation says what would change: balances, contract values, events, or why it would fail. `lightchain.simulate.before` extends this to testnet.
+  - **Transaction debugger.** *Lightchain: Debug a Transaction* explains what a transaction did and, when it failed, why: the revert reason in plain words, custom errors and events decoded with your project's ABIs, the call trace when the node offers one, and a jump to the function in your code.
+  - **Gas lens.** Above each contract and function in `src/`: what it costs to deploy or call, in gas and LCAI, and how that changed since the last build.
+  - **Contract map.** Each contract in plain words: what anyone can do, what only the owner can, and where money moves in or out.
+  - **Live dashboard.** A deployed contract's balance, current values and events, refreshed while the tab is open, with optional notifications.
+  - **App for a contract.** *Lightchain: Make an App for a Contract* writes a one-file web app (`app/<Name>/index.html`) that reads the contract and calls it through a browser wallet, previews it in a tab, and lets Lightchain AI reshape it.
+- **Launcher.** The search box in the title bar opens *What do you want to do?*: Lightchain actions in plain words, with files and every editor command still one step away.
 - **Lightchain home** (left side bar): switch projects in one click, search your chats grouped by day, and keep the project's tasks at hand.
 - **Task board.** To do / In progress / Review / Done with drag and drop, priorities and labels, stored in `.lightchain/tasks.json` so a team shares it through git. Hand a task to Lightchain AI with *Do with AI*, or let `/plan` break a goal into tasks.
 - **Commit with Lightchain AI** writes a commit message for your changes into Source Control; you review it and commit.
@@ -166,6 +175,8 @@ Network settings live in `extensions/lightchain-studio/src/networks.ts`.
   - `src/agentStudio.ts`: Agent Studio (agents, instructions, project context). `src/workspaceView.ts`: the Lightchain home side bar. `src/tasks.ts`, `src/boardPanel.ts`: tasks and the board.
   - `src/walletView.ts`, `src/usage.ts`, `src/faucet.ts`: the Wallet section, spend read from JobRegistry events, and the testnet faucet claim.
   - `src/newProjectPanel.ts`, `src/templates.ts`, `src/deployWizard.ts`, `src/commitMessage.ts`: new project window, templates, deploy wizard and commit messages.
+  - `src/chain/`: the on-chain tools â€” `security.ts` (the checks), `simulate.ts` (private fork), `txDebug.ts`, `abiIndex.ts` (decoding calls, events and reverts), `gas.ts`, `graph.ts` (contract map), `appTemplate.ts`, and their tabs.
+  - `src/launcher.ts`: the title bar launcher.
   - `src/ui/site.ts`: the shared Lightchain design tokens and components for the webviews.
   - `test/`: unit tests, run with `npm test` in `tools/`.
   - `src/wallet.ts`, `src/browserBridge.ts`, `src/connectPage.ts`, `src/keystore.ts`: local accounts in SecretStorage, and the browser wallet bridge. The bridge is a loopback page that discovers wallets through EIP-6963 and relays requests over SSE/POST, protected by a token plus Host and Origin checks.

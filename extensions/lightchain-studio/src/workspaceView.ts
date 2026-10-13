@@ -299,6 +299,8 @@ export class WorkspaceView implements vscode.WebviewViewProvider, vscode.Disposa
 		search: '<circle cx="11" cy="11" r="6.5"/><path d="m20 20-4-4"/>',
 		agents: '<circle cx="12" cy="8" r="3.5"/><path d="M5 20c1.2-3.5 4-5 7-5s5.8 1.5 7 5"/>',
 		board: '<rect x="3.5" y="4" width="4.5" height="16" rx="1"/><rect x="9.75" y="4" width="4.5" height="11" rx="1"/><rect x="16" y="4" width="4.5" height="7" rx="1"/>',
+		map: '<rect x="9" y="3" width="6" height="5" rx="1"/><rect x="3" y="16" width="6" height="5" rx="1"/><rect x="15" y="16" width="6" height="5" rx="1"/><path d="M12 8v4M6 16v-2a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v2"/>',
+		bug: '<rect x="8" y="7" width="8" height="12" rx="4"/><path d="M12 7V4M4 13h4M16 13h4M5 7l3 2M19 7l-3 2M5 20l3-2M19 20l-3-2"/>',
 		chev: '<path d="m6 9 6 6 6-6"/>',
 		layout: '<rect x="3.5" y="4" width="17" height="16" rx="2"/><path d="M9.5 4v16M9.5 13h11"/>',
 		gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
@@ -384,7 +386,7 @@ export class WorkspaceView implements vscode.WebviewViewProvider, vscode.Disposa
 
 	function renderFoot() {
 		const nav = $('nav'); nav.replaceChildren();
-		[['files', 'Files', 'workbench.view.explorer'], ['search', 'Search', 'workbench.view.search'], ['agents', 'Agents', 'lightchain.agents.open'], ['board', 'Task board', 'lightchain.tasks.board'], ['layout', 'Layout', '']]
+		[['files', 'Files', 'workbench.view.explorer'], ['search', 'Search', 'workbench.view.search'], ['agents', 'Agents', 'lightchain.agents.open'], ['board', 'Task board', 'lightchain.tasks.board'], ['map', 'Contract map', 'lightchain.map.open'], ['bug', 'Debug a transaction', 'lightchain.tx.debug'], ['layout', 'Layout', '']]
 			.forEach(([ic, label, command]) => { const b = item({ icon: ic, name: label, click: () => command ? vscode.postMessage({ type: 'run', command }) : toggleLayout() }); b.classList.remove('row'); b.classList.add('nav'); if (!command) b.id = 'layoutBtn'; nav.append(b); });
 		const a = $('account'); a.replaceChildren();
 		const acc = state.account;

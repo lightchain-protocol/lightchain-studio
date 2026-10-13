@@ -78,3 +78,13 @@ test('New project window script compiles', () => {
 	const panel = new NewProjectPanel(extUri) as unknown as { html(w: unknown): string };
 	assertCompiles('newProjectPanel', panel.html(webview));
 });
+
+test('On-chain tool tabs: scripts compile', async () => {
+	const { page } = await import('../src/ui/page');
+	const tx = await import('../src/chain/txPanel');
+	const dash = await import('../src/chain/dashboardPanel');
+	const map = await import('../src/chain/mapPanel');
+	assertCompiles('txPanel', page(webview as never, extUri as never, { title: 't', lead: 'l', css: tx.TX_CSS, script: tx.TX_SCRIPT }));
+	assertCompiles('dashboardPanel', page(webview as never, extUri as never, { title: 't', lead: 'l', css: dash.DASHBOARD_CSS, script: dash.DASHBOARD_SCRIPT }));
+	assertCompiles('mapPanel', page(webview as never, extUri as never, { title: 't', lead: 'l', css: map.MAP_CSS, script: map.MAP_SCRIPT }));
+});

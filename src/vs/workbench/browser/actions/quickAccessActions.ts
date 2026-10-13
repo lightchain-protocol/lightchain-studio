@@ -180,6 +180,15 @@ registerAction2(class QuickAccessAction extends Action2 {
 
 		const configurationService = accessor.get(IConfigurationService);
 		const commandService = accessor.get(ICommandService);
+		const lightchainQuickInput = accessor.get(IQuickInputService);
+		if (await commandService.executeCommand('lightchain.launcher').then(() => true, () => false)) {
+			return;
+		}
+		if (lightchainQuickInput) {
+			const providerOptions: AnythingQuickAccessProviderRunOptions = { includeHelp: true, from: 'commandCenter' };
+			lightchainQuickInput.quickAccess.show(undefined, { preserveValue: true, providerOptions });
+			return;
+		}
 		const aiFeaturesDisabled = configurationService.getValue<boolean>(ChatAIDisabledSettingId) === true;
 		const useUnifiedQuickAccess = !aiFeaturesDisabled && configurationService.getValue<boolean>(UNIFIED_AGENTS_BAR_SETTING) === true;
 		if (useUnifiedQuickAccess) {

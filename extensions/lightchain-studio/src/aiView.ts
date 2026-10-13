@@ -856,6 +856,12 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		await this.send('/audit', false, { file, mentions: [] });
 	}
 
+	/** Sends a request to the chat from elsewhere in the IDE (a lens, a panel), about `file` when given. */
+	async ask(request: string, file?: string): Promise<void> {
+		await vscode.commands.executeCommand('lightchain.ai.focus');
+		await this.send(request, false, file ? { file, mentions: [] } : undefined);
+	}
+
 	/** A forge command failed: send its output to the chat to be fixed. */
 	async fixFailure(command: string, output: string): Promise<void> {
 		await vscode.commands.executeCommand('lightchain.ai.focus');

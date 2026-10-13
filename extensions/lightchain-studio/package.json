@@ -359,6 +359,41 @@
 				"category": "Lightchain"
 			},
 			{
+				"command": "lightchain.tx.debug",
+				"title": "Debug a Transaction",
+				"category": "Lightchain",
+				"icon": "$(bug)"
+			},
+			{
+				"command": "lightchain.map.open",
+				"title": "Open Contract Map",
+				"category": "Lightchain",
+				"icon": "$(type-hierarchy)"
+			},
+			{
+				"command": "lightchain.dashboard.open",
+				"title": "Open Dashboard",
+				"category": "Lightchain",
+				"icon": "$(pulse)"
+			},
+			{
+				"command": "lightchain.launcher",
+				"title": "What Do You Want to Do?",
+				"category": "Lightchain",
+				"icon": "$(search)"
+			},
+			{
+				"command": "lightchain.app.preview",
+				"title": "Make an App for a Contract",
+				"category": "Lightchain",
+				"icon": "$(browser)"
+			},
+			{
+				"command": "lightchain.security.fixAll",
+				"title": "Fix Security Problems with Lightchain AI",
+				"category": "Lightchain"
+			},
+			{
 				"command": "lightchain.rules.open",
 				"title": "Open Instructions",
 				"category": "Lightchain"
@@ -427,6 +462,16 @@
 					"command": "lightchain.programs.copyAddress",
 					"when": "view == lightchain.deployedPrograms && viewItem =~ /^program/",
 					"group": "inline@2"
+				},
+				{
+					"command": "lightchain.dashboard.open",
+					"when": "view == lightchain.deployedPrograms && viewItem =~ /^program/",
+					"group": "1_actions@0"
+				},
+				{
+					"command": "lightchain.app.preview",
+					"when": "view == lightchain.deployedPrograms && viewItem =~ /^program/",
+					"group": "1_actions@0"
 				},
 				{
 					"command": "lightchain.programs.findReferences",
@@ -596,6 +641,23 @@
 					"type": "boolean",
 					"default": true,
 					"markdownDescription": "Search the project on this machine for code related to each request and attach the best matches to the prompt. Nothing is uploaded to build the index."
+				},
+				"lightchain.simulate.before": {
+					"type": "string",
+					"enum": ["mainnet", "always", "never"],
+					"enumDescriptions": ["Preview every mainnet transaction before you confirm it", "Preview testnet transactions too", "Never preview"],
+					"default": "mainnet",
+					"markdownDescription": "Try each transaction on a private copy of the network first and show what it would change (balances, contract values, events) before you confirm it."
+				},
+				"lightchain.security.check": {
+					"type": "boolean",
+					"default": true,
+					"markdownDescription": "Check Solidity files for common security mistakes while you type (reentrancy, missing access control, unchecked payments, predictable randomness…) and show them as problems."
+				},
+				"lightchain.gas.lens": {
+					"type": "boolean",
+					"default": true,
+					"markdownDescription": "Show what each contract costs to deploy and each function costs to call (gas and LCAI) above the code in `src/`."
 				},
 				"lightchain.explorer.outline": {
 					"type": "boolean",
