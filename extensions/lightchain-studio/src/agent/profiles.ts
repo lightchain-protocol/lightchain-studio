@@ -128,7 +128,7 @@ export function profileFromMarkdown(id: string, text: string): AgentProfile | un
 export function allowedTools(p: AgentProfile): string[] {
 	return [
 		...(p.can.read ? ['list_dir', 'read_file', 'search'] : []),
-		...(p.can.write ? ['write_file'] : []),
+		...(p.can.write ? ['write_file', 'append_file'] : []),
 		...(p.can.build ? ['forge_build'] : []),
 		...(p.can.test ? ['forge_test'] : []),
 		...(p.can.run ? ['run_command'] : []),

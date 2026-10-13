@@ -3,7 +3,7 @@ import { ChatMessage, InferenceProvider } from '../agent/agent';
 import { estimateTokens, recap, sessionNotes } from '../agent/memory';
 import { NetworkState } from '../networkState';
 import { Wallet } from '../wallet';
-import { DelegateNotAuthorizedError, LightchainInference, StatusFn } from './inference';
+import { DelegateNotAuthorizedError, InsufficientCreditsError, LightchainInference, StatusFn } from './inference';
 
 /**
  * InferenceProvider backed by Lightchain decentralized inference.
@@ -77,6 +77,13 @@ export class LightchainProvider implements InferenceProvider {
 		} catch (err) {
 			if (err instanceof DelegateNotAuthorizedError && !err.delegate) {
 				throw new DelegateNotAuthorizedError(await this.client.delegate().catch(() => undefined));
+			}
+			// credits are there, but the spending limit set when they were enabled is used up: raising it is one step, not a top-up
+			if (err instanceof InsufficientCreditsError && /allowance|spending limit/i.test(err.message)) {
+				const delegate = await this.client.delegate().catch(() => undefined);
+				if (delegate) {
+					throw new DelegateNotAuthorizedError(delegate, true);
+				}
 			}
 			throw err;
 		}

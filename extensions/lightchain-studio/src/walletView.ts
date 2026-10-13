@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { formatEther } from 'viem';
-import { Credits, JOB_FEE_LCAI } from './credits';
+import { Credits, jobFee } from './credits';
 import { claimTestnetLcai } from './faucet';
 import { addressUrl, txUrl } from './networks';
 import { NetworkState } from './networkState';
@@ -63,9 +63,9 @@ export class WalletView implements vscode.WebviewViewProvider, vscode.Disposable
 				const used = await this.usage.read(client as never, net, active.address, snap.credits).catch(() => null);
 				const left = Number(formatEther(snap.credits));
 				credits = {
-					balance: lcai(snap.credits), requests: Math.floor(left / JOB_FEE_LCAI + 1e-9),
+					balance: lcai(snap.credits), requests: Math.floor(left / jobFee(net) + 1e-9),
 					spent: used ? lcai(used.spent) : null, deposited: used ? lcai(used.deposited) : null, withdrawn: used ? lcai(used.withdrawn) : null,
-					spentRequests: used ? Math.round(Number(formatEther(used.spent)) / JOB_FEE_LCAI) : null,
+					spentRequests: used ? Math.round(Number(formatEther(used.spent)) / jobFee(net)) : null,
 					wallet: lcai(snap.walletBalance), lightscan: addressUrl(net, active.address),
 				};
 			} catch {

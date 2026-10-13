@@ -53,7 +53,7 @@ export function systemPrompt(workspaceName: string, profile?: AgentProfile): str
 	const tools = AGENT_TOOLS.filter(t => !allowed || allowed.includes(t.name)).map(t => `- ${t.name}: ${t.description}\n  args: ${t.args}`).join('\n');
 	const canWrite = !profile || profile.can.write;
 	return [
-		`You are Lightchain AI, the coding agent inside Lightchain Studio — the IDE for building on the Lightchain AI blockchain (EVM, Solidity, Foundry). Testnet chain id 8200, mainnet 9200, native token LCAI.`,
+		`You are Lightchain AI, the coding agent inside Lightchain Studio — the IDE for building on the Lightchain AI blockchain (EVM, Solidity, Foundry). Testnet chain id 8200, mainnet 9200. LCAI is the chain's native coin, like ETH on Ethereum: contracts receive it with payable functions and msg.value and send it with call{value: …} — never treat LCAI as an ERC-20 token.`,
 		`You are working in the project "${workspaceName}". Paths are relative to the project root.`,
 		...(profile ? ['', profilePrompt(profile)] : []),
 		``,
@@ -62,6 +62,7 @@ export function systemPrompt(workspaceName: string, profile?: AgentProfile): str
 		`{"name": "read_file", "args": {"path": "src/Counter.sol"}}`,
 		'```',
 		`Call one or more tools per reply, then STOP and wait for the results. Do not invent tool results.`,
+		`Replies are limited to about 3,000 characters (roughly 60 lines of code). Write ONE file per reply. A longer file is written in parts: write_file the first ~50 lines (stop at the end of a function), then append_file the next ~50 lines, and so on until the file is complete — never try to send a long file in one reply.`,
 		`When the task is done, reply normally without any tool block and summarize ${canWrite ? 'what you changed' : 'your answer'}.`,
 		``,
 		`Tools:`,
@@ -131,6 +132,34 @@ export function codeBlockAsWrite(text: string): ToolCall | undefined {
 	return undefined;
 }
 
+/**
+ * Lightchain workers cap an answer at about 1,000 tokens, so a reply that writes a
+ * whole file is often cut in the middle of its tool block. True when `text` ends
+ * inside a ```tool (or tool-call ```json) block that was never closed.
+ */
+export function cutOffToolCall(text: string): boolean {
+	const fences = [...text.matchAll(/^```([\w+-]*)[^\n]*$/gm)];
+	if (fences.length % 2 === 0) {
+		return false; // every block is closed
+	}
+	const open = fences[fences.length - 1];
+	const body = text.slice(open.index! + open[0].length);
+	return open[1] === 'tool' || (/^json$/i.test(open[1]) && /"name"\s*:/.test(body)) || /"name"\s*:\s*"write_file"/.test(body);
+}
+
+/** Joins a cut-off reply with its continuation: drops a repeated code fence and any overlap the model repeated. */
+export function joinContinuation(head: string, more: string): string {
+	let tail = more.replace(/^\s*```[\w+-]*[^\n]*\n/, '').replace(/^\s*(?:Continuing|Here is the rest|Continued)[^\n]*\n+/i, '');
+	// the model often repeats the last few characters it had already written
+	for (let n = Math.min(200, head.length, tail.length); n >= 12; n--) {
+		if (head.endsWith(tail.slice(0, n))) {
+			tail = tail.slice(n);
+			break;
+		}
+	}
+	return head + tail;
+}
+
 /** "I have created `src/Game.sol`…" → "src/Game.sol" (a claim of a file change), else undefined. */
 export function claimedFile(text: string): string | undefined {
 	if (!/\b(I(?:'ve| have)?\s+(?:now\s+)?(?:created|written|wrote|added|updated|modified|saved|implemented)|has been (?:created|written|added|updated|saved))\b/i.test(text)) {
@@ -158,6 +187,8 @@ export class AgentStuckError extends Error { }
 
 const MAX_FAILED_STEPS = 3;
 const MAX_FIX_ROUNDS = 2;
+/** How many times one answer may be continued after the worker cut it off. */
+const MAX_CONTINUES = 1;
 
 export class Agent {
 	private history: ChatMessage[];
@@ -239,9 +270,30 @@ export class Agent {
 				reply += delta;
 				events.onText(delta);
 			}
+			// the worker cut the answer in the middle of a tool call: have the model carry on from that exact point
+			for (let n = 0; n < MAX_CONTINUES && cutOffToolCall(reply) && !signal.aborted; n++) {
+				events.onStatus(`The answer was cut off by the network's length limit — continuing it (${n + 1})…`);
+				this.history.push({ role: 'assistant', content: reply });
+				this.history.push({ role: 'user', content: 'Your reply was cut off by the length limit in the middle of the tool block. Continue EXACTLY from the character where it stopped: no repetition, no explanation, no new code fence. Finish the JSON and close the block with ```.' });
+				let more = '';
+				for await (const delta of this.provider.chat(this.history, signal, (st, o) => events.onStatus(st, o))) {
+					more += delta; // the rest of a tool block: nothing to show the user
+				}
+				// keep one assistant message holding the whole reply
+				this.history.length -= 2;
+				reply = joinContinuation(reply, more);
+			}
 			events.onReplyEnd?.();
 			this.history.push({ role: 'assistant', content: reply });
 			const calls = parseToolCalls(reply);
+			if (!calls.length && cutOffToolCall(reply)) {
+				// still unfinished after the allowed continuations: say so instead of ending as if nothing was asked
+				this.history.push({ role: 'user', content: 'That file is too long to send in one reply, so nothing was written. Write it in parts instead: call write_file now with ONLY the first 40 to 50 lines (stop at the end of a function), then in your next replies call append_file with the next 40 to 50 lines each, until the file is complete.' });
+				events.onStatus('The file was too long for one answer — asking for it in smaller parts…');
+				if (step < MAX_STEPS - 1) {
+					continue;
+				}
+			}
 			if (!calls.length) {
 				const apply = this.profile && !this.profile.can.write ? undefined : codeBlockAsWrite(reply);
 				if (!apply) {
@@ -309,7 +361,7 @@ export class Agent {
 				events.onToolStart(call);
 				const result: ToolResult = await tool.run(call.args, this.ctx).catch(err => ({ ok: false, output: (err as Error).message }));
 				events.onToolEnd(call, result);
-				if (result.ok && call.name === 'write_file') {
+				if (result.ok && (call.name === 'write_file' || call.name === 'append_file')) {
 					wrote = true;
 					if (/\.sol$/.test(String(call.args.path ?? ''))) {
 						unbuilt = true;
@@ -329,6 +381,15 @@ export class Agent {
 				throw new AgentStuckError(`Stopped after ${MAX_FAILED_STEPS} failed attempts in a row, so it doesn't keep spending credits.`);
 			}
 			this.history.push({ role: 'user', content: results.join('\n\n') });
+		}
+		// Out of steps (or stopped by a failure) with contract changes nobody compiled: check them once,
+		// so the user is told when the result does not build instead of being offered a deploy.
+		if (unbuilt && this.ctx.forgePath && !signal.aborted && (!this.profile || this.profile.can.build)) {
+			const call: ToolCall = { name: 'forge_build', args: {} };
+			events.onToolStart(call);
+			const result = await TOOLS.find(t => t.name === 'forge_build')!.run({}, this.ctx).catch(err => ({ ok: false, output: (err as Error).message }));
+			this.lastCheck = { command: 'forge build', ...result };
+			events.onToolEnd(call, result);
 		}
 		events.onTurnEnd();
 	}

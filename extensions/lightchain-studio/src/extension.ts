@@ -16,7 +16,7 @@ import { AppPanel } from './chain/appPanel';
 import { showLauncher } from './launcher';
 import { BackgroundAgents } from './backgroundRunner';
 import { WalletSpaces } from './walletSpace';
-import { JOB_FEE_LCAI } from './credits';
+import { jobFee } from './credits';
 import { describeSimulation, simulate } from './chain/simulate';
 import { findForge } from './foundry';
 import * as nodePath from 'node:path';
@@ -72,7 +72,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		const abis = await projectAbis.index();
 		const name = tx.to ? deployedNames().get(tx.to.toLowerCase()) ?? abis.decodeCall(tx.data)?.contract : undefined;
 		return vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Checking what this transaction will do…' }, async () =>
-			describeSimulation(await simulate({ rpcUrl: net.rpcUrl, anvil: anvil && nodeFs.existsSync(anvil) ? anvil : undefined, abis, abi: name ? abis.byName(name)?.abi : undefined, toLabel: name, tx: { from: account.address, to: tx.to, data: tx.data, value: tx.value } })));
+			describeSimulation(await simulate({ rpcUrl: net.rpcUrl, anvil: anvil && nodeFs.existsSync(anvil) ? anvil : undefined, abis, abi: name ? abis.byName(name)?.abi : undefined, toLabel: name ?? (tx.to?.toLowerCase() === net.jobRegistry.toLowerCase() ? 'Your Lightchain AI credits' : undefined), tx: { from: account.address, to: tx.to, data: tx.data, value: tx.value } })));
 	};
 	const gasLens = new GasLens(wallet, network);
 	const marketplace = new MarketplaceProvider();
@@ -119,7 +119,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		vscode.commands.registerCommand('lightchain.agents.new', () => studio.startNew()));
 	const tasks = new TaskStore();
 	ai.tasks = tasks;
-	const background = new BackgroundAgents(context, tasks, () => ai.sideProvider(), () => profiles.get('builder'), JOB_FEE_LCAI);
+	const background = new BackgroundAgents(context, tasks, () => ai.sideProvider(), () => profiles.get('builder'), () => jobFee(network.current));
 	const board = new BoardPanel(context.extensionUri, tasks, t => ai.runTask(t), goal => ai.plan(goal), id => background.stateOf(id));
 	context.subscriptions.push(background, background.onDidChange(() => board.refresh()),
 		vscode.commands.registerCommand('lightchain.tasks.background', (id?: string) => background.start(typeof id === 'string' ? id : undefined)),
@@ -399,7 +399,7 @@ function registerWalletCommands(context: vscode.ExtensionContext, wallet: Wallet
 		}
 		try {
 			const account = await wallet.importKey(name, key.trim());
-			vscode.window.showInformationMessage(`Imported ${account.name} (${shortAddress(account.address)}).`);
+			vscode.window.showInformationMessage(`Wallet added: ${account.name} (${shortAddress(account.address)}).`);
 		} catch (err) {
 			vscode.window.showErrorMessage((err as Error).message);
 		}
@@ -425,7 +425,7 @@ function registerWalletCommands(context: vscode.ExtensionContext, wallet: Wallet
 		}
 		try {
 			const account = await wallet.importMnemonic(name, phrase, pick.index);
-			vscode.window.showInformationMessage(`Imported ${account.name} (${shortAddress(account.address)}).`);
+			vscode.window.showInformationMessage(`Wallet added: ${account.name} (${shortAddress(account.address)}).`);
 		} catch (err) {
 			vscode.window.showErrorMessage((err as Error).message);
 		}

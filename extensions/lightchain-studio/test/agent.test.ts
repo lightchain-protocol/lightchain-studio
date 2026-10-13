@@ -207,3 +207,77 @@ test('background work: a broken result is reported, a conflict is not forced, di
 	const plain = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-plain-'));
 	assert.match((await notReady(plain))!, /not a git repository/);
 });
+
+// ---- answers cut off by the worker's length limit ---------------------------------------
+import { cutOffToolCall, joinContinuation } from '../src/agent/agent';
+
+test('cut-off answers: detected only when a tool block was left open', () => {
+	const open = `I'll write it.\n${fence}tool\n{"name": "write_file", "args": {"path": "src/Game.sol", "content": "// SPDX\\ncontract Game {\\n    uint256 public`;
+	assert.equal(cutOffToolCall(open), true);
+	assert.equal(cutOffToolCall(open + ` x;\\n}\\n"}}\n${fence}`), false);
+	assert.equal(cutOffToolCall('Just text, no blocks.'), false);
+	assert.equal(cutOffToolCall(`Example:\n${fence}solidity\ncontract A {`), false, 'an unfinished code sample is not a tool call');
+	assert.equal(cutOffToolCall(`${fence}json\n{"name": "write_file", "args": {"path": "a.sol", "content": "x`), true);
+	assert.equal(joinContinuation('abc uint256 public', ' x;\n}'), 'abc uint256 public x;\n}');
+	assert.equal(joinContinuation('contract Game {\\n    uint256 public stake;', `${fence}tool\n    uint256 public stake;\\n}`), 'contract Game {\\n    uint256 public stake;\\n}', 'a repeated fence and overlap are dropped');
+});
+
+test('cut-off answers: the agent asks the model to continue and writes the complete file', async () => {
+	const { root, forge } = project();
+	const content = 'pragma solidity ^0.8.24;\ncontract Game {\n    uint256 public stake;\n    function play() external payable { stake += msg.value; }\n}\n';
+	const full = tool({ name: 'write_file', args: { path: 'src/Game.sol', content } });
+	const cut = full.indexOf('function play');
+	const m = fakeModel([`Let me write the contract first.\n${full.slice(0, cut)}`, full.slice(cut - 20), 'Done: Game.sol is written.']);
+	const agent = new Agent(m.provider, { root, forgePath: forge, approve: async () => true });
+	const log: string[] = [];
+	const statuses: string[] = [];
+	await agent.run('Build a game', { ...events(log), onStatus: (s: string) => { statuses.push(s); } }, new AbortController().signal);
+	assert.equal(fs.readFileSync(path.join(root, 'src/Game.sol'), 'utf8'), content, 'the two halves were joined into the exact file');
+	assert.ok(statuses.some(s => /cut off/.test(s)));
+	assert.match(m.seen[1], /Continue EXACTLY from the character where it stopped/);
+	assert.ok(log.includes('end write_file ok') && log.includes('end forge_build ok'));
+});
+
+test('cut-off answers: a file that never finishes is asked for in smaller parts instead of ending silently', async () => {
+	const { root, forge } = project();
+	const never = `${fence}tool\n{"name": "write_file", "args": {"path": "src/Big.sol", "content": "contract Big {`;
+	const small = tool({ name: 'write_file', args: { path: 'src/Big.sol', content: 'pragma solidity ^0.8.24;\ncontract Big { uint256 public x; }\n' } });
+	const m = fakeModel([never, ' uint a;', small, 'Done.']);
+	const agent = new Agent(m.provider, { root, forgePath: forge, approve: async () => true });
+	await agent.run('Build something big', events([]), new AbortController().signal);
+	assert.ok(m.seen.some(s => /too long to send in one reply/.test(s) && /append_file/.test(s)));
+	assert.ok(fs.readFileSync(path.join(root, 'src/Big.sol'), 'utf8').includes('contract Big { uint256 public x; }'));
+});
+
+test('long files: written in parts with write_file then append_file, built once complete', async () => {
+	const { root, forge } = project();
+	const part1 = 'pragma solidity ^0.8.24;\ncontract Game {\n    uint256 public stake;\n';
+	const part2 = '    function play() external payable { stake += msg.value; }\n}\n';
+	const m = fakeModel([
+		tool({ name: 'write_file', args: { path: 'src/Game.sol', content: part1 } }),
+		tool({ name: 'append_file', args: { path: 'src/Game.sol', content: part2 } }),
+		tool({ name: 'append_file', args: { path: 'src/Game.sol', content: part2 } }), // the same part again: refused
+		tool({ name: 'append_file', args: { path: 'src/Missing.sol', content: 'x' } }),
+		'Done.',
+	]);
+	const agent = new Agent(m.provider, { root, forgePath: forge, approve: async () => true }, BUILTIN_AGENTS[0]);
+	const log: string[] = [];
+	await agent.run('Build a game', events(log), new AbortController().signal);
+	assert.equal(fs.readFileSync(path.join(root, 'src/Game.sol'), 'utf8'), part1 + part2);
+	assert.ok(m.seen.some(s => /already ends with exactly this part/.test(s)));
+	assert.ok(m.seen.some(s => /does not exist yet\. Start it with write_file/.test(s)));
+	assert.ok(log.includes('end forge_build ok'));
+});
+
+test('out of steps with unbuilt contract changes: one final build tells whether the result compiles', async () => {
+	const { root, forge } = project();
+	const bad = 'pragma solidity ^0.8.24;\ncontract Bad { uint x = 1 }\n';
+	// the model keeps reading after a broken write until the step limit is reached
+	const m = fakeModel([tool({ name: 'write_file', args: { path: 'src/Bad.sol', content: bad } }), ...Array.from({ length: 11 }, () => tool({ name: 'read_file', args: { path: 'src/Bad.sol' } }))]);
+	const agent = new Agent(m.provider, { root, forgePath: forge, approve: async () => true });
+	const log: string[] = [];
+	await agent.run('Build it', events(log), new AbortController().signal);
+	assert.equal(agent.lastCheck?.ok, false);
+	assert.equal(agent.lastCheck?.command, 'forge build');
+	assert.equal(log[log.length - 2], 'end forge_build fail');
+});

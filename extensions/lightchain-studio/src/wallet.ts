@@ -259,7 +259,8 @@ export class Wallet implements vscode.Disposable {
 				tx.gas ?? client.estimateGas({ account: account.address, to: tx.to, data: tx.data, value: tx.value }),
 				client.getGasPrice(),
 			]);
-			fee = `≈ ${Number(formatEther(gas * price)).toPrecision(3)} LCAI`;
+			const lcai = Number(formatEther(gas * price));
+			fee = lcai < 0.00001 ? 'less than 0.00001 LCAI' : `≈ ${lcai.toPrecision(2)} LCAI`;
 		} catch { /* the wallet will show it */ }
 		const lines = [
 			purpose ?? (tx.to ? `Transaction to ${tx.to}` : 'Contract deployment'),

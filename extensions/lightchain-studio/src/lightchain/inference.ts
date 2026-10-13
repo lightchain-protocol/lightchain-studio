@@ -21,7 +21,8 @@ import { bytesToBase64, base64ToBytes } from './base64';
  * the session's earlier jobs on-chain.
  */
 export class DelegateNotAuthorizedError extends Error {
-	constructor(readonly delegate?: string) { super('Lightchain AI is not yet allowed to spend your credits.'); }
+	/** `limit`: it is allowed, but the amount it may spend is used up (credits were added since). */
+	constructor(readonly delegate?: string, readonly limit = false) { super(limit ? 'Lightchain AI has used up the amount it may spend from your credits.' : 'Lightchain AI is not yet allowed to spend your credits.'); }
 }
 /** The worker accepted the job but failed or went silent — another model may answer. */
 export class WorkerError extends Error {

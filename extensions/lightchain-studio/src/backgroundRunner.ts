@@ -29,7 +29,7 @@ export class BackgroundAgents implements vscode.Disposable {
 		private readonly tasks: TaskStore,
 		private readonly provider: () => InferenceProvider | undefined,
 		private readonly profile: () => AgentProfile | undefined,
-		private readonly feePerRequest: number,
+		private readonly feePerRequest: () => number,
 	) {
 		this.status.command = 'lightchain.tasks.backgroundMenu';
 		this.refresh();
@@ -113,7 +113,7 @@ export class BackgroundAgents implements vscode.Disposable {
 				'',
 				'• It works on a separate git branch. Your files stay exactly as they are until you merge its work.',
 				'• It saves its changes without asking, but never runs terminal commands.',
-				`• It uses at most about ${MAX_REQUESTS} requests (≈ ${(MAX_REQUESTS * this.feePerRequest).toFixed(2)} LCAI of credits).`,
+				`• It uses at most about ${MAX_REQUESTS} requests (≈ ${(MAX_REQUESTS * this.feePerRequest()).toFixed(2)} LCAI of credits).`,
 				'• You can keep working, and stop it from the status bar.',
 			].join('\n'),
 		}, 'Start');

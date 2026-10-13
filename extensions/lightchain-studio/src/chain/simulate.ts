@@ -164,8 +164,12 @@ export function describeSimulation(s: Simulation): string[] {
 			lines.push(`…and ${s.state.length - 6} more values change.`);
 		}
 	}
-	if (s.events.length) {
-		lines.push(`Events: ${s.events.slice(0, 3).join('; ')}${s.events.length > 3 ? ` and ${s.events.length - 3} more` : ''}`);
+	// events this project can name are shown; the rest are only counted
+	const known = s.events.filter(e => !/^event (0x|$)/.test(e));
+	if (known.length) {
+		lines.push(`Events: ${known.slice(0, 3).join('; ')}${known.length > 3 ? ` and ${known.length - 3} more` : ''}`);
+	} else if (s.events.length) {
+		lines.push(`It announces ${s.events.length} event${s.events.length === 1 ? '' : 's'}.`);
 	}
 	if (s.how === 'call' && s.fee) {
 		lines.push(`Network fee: about ${lcai(s.fee)}`);

@@ -100,7 +100,7 @@ export async function runInBackground(o: RunOptions): Promise<WorkResult> {
 	try {
 		await agent.run(o.prompt, {
 			onText() { },
-			onToolStart: call => { steps++; o.onProgress?.(call.name === 'write_file' ? `Writing ${String(call.args.path ?? 'a file')}` : call.name === 'forge_build' ? 'Checking that it compiles' : call.name === 'forge_test' ? 'Running the tests' : call.name === 'read_file' ? `Reading ${String(call.args.path ?? 'a file')}` : 'Working'); },
+			onToolStart: call => { steps++; o.onProgress?.(call.name === 'write_file' || call.name === 'append_file' ? `Writing ${String(call.args.path ?? 'a file')}` : call.name === 'forge_build' ? 'Checking that it compiles' : call.name === 'forge_test' ? 'Running the tests' : call.name === 'read_file' ? `Reading ${String(call.args.path ?? 'a file')}` : 'Working'); },
 			onToolEnd() { },
 			onTurnEnd() { },
 			onStatus: status => o.onProgress?.(status),

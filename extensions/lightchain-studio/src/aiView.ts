@@ -24,7 +24,7 @@ import { Wallet } from './wallet';
 import { isWalletTimeout } from './browserBridge';
 import { shortAddress } from './deployedPrograms';
 import { txUrl } from './networks';
-import { Credits, formatLcai, JOB_FEE_LCAI } from './credits';
+import { Credits, formatLcai, jobFee } from './credits';
 import { Agent, InferenceProvider } from './agent/agent';
 import { ApprovalRequest, PartialApproval } from './agent/tools';
 import { ProposalStore } from './agent/proposals';
@@ -347,7 +347,14 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				}
 				this.post({ type: 'creditResult', busy: true, text: account.kind === 'browser' ? `Approve ${amount} LCAI in your browser wallet…` : `Adding ${amount} LCAI…` });
 				try {
-					await this.credits.topUp(account, this.network.current, amount);
+					const net = this.network.current;
+					await this.credits.topUp(account, net, amount);
+					// Lightchain AI may spend up to a limit set when it was allowed: keep that limit equal to the credits
+					const delegate = this.memento.get<`0x${string}`>(`lightchain.ai.delegate:${net.id}:${account.address.toLowerCase()}`);
+					if (delegate) {
+						this.post({ type: 'creditResult', busy: true, text: 'Letting Lightchain AI use the new credits…' });
+						await this.credits.enableForAi(account, net, delegate).catch(() => undefined);
+					}
 					this.post({ type: 'creditResult', ok: true, text: `Added ${amount} LCAI to your credits.` });
 				} catch (err) {
 					this.post({ type: 'creditResult', ok: false, text: friendlyError(err, account) });
@@ -449,11 +456,11 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			return;
 		}
 		// Don't submit a prompt the credits can't pay for: it would only fail after sign-in and upload.
-		if (!retry && this.lastCredits !== undefined && this.lastCredits < JOB_FEE_LCAI) {
+		if (!retry && this.lastCredits !== undefined && this.lastCredits < jobFee(this.network.current)) {
 			this.post({ type: 'restoreInput', text: request });
 			this.post({
 				type: 'card', title: 'Not enough credits for a prompt', state: '', stateKind: 'err',
-				detail: `Each Lightchain AI job costs about ${JOB_FEE_LCAI} LCAI in credits; you have ${this.lastCredits.toFixed(2)}. Top up, then send again.`,
+				detail: `Each Lightchain AI job costs about ${jobFee(this.network.current)} LCAI in credits; you have ${this.lastCredits.toFixed(2)}. Top up, then send again.`,
 				actions: [{ label: 'Top up credits', command: 'lightchain.credits.topUp' }],
 			});
 			return;
@@ -552,8 +559,10 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				this.pendingDelegate = err.delegate as `0x${string}`;
 				this.retryText = text;
 				this.post({
-					type: 'card', id: 'setup-credits', title: 'Allow Lightchain AI to use your credits', state: 'One-time setup', stateKind: 'wait',
-					detail: `A single on-chain approval on ${this.network.current.label}${this.wallet.active?.kind === 'browser' ? ', confirmed in your browser wallet' : ''}. Your message is sent automatically right after.`,
+					type: 'card', id: 'setup-credits', title: err.limit ? 'Let Lightchain AI use the credits you added' : 'Allow Lightchain AI to use your credits', state: err.limit ? 'Spending limit reached' : 'One-time setup', stateKind: 'wait',
+					detail: err.limit
+						? `Lightchain AI may only spend the amount that was in your credits when you allowed it. Raise that limit to your current credits with one approval on ${this.network.current.label}; your message continues right after.`
+						: `A single on-chain approval on ${this.network.current.label}${this.wallet.active?.kind === 'browser' ? ', confirmed in your browser wallet' : ''}. Your message is sent automatically right after.`,
 					actions: [{ label: 'Allow', command: 'enableCredits' }],
 				});
 			} else if (err instanceof AgentStuckError) {
@@ -603,7 +612,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				// every reply is a job on Lightchain: show where to verify it and what it cost
 				const net = this.network.current;
 				this.post({
-					type: 'jobs', count: this.turnJobs.length, cost: +(this.turnJobs.length * JOB_FEE_LCAI).toFixed(4),
+					type: 'jobs', count: this.turnJobs.length, cost: +(this.turnJobs.length * jobFee(net)).toFixed(4),
 					jobs: this.turnJobs.map(j => ({ id: j.jobId, url: j.txHash ? txUrl(net, j.txHash) : undefined })),
 				});
 				this.turnJobs = [];
@@ -676,8 +685,8 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			vscode.window.showWarningMessage('Connect a wallet to use Lightchain AI.', 'Connect Wallet').then(p => p && vscode.commands.executeCommand('lightchain.wallet.menu'));
 			return;
 		}
-		if (this.lastCredits !== undefined && this.lastCredits < JOB_FEE_LCAI) {
-			vscode.window.showWarningMessage(`Not enough Lightchain AI credits (each request costs about ${JOB_FEE_LCAI} LCAI).`, 'Top Up').then(p => p && vscode.commands.executeCommand('lightchain.credits.topUp'));
+		if (this.lastCredits !== undefined && this.lastCredits < jobFee(this.network.current)) {
+			vscode.window.showWarningMessage(`Not enough Lightchain AI credits (each request costs about ${jobFee(this.network.current)} LCAI).`, 'Top Up').then(p => p && vscode.commands.executeCommand('lightchain.credits.topUp'));
 			return;
 		}
 		if (!this.model) {
@@ -1041,6 +1050,8 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			}
 			update('Waiting for approval', 'wait', account.kind === 'browser' ? 'Approve the transaction in your browser wallet.' : 'Sending the approval…');
 			await this.credits.enableForAi(account, net, this.pendingDelegate);
+			// remembered so adding credits later can raise the spending limit along with them
+			await this.memento.update(`lightchain.ai.delegate:${net.id}:${account.address.toLowerCase()}`, this.pendingDelegate);
 			this.pendingDelegate = undefined;
 			update('Done', 'ok', 'Credits enabled. Sending your message…');
 			const text = this.retryText;
@@ -1110,7 +1121,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		const account = this.wallet.active;
 		const network = this.network.current;
 		const base = {
-			type: 'state', network: network.label, testnet: network.id === 'testnet',
+			type: 'state', network: network.label, testnet: network.id === 'testnet', fee: jobFee(network),
 			account: account ? shortAddress(account.address) : null, credits: null as string | null,
 			gas: null as number | null, creditsNum: null as number | null,
 			asked: this.memento.get<boolean>('lightchain.ai.asked', false),
@@ -1177,7 +1188,8 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	.lc-top__credits span { color: #b1b3d0; }
 	.lc-sm-title[hidden] { display: none; }
 	.lc-edit__where { padding: 6px 12px; border-bottom: 1px solid rgba(255, 255, 255, 0.06); color: #b1b3d0; font-size: 12px; }
-	.lc-top__right { margin-left: auto; display: flex; align-items: center; gap: 16px; }
+	.lc-top__right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+	.lc-top__right .lc-link { white-space: nowrap; }
 	/* model picker = lcai-chat-v2 components/model-picker.tsx (ModelSelect) + ui/dropdown-menu, dark tokens */
 	.lc-model { position: relative; flex: 1; min-width: 0; }
 	/* agent picker (site tokens: hairline square, greys) */
@@ -1588,7 +1600,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		const i = flowSteps.findIndex(s => s.id === id);
 		if (i >= 0 && i >= flowIdx) { flowIdx = i; flowSeen.add(id); drawFlow(); }
 	}
-	const TOOL_STEP = { read_file: 'read', list_dir: 'read', search: 'read', write_file: 'write', forge_build: 'build', forge_test: 'test' };
+	const TOOL_STEP = { read_file: 'read', list_dir: 'read', search: 'read', write_file: 'write', append_file: 'write', forge_build: 'build', forge_test: 'test' };
 	// files Lightchain AI changed in this chat (checkpoint id → files)
 	const sessionEdits = {};
 	let editsOpen = false;
@@ -1749,9 +1761,9 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	const historyEl = $('history');
 	// ---- credits: click the balance to add more, without leaving the chat ----
 	const creditMenu = $('creditMenu');
-	let hasAccount = false, isTestnet = true, creditBusy = false, creditNote = null;
+	let hasAccount = false, isTestnet = true, creditBusy = false, creditNote = null, feeNow = 0.02;
 	function renderCredit() {
-		creditMenu.replaceChildren(el('div', 'lc-credit__title', 'Add credits'), el('div', 'lc-credit__sub', 'Credits pay for Lightchain AI. 1 LCAI is about ${Math.round(1 / JOB_FEE_LCAI)} requests, taken from your wallet' + (isTestnet ? ' on testnet.' : ' on mainnet.')));
+		creditMenu.replaceChildren(el('div', 'lc-credit__title', 'Add credits'), el('div', 'lc-credit__sub', 'Credits pay for Lightchain AI. 1 LCAI is about ' + Math.round(1 / feeNow) + ' requests, taken from your wallet' + (isTestnet ? ' on testnet.' : ' on mainnet.')));
 		const add = amount => { if (creditBusy) return; creditBusy = true; creditNote = { kind: '', text: 'Adding ' + amount + ' LCAI…' }; renderCredit(); vscode.postMessage({ type: 'topUp', amount: String(amount) }); };
 		const presets = el('div', 'lc-credit__row');
 		[1, 5, 10].forEach(n => { const b = el('button', '', n + ' LCAI'); b.type = 'button'; b.disabled = creditBusy; b.onclick = () => add(n); presets.append(b); });
@@ -1841,7 +1853,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				$('eyebrow').textContent = m.network; // the view header already says "Lightchain AI"
 				$('eyebrow').hidden = m.testnet; // only flag mainnet (real LCAI); the status bar shows the network
 				$('credits').replaceChildren();
-				hasAccount = !!m.account; isTestnet = !!m.testnet;
+				hasAccount = !!m.account; isTestnet = !!m.testnet; if (m.fee) feeNow = m.fee;
 				if (m.account) { $('credits').append(m.credits ?? '—', Object.assign(document.createElement('span'), { textContent: m.credits === '1' ? ' credit' : ' credits' }), Object.assign(document.createElement('span'), { className: 'plus', textContent: '+' })); }
 				else { $('credits').append(Object.assign(document.createElement('span'), { textContent: 'Connect wallet' })); creditMenu.hidden = true; }
 				break;
@@ -2085,6 +2097,7 @@ function summarize(name: string, args: Record<string, any>): string {
 		case 'list_dir': return `List ${args.path ?? '.'}`;
 		case 'search': return `Search “${args.query}”`;
 		case 'write_file': return `Write ${args.path}`;
+		case 'append_file': return `Add to ${args.path}`;
 		case 'edit_file': return `Edit ${args.path}`;
 		case 'forge_build': return 'forge build';
 		case 'forge_test': return args.match ? `forge test ${args.match}` : 'forge test';

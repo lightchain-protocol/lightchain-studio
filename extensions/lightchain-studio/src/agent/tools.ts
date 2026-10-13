@@ -181,6 +181,34 @@ export const TOOLS: Tool[] = [
 		},
 	},
 	{
+		name: 'append_file',
+		description: 'Add text to the end of a file written earlier in this task (needs user approval). For files too long for one reply: write_file the first part, then append_file the rest, part by part.',
+		args: '{"path": "src/Token.sol", "content": "// the next part of the file"}',
+		async run(args, ctx) {
+			const p = await safePath(ctx, args.path);
+			if (typeof args.content !== 'string' || !args.content) {
+				return { ok: false, output: '"content" (string) is required.' };
+			}
+			const before = await fs.readFile(p, 'utf8').catch(() => undefined);
+			if (before === undefined) {
+				return { ok: false, output: `${rel(ctx, p)} does not exist yet. Start it with write_file, then append_file the rest.` };
+			}
+			// the same part sent twice (a retried reply) must not be added twice
+			if (args.content.trim().length > 40 && before.trimEnd().endsWith(args.content.trim())) {
+				return { ok: false, output: `No change: ${rel(ctx, p)} already ends with exactly this part. Send the NEXT part, or stop if the file is complete.` };
+			}
+			const after = before + (before.endsWith('\n') || args.content.startsWith('\n') ? '' : '\n') + args.content + (args.content.endsWith('\n') ? '' : '\n');
+			const decision = await ctx.approve({ kind: 'write', title: `Add to ${rel(ctx, p)}`, diff: { path: rel(ctx, p), before, after } });
+			if (!decision) {
+				return { ok: false, output: 'The user rejected this change.' };
+			}
+			const content = typeof decision === 'object' ? decision.content : after;
+			await fs.writeFile(p, content, 'utf8');
+			ctx.onWrite?.(p, before, content);
+			return { ok: true, output: `Wrote ${rel(ctx, p)} (now ${content.split('\n').length} lines).` };
+		},
+	},
+	{
 		name: 'edit_file',
 		description: 'Replace an exact snippet in a file (needs user approval). "old" must match the file exactly once.',
 		args: '{"path": "src/Counter.sol", "old": "exact existing text", "new": "replacement text"}',
