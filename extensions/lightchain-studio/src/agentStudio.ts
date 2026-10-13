@@ -1,28 +1,51 @@
 import * as vscode from 'vscode';
-import { AgentProfile, AgentProfiles, BUILTIN_AGENTS, flow } from './agent/profiles';
+import { AGENTS_DIR, AgentProfile, AgentProfiles, BUILTIN_AGENTS, flow } from './agent/profiles';
+import { RULES_BUDGET, RULES_DIR, Rule, RuleStore, renderRules } from './agent/rules';
+import { WorkspaceIndex } from './agent/workspaceIndex';
+import { estimateTokens } from './agent/memory';
 import { IDENTICON_JS, siteCss } from './ui/site';
 
+type Tab = 'agents' | 'rules' | 'context';
+
 /**
- * Agent Studio: see how each Lightchain AI agent works (a visual flow of its
- * steps) and change it with plain controls — no code.
+ * Agent Studio: what Lightchain AI is and knows in this project, in one tab.
+ *
+ *   Agents        how each agent works (a visual flow) and what it may do
+ *   Instructions  what every agent must keep in mind — Markdown files in the project
+ *   Project context  what Lightchain AI knows about the code, found on this machine
+ *
+ * Everything is stored as Markdown in .lightchain/, so it can also be written
+ * by hand and is shared with the team through git.
  */
 export class AgentStudio implements vscode.Disposable {
 	private panel?: vscode.WebviewPanel;
 	private selected?: string;
+	private selectedRule?: string;
+	private tab: Tab = 'agents';
 	private readonly disposables: vscode.Disposable[] = [];
 
 	constructor(
 		private readonly extensionUri: vscode.Uri,
 		private readonly profiles: AgentProfiles,
+		private readonly rules: RuleStore,
+		private readonly index: WorkspaceIndex,
 		private readonly models: () => string[],
 		private readonly use: (id: string, prompt?: string) => Promise<void>,
+		private readonly projectMap: () => Promise<string>,
 	) {
-		this.disposables.push(profiles.onDidChange(() => this.push()));
+		this.disposables.push(profiles.onDidChange(() => this.push()), rules.onDidChange(() => this.push()));
 	}
 
-	open(id?: string): void {
+	open(id?: string, tab?: Tab, ruleId?: string): void {
 		if (id) {
 			this.selected = id;
+			this.tab = 'agents';
+		}
+		if (tab) {
+			this.tab = tab;
+		}
+		if (ruleId) {
+			this.selectedRule = ruleId;
 		}
 		if (this.panel) {
 			this.panel.reveal(vscode.ViewColumn.Active);
@@ -41,18 +64,57 @@ export class AgentStudio implements vscode.Disposable {
 	/** A new agent (or a copy of `from`), opened for editing. */
 	async create(from?: string): Promise<void> {
 		const base = this.profiles.get(from ?? 'builder');
-		const id = `agent-${Date.now().toString(36)}`;
-		await this.profiles.put({ ...base, id, name: from ? `${base.name} copy` : 'New agent', glyph: from ? base.glyph : 'NA', builtin: undefined });
+		const name = from ? `${base.name} copy` : 'New agent';
+		const id = this.profiles.newId(name);
+		await this.profiles.put({ ...base, id, name, glyph: from ? base.glyph : 'NA', builtin: undefined });
 		this.open(id);
+	}
+
+	/** A new instruction file, opened for writing. */
+	async createRule(): Promise<void> {
+		const rule = await this.rules.create();
+		this.open(undefined, 'rules', rule.id);
+	}
+
+	private relFile(id: string): string {
+		return `${AGENTS_DIR}/${id}.md`;
 	}
 
 	private push(): void {
 		const agents = this.profiles.all.map(p => ({
-			...p, flow: flow(p),
+			...p, flow: flow(p), file: this.relFile(p.id),
 			kind: p.builtin ? 'builtin' : this.profiles.isCustomized(p.id) ? 'customized' : 'project',
 		}));
 		this.selected = agents.some(a => a.id === this.selected) ? this.selected : agents[0]?.id;
-		void this.panel?.webview.postMessage({ type: 'state', agents, selected: this.selected, models: this.models(), hasProject: !!vscode.workspace.workspaceFolders?.length });
+		const all = this.rules.all;
+		this.selectedRule = all.some(r => r.id === this.selectedRule) ? this.selectedRule : all[0]?.id;
+		const sent = renderRules(this.rules.always());
+		const rules = all.map(r => {
+			const part = sent.parts.find(x => x.id === r.id);
+			return { ...r, chars: r.body.trim().length, cut: !!part?.cut, left: r.apply === 'always' && !part && !!r.body.trim() };
+		});
+		void this.panel?.webview.postMessage({
+			type: 'state', tab: this.tab, agents, selected: this.selected, models: this.models(), hasProject: !!vscode.workspace.workspaceFolders?.length,
+			rules, selectedRule: this.selectedRule, budget: RULES_BUDGET, used: sent.text.length, rulesDir: RULES_DIR,
+		});
+	}
+
+	/** What the Project context tab shows: the local index and what every conversation starts with. */
+	private async pushContext(force = false): Promise<void> {
+		await this.index.refresh(force).catch(() => undefined);
+		const map = await this.projectMap().catch(() => '');
+		const window = vscode.workspace.getConfiguration('lightchain.ai').get<number>('contextTokens', 8_192);
+		void this.panel?.webview.postMessage({ type: 'context', files: this.index.index.files, chunks: this.index.index.chunks, enabled: this.index.enabled, map, mapTokens: estimateTokens(map), window });
+	}
+
+	private async reveal(rel: string, line?: number): Promise<void> {
+		const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+		if (!root) {
+			return;
+		}
+		const doc = await vscode.workspace.openTextDocument(vscode.Uri.joinPath(root, rel));
+		const at = line ? new vscode.Range(line - 1, 0, line - 1, 0) : undefined;
+		await vscode.window.showTextDocument(doc, { viewColumn: vscode.ViewColumn.Beside, preview: false, selection: at });
 	}
 
 	private async onMessage(m: any): Promise<void> {
@@ -60,6 +122,49 @@ export class AgentStudio implements vscode.Disposable {
 			switch (m?.type) {
 				case 'ready':
 					return this.push();
+				case 'tab':
+					this.tab = m.tab === 'rules' || m.tab === 'context' ? m.tab : 'agents';
+					this.push();
+					return this.tab === 'context' ? this.pushContext() : undefined;
+				case 'selectRule':
+					this.selectedRule = String(m.id);
+					return this.push();
+				case 'createRule':
+					return this.createRule();
+				case 'saveRule':
+					await this.rules.put(m.rule as Rule);
+					return;
+				case 'removeRule': {
+					const r = this.rules.get(String(m.id));
+					if (r && await vscode.window.showWarningMessage(`Delete the instruction "${r.title}"?`, { modal: true, detail: `${r.file} is removed from the project.` }, 'Delete')) {
+						await this.rules.remove(r.id);
+					}
+					return;
+				}
+				case 'openRule': {
+					const r = this.rules.get(String(m.id));
+					return r ? this.reveal(r.file) : undefined;
+				}
+				case 'openAgent': {
+					// a built-in has no file until it is saved for this project
+					const p = this.profiles.get(String(m.id));
+					if (p.builtin) {
+						await this.profiles.put(p);
+					}
+					return this.reveal(this.relFile(p.id));
+				}
+				case 'openFile':
+					return this.reveal(String(m.path), typeof m.line === 'number' ? m.line : undefined);
+				case 'refreshContext':
+					return this.pushContext(true);
+				case 'localContext':
+					await vscode.workspace.getConfiguration('lightchain.ai').update('localContext', !!m.on, vscode.ConfigurationTarget.Global);
+					return this.pushContext();
+				case 'search': {
+					const hits = await this.index.search(String(m.query ?? ''), [], { maxChunks: 6, maxChars: 6_000 });
+					void this.panel?.webview.postMessage({ type: 'hits', query: String(m.query ?? ''), hits: hits.map(h => ({ path: h.path, start: h.start, end: h.end, label: h.label, preview: h.text.split('\n').filter(l => l.trim()).slice(0, 4).join('\n') })) });
+					return;
+				}
 				case 'select':
 					this.selected = String(m.id);
 					return this.push();
@@ -110,7 +215,14 @@ export class AgentStudio implements vscode.Disposable {
 	.pill.off { color: var(--lc-text-tertiary); }
 
 	/* header */
-	.s-top { flex: none; display: flex; align-items: flex-end; gap: 16px; padding: 24px 28px 20px; border-bottom: 1px solid var(--lc-rule); }
+	[hidden] { display: none !important; }
+	.s-top { flex: none; display: flex; align-items: flex-end; gap: 16px; padding: 24px 28px 16px; }
+	/* tabs: quiet text, accent underline for the open one */
+	.s-tabs { flex: none; display: flex; gap: 22px; padding: 0 28px; border-bottom: 1px solid var(--lc-rule); }
+	.s-tab { display: inline-flex; align-items: center; gap: 8px; padding: 10px 0 11px; margin-bottom: -1px; border: 0; border-bottom: 2px solid transparent; background: none; color: var(--lc-text-tertiary); font-size: 13px; font-weight: 500; cursor: pointer; transition: color var(--lc-motion) ease, border-color var(--lc-motion) ease; }
+	.s-tab:hover { color: var(--lc-text-primary); }
+	.s-tab.on { color: var(--lc-text-strong); border-bottom-color: var(--lc-accent); }
+	.s-tab .n { min-width: 18px; padding: 0 5px; border-radius: 999px; background: var(--lc-surface-3); color: var(--lc-text-secondary); font-size: 11px; line-height: 18px; text-align: center; }
 	.s-top .eyebrow { margin-bottom: 12px; }
 	.s-top .title { color: var(--lc-text-strong); }
 	.s-top .lead { margin-top: 6px; color: var(--lc-text-tertiary); font-size: 14px; }
@@ -179,35 +291,110 @@ export class AgentStudio implements vscode.Disposable {
 	.toggle__help { color: var(--lc-text-tertiary); font-size: 12px; line-height: 1.45; }
 	.note { margin-top: 8px; color: var(--lc-text-tertiary); font-size: 12px; line-height: 1.5; }
 	.manage { display: flex; gap: 8px; flex-wrap: wrap; }
+	.path { display: block; margin-bottom: 10px; color: var(--lc-text-secondary); font-size: 12px; word-break: break-all; }
+
+	/* instructions: list, editor, what the AI receives */
+	.pill.warn { border-color: transparent; background: rgba(255, 143, 60, 0.14); color: var(--lc-warning); }
+	.r-edit { display: flex; flex-direction: column; gap: 12px; min-height: 0; padding: 22px 28px 24px; overflow-y: auto; }
+	.r-edit > *, .c-main > * { width: 100%; max-width: 760px; }
+	.r-title { height: 44px !important; font-size: 18px !important; font-weight: 600; color: var(--lc-text-strong) !important; }
+	.r-body { flex: 1; display: flex; flex-direction: column; min-height: 260px; }
+	.r-body textarea { flex: 1; min-height: 220px; resize: none; font-size: 13.5px; line-height: 1.65; }
+	.r-foot { display: flex; gap: 12px; margin-top: 8px; color: var(--lc-text-tertiary); font-size: 12px; }
+	.r-globs { margin: 2px 0 8px 30px; width: calc(100% - 30px); }
+	.empty { margin: auto; max-width: 420px; text-align: center; }
+	.empty h2 { margin: 0 0 8px; color: var(--lc-text-strong); font-size: 18px; font-weight: 600; letter-spacing: -0.01em; }
+	.empty p { margin: 0 0 18px; color: var(--lc-text-tertiary); font-size: 13px; line-height: 1.6; }
+	.meter { height: 6px; margin: 4px 0 8px; border-radius: 999px; background: var(--lc-surface-3); overflow: hidden; }
+	.meter i { display: block; height: 100%; border-radius: 999px; background: var(--lc-accent); transition: width var(--lc-motion-base) ease; }
+	.meter.over i { background: var(--lc-warning); }
+	.meter-text { color: var(--lc-text-secondary); font-size: 12px; }
+	.row { display: flex; align-items: center; gap: 8px; padding: 6px 0; color: var(--lc-text-primary); font-size: 13px; }
+	.row + .row { border-top: 1px solid rgba(112, 100, 233, 0.12); }
+	.row .grow { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.row .num { color: var(--lc-text-tertiary); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+	/* project context */
+	.c-body { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(360px, 1fr) minmax(320px, 460px); }
+	.c-main { display: flex; flex-direction: column; gap: 12px; padding: 22px 28px 40px; overflow-y: auto; }
+	.c-lead { margin: 0 0 12px; color: var(--lc-text-tertiary); font-size: 13px; line-height: 1.6; }
+	.stats { display: flex; gap: 28px; margin-bottom: 4px; }
+	.stat b { display: block; color: var(--lc-text-strong); font-size: 22px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.2; font-variant-numeric: tabular-nums; }
+	.stat span { color: var(--lc-text-tertiary); font-size: 12px; }
+	.hit { display: block; width: 100%; margin-top: 8px; padding: 10px 12px; border: 1px solid var(--zap); border-radius: 12px; background: transparent; color: var(--lc-text-primary); text-align: left; cursor: pointer; transition: border-color .2s ease, background .2s ease; }
+	.hit:hover { border-color: var(--zap-strong); background: rgba(91, 75, 255, 0.06); }
+	.hit__head { display: flex; gap: 8px; align-items: baseline; font-size: 13px; }
+	.hit__head .where { color: var(--lc-text-tertiary); font-size: 12px; }
+	.hit pre, .map { margin: 6px 0 0; color: var(--lc-text-tertiary); font-family: Menlo, Monaco, "Courier New", monospace; font-size: 11.5px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; overflow: hidden; }
+	.map { max-height: none; color: var(--lc-text-secondary); }
 </style>
 </head>
 <body>
 	<div class="s-top">
-		<div><div class="eyebrow">Lightchain AI</div><h1 class="title">Agent Studio</h1><div class="lead">See how each agent works and change it with switches and sentences. No code.</div></div>
+		<div><div class="eyebrow">Lightchain AI</div><h1 class="title">Agent Studio</h1><div class="lead" id="lead"></div></div>
 		<div class="grow"></div>
 		<span class="saved" id="saved">Saved</span>
 		<button class="button button-primary button-sm" id="useBtn">Use in chat</button>
 	</div>
-	<div class="s-body">
+	<div class="s-tabs" id="tabs"></div>
+	<div class="s-body" id="tab-agents">
 		<div class="s-list" id="list"></div>
 		<div class="s-flow" id="flow"></div>
 		<div class="s-props" id="props"></div>
+	</div>
+	<div class="s-body" id="tab-rules" hidden>
+		<div class="s-list" id="rlist"></div>
+		<div class="r-edit" id="redit"></div>
+		<div class="s-props" id="rside"></div>
+	</div>
+	<div class="c-body" id="tab-context" hidden>
+		<div class="c-main" id="cmain"></div>
+		<div class="s-props" id="cside"></div>
 	</div>
 <script nonce="${nonce}">
 	const vscode = acquireVsCodeApi();
 	${IDENTICON_JS}
 	const $ = id => document.getElementById(id);
 	const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
-	let state = { agents: [], selected: null, models: [], hasProject: true };
+	let state = { tab: 'agents', agents: [], selected: null, models: [], hasProject: true, rules: [], selectedRule: null, budget: 2400, used: 0, rulesDir: '' };
 	let draft = null, focusSec = null, saveTimer = null;
+	let ruleDraft = null, ruleTimer = null;
+	let context = null, hits = null, query = '', searchTimer = null;
+	const LEADS = {
+		agents: 'See how each agent works and change it with switches and sentences. No code.',
+		rules: 'What every agent keeps in mind in this project. Plain Markdown files your team shares through git.',
+		context: 'What Lightchain AI knows about your code. Found on this machine, never uploaded.',
+	};
+	const flashSaved = () => { $('saved').classList.add('show'); setTimeout(() => $('saved').classList.remove('show'), 1200); };
+	const num = n => String(n).replace(/\\B(?=(\\d{3})+(?!\\d))/g, ',');
+
+	function renderTabs() {
+		const tabs = [['agents', 'Agents', state.agents.length], ['rules', 'Instructions', state.rules.length], ['context', 'Project context', null]];
+		$('tabs').replaceChildren(...tabs.map(([id, label, n]) => {
+			const b = el('button', 's-tab' + (state.tab === id ? ' on' : ''), label);
+			if (n !== null) b.append(el('span', 'n', String(n)));
+			b.onclick = () => { if (state.tab !== id) { state.tab = id; showTab(); vscode.postMessage({ type: 'tab', tab: id }); } };
+			return b;
+		}));
+	}
+	function showTab() {
+		['agents', 'rules', 'context'].forEach(t => { $('tab-' + t).hidden = state.tab !== t; });
+		$('lead').textContent = LEADS[state.tab];
+		const btn = $('useBtn');
+		btn.textContent = state.tab === 'agents' ? 'Use in chat' : state.tab === 'rules' ? 'New instruction' : 'Refresh';
+		btn.disabled = state.tab !== 'agents' && !state.hasProject;
+		renderTabs();
+		if (state.tab === 'context') renderContext();
+	}
 
 	const cur = () => state.agents.find(a => a.id === state.selected);
 	function save() {
 		clearTimeout(saveTimer);
+		const d = draft; // the agent being edited now, even if another is selected before the timer fires
 		saveTimer = setTimeout(() => {
-			const { flow, kind, ...agent } = draft;
+			const { flow, kind, file, ...agent } = d;
 			vscode.postMessage({ type: 'save', agent });
-			$('saved').classList.add('show'); setTimeout(() => $('saved').classList.remove('show'), 1200);
+			flashSaved();
 		}, 350);
 	}
 	function change(fn) { fn(draft); renderFlow(); save(); }
@@ -317,18 +504,158 @@ export class AgentStudio implements vscode.Disposable {
 		// manage
 		const mg = section('manage', 'Manage');
 		const mrow = el('div', 'manage'); const dup = el('button', 'button button-xs', 'Duplicate'); dup.onclick = () => vscode.postMessage({ type: 'create', from: p.id });
-		mrow.append(dup); mg.append(mrow);
+		const md = el('button', 'button button-xs', 'Edit as Markdown'); md.title = 'Open ' + p.file + ' in the editor'; md.onclick = () => vscode.postMessage({ type: 'openAgent', id: p.id });
+		mrow.append(md, dup); mg.append(mrow);
 		if (p.kind !== 'builtin') { const rm = el('button', 'button button-xs', p.kind === 'customized' ? 'Reset to default' : 'Delete agent'); rm.onclick = () => vscode.postMessage({ type: 'remove', id: p.id }); mrow.append(rm); }
-		mg.append(el('div', 'note', p.kind === 'project' ? 'Saved in .lightchain/agents.json — shared with your team through git.' : 'Built-in agent. Your changes are saved for this project and can be reset.'));
+		mg.append(el('div', 'note', p.kind === 'builtin' ? 'Built-in agent. Change anything here, or edit it as Markdown, and a copy is saved for this project.' : 'Saved as ' + p.file + ' — a Markdown file you can also write by hand and share through git.'));
 		box.append(id, job, rules, can, safety, checks, model, st, mg);
 		box.scrollTop = top;
 	}
 
-	$('useBtn').onclick = () => draft && vscode.postMessage({ type: 'use', id: draft.id });
+	// ---- instructions ----
+	const APPLY = { always: 'Always', files: 'Matching files', manual: 'On mention' };
+	const curRule = () => state.rules.find(r => r.id === state.selectedRule);
+	function saveRule() {
+		clearTimeout(ruleTimer);
+		const d = ruleDraft;
+		ruleTimer = setTimeout(() => { vscode.postMessage({ type: 'saveRule', rule: d }); flashSaved(); }, 350);
+	}
+	function changeRule(fn) { fn(ruleDraft); saveRule(); }
+
+	function renderRuleList() {
+		const box = $('rlist'); box.replaceChildren(el('span', 'group-title', 'Instructions'));
+		state.rules.forEach(r => {
+			const c = el('button', 's-card' + (r.id === state.selectedRule ? ' sel' : ''));
+			const g = el('span', 'glyph'); g.innerHTML = lcIdenticon('rule:' + r.id);
+			const first = (r.body.split('\\n').find(l => l.trim() && l.trim()[0] !== '#') || '').trim();
+			const t = el('span', 's-card__text'); t.append(el('span', 's-card__name', r.title), el('span', 's-card__sum', r.description || first || 'Empty'));
+			const k = el('span', 's-card__kind'); k.append(el('span', 'pill', APPLY[r.apply]));
+			if (r.cut || r.left) { k.append(' ', el('span', 'pill warn', r.left ? 'Not sent' : 'Cut')); }
+			t.append(k); c.append(g, t);
+			c.onclick = () => { if (r.id !== state.selectedRule) vscode.postMessage({ type: 'selectRule', id: r.id }); };
+			box.append(c);
+		});
+		if (state.hasProject) { const n = el('button', 'button button-sm button-block s-new', '+ New instruction'); n.onclick = () => vscode.postMessage({ type: 'createRule' }); box.append(n); }
+	}
+
+	function renderRuleEdit() {
+		const box = $('redit'); box.replaceChildren();
+		const r = ruleDraft;
+		if (!r) {
+			const e = el('div', 'empty');
+			e.append(el('h2', '', state.hasProject ? 'No instructions yet' : 'Open a project first'),
+				el('p', '', state.hasProject ? 'Tell Lightchain AI how this project is built: the Solidity version, the libraries you use, what must always be tested, what must never happen. Every agent follows them.' : 'Instructions are saved with a project, so open or create one.'));
+			if (state.hasProject) { const b = el('button', 'button button-primary', 'Write the first instruction'); b.onclick = () => vscode.postMessage({ type: 'createRule' }); e.append(b); }
+			box.append(e); return;
+		}
+		const ti = el('input', 'input r-title'); ti.value = r.title; ti.maxLength = 60; ti.placeholder = 'Name this instruction'; ti.disabled = !!r.fixed; ti.oninput = () => changeRule(d => { d.title = ti.value; });
+		box.append(ti);
+		if (!r.fixed) { const di = el('input', 'input'); di.value = r.description || ''; di.maxLength = 160; di.placeholder = 'Short description (optional)'; di.oninput = () => changeRule(d => { d.description = di.value; }); box.append(di); }
+		const when = el('div', 'zpanel'); when.append(el('div', 'zlabel', 'When it applies'));
+		if (r.fixed) {
+			when.append(el('div', 'note', r.file + ' always applies. It is the file other tools read too, so it stays one plain Markdown file.'));
+		} else {
+			const opt = (key, title, help) => { const t = el('div', 'toggle'); t.append(el('span', 'check' + (r.apply === key ? ' on' : ''), '✓')); const tx = el('span', 'toggle__text'); tx.append(el('span', 'toggle__title', title), el('span', 'toggle__help', help)); t.append(tx); t.onclick = () => { changeRule(d => { d.apply = key; }); renderRuleEdit(); if (key === 'files') { const gi = document.querySelector('.r-globs'); if (gi) gi.focus(); } }; return t; };
+			when.append(opt('always', 'Always', 'Sent at the start of every conversation'));
+			when.append(opt('files', 'For matching files', 'Added when a matching file is open or mentioned'));
+			if (r.apply === 'files') {
+				const gi = el('input', 'input mono r-globs'); gi.value = (r.globs || []).join(', '); gi.placeholder = 'src/**/*.sol, *.t.sol'; gi.spellcheck = false;
+				gi.oninput = () => changeRule(d => { d.globs = gi.value.split(',').map(x => x.trim()).filter(Boolean); });
+				when.append(gi);
+			}
+			when.append(opt('manual', 'Only when mentioned', 'Type @ in the chat and pick it'));
+		}
+		box.append(when);
+		const body = el('div', 'r-body zpanel'); body.append(el('div', 'zlabel', 'Instruction'));
+		const ta = el('textarea', 'input'); ta.value = r.body; ta.spellcheck = false; ta.placeholder = 'Plain sentences or Markdown. For example: Use Solidity ^0.8.24. Every external function needs a test.';
+		const count = el('span', '', num(r.body.trim().length) + ' characters');
+		ta.oninput = () => { changeRule(d => { d.body = ta.value; }); count.textContent = num(ta.value.trim().length) + ' characters'; };
+		const foot = el('div', 'r-foot'); foot.append(count); body.append(ta, foot); box.append(body);
+	}
+
+	function renderRuleSide() {
+		const box = $('rside'); box.replaceChildren();
+		const always = state.rules.filter(x => x.apply === 'always');
+		const over = always.some(x => x.cut || x.left);
+		const sent = el('div', 'zpanel'); sent.append(el('div', 'zlabel', 'Sent with every conversation'));
+		const meter = el('div', 'meter' + (over ? ' over' : '')); const bar = el('i'); bar.style.width = Math.min(100, Math.round(100 * state.used / state.budget)) + '%'; meter.append(bar);
+		sent.append(meter, el('div', 'meter-text', num(state.used) + ' of ' + num(state.budget) + ' characters'));
+		if (over) sent.append(el('div', 'note', 'Over the limit: instructions marked Cut are shortened and Not sent are left out. Keep always-on instructions short, or apply them to matching files only.'));
+		else sent.append(el('div', 'note', 'Lightchain models read a small window, so always-on instructions share ' + num(state.budget) + ' characters. Instructions for matching files are added only when needed.'));
+		always.forEach(x => { const row = el('div', 'row'); row.append(el('span', 'grow', x.title), el('span', 'num', num(x.chars))); if (x.cut || x.left) row.append(el('span', 'pill warn', x.left ? 'Not sent' : 'Cut')); sent.append(row); });
+		box.append(sent);
+		const r = curRule();
+		if (r) {
+			const file = el('div', 'zpanel'); file.append(el('div', 'zlabel', 'File'), el('span', 'path mono', r.file));
+			const row = el('div', 'manage'); const md = el('button', 'button button-xs', 'Edit as Markdown'); md.onclick = () => vscode.postMessage({ type: 'openRule', id: r.id });
+			const rm = el('button', 'button button-xs', 'Delete'); rm.onclick = () => vscode.postMessage({ type: 'removeRule', id: r.id });
+			row.append(md, rm); file.append(row); box.append(file);
+		}
+		const tip = el('div', 'zpanel'); tip.append(el('div', 'zlabel', 'Good to know'));
+		tip.append(el('div', 'note', 'New instructions are saved in ' + state.rulesDir + '/. An AGENTS.md at the project root is read too, so instructions written for other tools already work here.'));
+		box.append(tip);
+	}
+
+	// ---- project context ----
+	function renderContext() {
+		const main = $('cmain'), side = $('cside');
+		const active = document.activeElement && document.activeElement.id === 'cq';
+		const caret = active ? document.activeElement.selectionStart : 0;
+		main.replaceChildren(); side.replaceChildren();
+		const idx = el('div', 'zpanel'); idx.append(el('div', 'zlabel', 'Local project search'));
+		idx.append(el('p', 'c-lead', 'When you ask for something, Studio searches your project on this machine and attaches the few pieces of code your request is about. Nothing is uploaded to build the index.'));
+		const stats = el('div', 'stats');
+		const stat = (n, label) => { const s = el('div', 'stat'); s.append(el('b', '', context ? num(n) : '–'), el('span', '', label)); return s; };
+		stats.append(stat(context ? context.files : 0, 'files indexed'), stat(context ? context.chunks : 0, 'searchable pieces'));
+		idx.append(stats);
+		const on = !context || context.enabled;
+		const tg = el('div', 'toggle'); tg.append(el('span', 'check' + (on ? ' on' : ''), '✓')); const tx = el('span', 'toggle__text'); tx.append(el('span', 'toggle__title', 'Attach related code automatically'), el('span', 'toggle__help', 'Shown under your message as outlined chips, so you always see what was added')); tg.append(tx);
+		tg.onclick = () => vscode.postMessage({ type: 'localContext', on: !on }); idx.append(tg);
+		main.append(idx);
+		const tryp = el('div', 'zpanel'); tryp.append(el('div', 'zlabel', 'Try it'));
+		const qi = el('input', 'input'); qi.id = 'cq'; qi.value = query; qi.placeholder = 'What would you ask? e.g. who can withdraw the fees';
+		qi.oninput = () => { query = qi.value; clearTimeout(searchTimer); searchTimer = setTimeout(() => { if (query.trim()) vscode.postMessage({ type: 'search', query }); else { hits = null; renderContext(); } }, 180); };
+		tryp.append(qi);
+		if (hits) {
+			if (!hits.length) tryp.append(el('div', 'note', 'Nothing in the project matches closely enough, so nothing would be attached.'));
+			hits.forEach(h => {
+				const b = el('button', 'hit'); const head = el('div', 'hit__head'); head.append(el('span', '', h.path), el('span', 'where', 'lines ' + h.start + '–' + h.end + (h.label ? ' · ' + h.label : '')));
+				b.append(head, el('pre', '', h.preview)); b.title = 'Open in the editor'; b.onclick = () => vscode.postMessage({ type: 'openFile', path: h.path, line: h.start }); tryp.append(b);
+			});
+		}
+		main.append(tryp);
+		if (active) { const again = $('cq'); again.focus(); again.selectionStart = again.selectionEnd = caret; }
+		const map = el('div', 'zpanel'); map.append(el('div', 'zlabel', 'Every conversation starts with'));
+		if (!context) { map.append(el('div', 'note', 'Reading the project…')); }
+		else if (!context.map) { map.append(el('div', 'note', 'Nothing yet. Add a contract or an instruction and it shows up here.')); }
+		else {
+			const pct = Math.min(100, Math.round(100 * context.mapTokens / context.window));
+			const meter = el('div', 'meter'); const bar = el('i'); bar.style.width = pct + '%'; meter.append(bar);
+			map.append(meter, el('div', 'meter-text', 'About ' + num(context.mapTokens) + ' of ' + num(context.window) + ' tokens of the model window'), el('pre', 'map', context.map));
+		}
+		side.append(map);
+	}
+
+	$('useBtn').onclick = () => {
+		if (state.tab === 'agents') { if (draft) vscode.postMessage({ type: 'use', id: draft.id }); }
+		else if (state.tab === 'rules') vscode.postMessage({ type: 'createRule' });
+		else { context = null; renderContext(); vscode.postMessage({ type: 'refreshContext' }); }
+	};
 	window.addEventListener('message', e => {
-		const m = e.data; if (!m || m.type !== 'state') return;
+		const m = e.data; if (!m) return;
+		if (m.type === 'context') { context = m; if (state.tab === 'context') renderContext(); return; }
+		if (m.type === 'hits') { if (m.query === query) { hits = m.hits; if (state.tab === 'context') renderContext(); } return; }
+		if (m.type !== 'state') return;
 		const switched = m.selected !== state.selected;
+		const ruleSwitched = m.selectedRule !== state.selectedRule;
 		state = m;
+		// the instruction editor is rebuilt only when another one is shown, so typing is never interrupted
+		if (ruleSwitched || !ruleDraft || !$('redit').contains(document.activeElement)) {
+			const r = curRule();
+			ruleDraft = r ? JSON.parse(JSON.stringify(r)) : null;
+			renderRuleEdit();
+		}
+		renderRuleList(); renderRuleSide(); showTab();
 		const a = cur();
 		// keep typing undisturbed: only rebuild the form when another agent is shown
 		if (switched || !draft || !document.activeElement || !$('props').contains(document.activeElement)) {

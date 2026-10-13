@@ -20,7 +20,18 @@ const MAX_PROBLEMS = 20;
 export type MentionResolver = (mention: string) => Promise<string | undefined>;
 
 /** Something the @-picker offers: a file, a contract, a deployed contract. */
-export interface MentionItem { id: string; label: string; detail?: string; kind: 'file' | 'contract' | 'deployed' }
+export interface MentionItem { id: string; label: string; detail?: string; kind: 'file' | 'contract' | 'deployed' | 'rule' }
+
+/** The project files a prompt's context points at (the open file and mentioned files or contracts). */
+export function contextFiles(ctx: PromptContext): string[] {
+	const mentioned = ctx.mentions.map(m => /^contract:\w+@(.+)$/.exec(m)?.[1] ?? (/^(deployed|tx|rule):/.test(m) ? undefined : m)).filter((m): m is string => !!m);
+	return [...new Set([...(ctx.file ? [ctx.file] : []), ...mentioned])];
+}
+
+/** Ids of the instructions a prompt @-mentions. */
+export function mentionedRules(ctx: PromptContext): string[] {
+	return ctx.mentions.map(m => /^rule:(.+)$/.exec(m)?.[1]).filter((m): m is string => !!m);
+}
 
 /** Files offered in the @-mention picker. */
 export async function mentionableFiles(): Promise<string[]> {
@@ -50,8 +61,9 @@ export function editorContext(): { file?: string; selection?: { start: number; e
 /**
  * `sent`: files already attached in this session (path → content). An unchanged
  * file is not sent again; the map is updated with what this prompt attaches.
+ * `extra`: further blocks for this prompt (scoped instructions, local search hits).
  */
-export async function buildContext(ctx: PromptContext, sent?: Map<string, string>, resolve?: MentionResolver): Promise<string> {
+export async function buildContext(ctx: PromptContext, sent?: Map<string, string>, resolve?: MentionResolver, extra: string[] = []): Promise<string> {
 	const root = vscode.workspace.workspaceFolders?.[0]?.uri;
 	if (!root) {
 		return '';
@@ -64,6 +76,8 @@ export async function buildContext(ctx: PromptContext, sent?: Map<string, string
 		if (contract) {
 			mentionFiles.push(contract[2]);
 			notes.push(`The user means contract ${contract[1]} in ${contract[2]}.`);
+		} else if (/^rule:/.test(m)) {
+			continue; // instructions are attached by the caller
 		} else if (/^(deployed|tx):/.test(m)) {
 			const text = await resolve?.(m).catch(() => undefined);
 			if (text) {
@@ -112,7 +126,7 @@ export async function buildContext(ctx: PromptContext, sent?: Map<string, string
 	if (problems.length) {
 		parts.push(`Current problems:\n${problems.join('\n')}`);
 	}
-	parts.push(...notes);
+	parts.push(...notes, ...extra.filter(Boolean));
 	return parts.length ? `Project context (current file contents, line-numbered — line numbers are not part of the file):\n\n${parts.join('\n\n')}\n\n---\n\n` : '';
 }
 

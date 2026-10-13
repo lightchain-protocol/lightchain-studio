@@ -5,7 +5,9 @@ import { applyHunks, lineDiff } from './agent/lineDiff';
 import { ChatStore, ChatEvent } from './agent/chatStore';
 import { runInlineEdit } from './agent/inlineEdit';
 import { StuckJobs } from './lightchain/stuckJobs';
-import { MentionItem, MentionResolver, PromptContext, buildContext, editorContext, mentionableFiles } from './agent/context';
+import { MentionItem, MentionResolver, PromptContext, buildContext, contextFiles, editorContext, mentionableFiles, mentionedRules } from './agent/context';
+import { RuleStore, renderRules } from './agent/rules';
+import { Hit, renderHits } from './agent/localIndex';
 import { SLASH_COMMANDS, expandSlash, parseSlash } from './agent/commands';
 import { fixPrompt } from './failureWatcher';
 import { Task, TaskStore, parseChecklist, taskPrompt } from './tasks';
@@ -69,6 +71,10 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	startSteps?: () => Promise<{ id: string; title: string; sub: string; done: boolean; command: string; action: string }[] | undefined>;
 	/** Agent profiles (set by the extension). */
 	profiles?: AgentProfiles;
+	/** The project's instructions (set by the extension). */
+	rules?: RuleStore;
+	/** Local project search: code related to a request, without the files it already carries (set by the extension). */
+	localSearch?: (query: string, exclude: string[]) => Promise<Hit[]>;
 	private profile(): AgentProfile | undefined {
 		return this.profiles?.get(this.memento.get<string>('lightchain.ai.agent', 'builder'));
 	}
@@ -377,7 +383,21 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		// Attach the project context (open file, selection, @-mentions, problems) to the prompt.
 		// Files the session has already seen unchanged are not sent again; they count as sent once the turn succeeds.
 		const attaching = new Map(this.agent ? this.attached : []);
-		let text = ctx ? (await buildContext(ctx, attaching, this.resolveMention)) + instruction : instruction;
+		// Instructions scoped to these files (or @-mentioned) and code found by local search ride along,
+		// once per session each.
+		const files = ctx ? contextFiles(ctx) : [];
+		const extra: string[] = [];
+		const fresh = <T,>(items: T[], key: (x: T) => string, body: (x: T) => string) => items.filter(x => attaching.get(key(x)) !== body(x) && (attaching.set(key(x), body(x)), true));
+		const scoped = fresh(this.rules?.scoped(files, ctx ? mentionedRules(ctx) : []) ?? [], r => `rule:${r.id}`, r => r.body);
+		if (scoped.length) {
+			extra.push(`Instructions for this request (follow them):\n${renderRules(scoped, 1_600).text}`);
+		}
+		const query = slash ? request.replace(/^\s*\/\w+\s*/, '') : request;
+		const found = fresh(query.trim() ? await this.localSearch?.(query, files).catch(() => []) ?? [] : [], h => `found:${h.path}:${h.start}`, h => h.text);
+		if (found.length) {
+			extra.push(renderHits(found));
+		}
+		let text = (await buildContext(ctx ?? { mentions: [] }, attaching, this.resolveMention, extra)) + instruction;
 		if (this.recap && !this.agent) {
 			text = `Earlier in this conversation (recap — you are continuing it):\n${this.recap}\n\n---\n\n${text}`;
 			this.recap = undefined;
@@ -399,7 +419,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		const turnId = `t${++this.seq}`;
 		if (!retry) {
 			const chips = ctx ? [...(ctx.file ? [ctx.selection ? `${basename(ctx.file)} · L${ctx.selection.start}–${ctx.selection.end}` : basename(ctx.file)] : []), ...ctx.mentions.map(mentionLabel)] : [];
-			this.post({ type: 'user', text: request, chips, turn: turnId });
+			this.post({ type: 'user', text: request, chips: [...chips, ...scoped.map(r => r.title)], found: found.map(h => ({ label: `${basename(h.path)} · L${h.start}–${h.end}`, title: `${h.path}${h.label ? ` — ${h.label}` : ''}` })), turn: turnId });
 			this.turnMarks.set(turnId, this.agent.size);
 		}
 		this.turnOrder.push(turnId);
@@ -1056,8 +1076,8 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	.lc-agent__item:hover .lc-agent__edit, .lc-agent__item:focus-within .lc-agent__edit, .lc-agent__item.sel .lc-agent__edit { opacity: 1; }
 	.lc-agent__edit:hover { border-color: #5b4bff; background: #5b4bff; color: #fff; }
 	.lc-agent__edit svg { width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-	.lc-agent__foot { display: flex; gap: 6px; margin-top: 6px; padding-top: 8px; border-top: 1px solid rgba(255, 255, 255, 0.1); }
-	.lc-agent__new, .lc-agent__manage { flex: 1; height: 30px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.2); border-radius: 8px; background: rgba(255, 255, 255, 0.06); color: #ccceef; font-family: "Inter", sans-serif; font-size: 11px; letter-spacing: .5px; text-transform: uppercase; cursor: pointer; transition: all .3s ease-in-out; }
+	.lc-agent__foot { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; padding-top: 8px; border-top: 1px solid rgba(255, 255, 255, 0.1); }
+	.lc-agent__new, .lc-agent__manage { flex: 1; white-space: nowrap; height: 30px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.2); border-radius: 8px; background: rgba(255, 255, 255, 0.06); color: #ccceef; font-family: "Inter", sans-serif; font-size: 11px; letter-spacing: .5px; text-transform: uppercase; cursor: pointer; transition: all .3s ease-in-out; }
 	.lc-agent__new:hover, .lc-agent__manage:hover { border-color: #5b4bff; background: #5b4bff; color: #fff; }
 	/* example requests for the chosen agent */
 	.lc-starters { display: flex; flex-direction: column; gap: 2px; margin-top: 18px; text-align: left; }
@@ -1234,6 +1254,8 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	.lc-chip button:hover { background: rgba(204, 206, 239, 0.1); color: #f5f6ff; }
 	.lc-msg-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 	.lc-msg-chips span { padding: 1px 6px; border-radius: 4px; background: rgba(204, 206, 239, 0.08); color: #7376aa; font-size: 11px; }
+	.lc-msg-chips span.found { background: transparent; box-shadow: inset 0 0 0 1px rgba(204, 206, 239, 0.12); }
+	.lc-msg-chips span.found::before { content: ""; display: inline-block; width: 5px; height: 5px; margin: 0 5px 1px 0; border-radius: 50%; background: #5b4bff; }
 	/* @-mention picker: same surface as the model menu */
 	.lc-mention { position: absolute; left: 8px; right: 8px; bottom: calc(100% + 4px); z-index: 60; max-height: 220px; overflow-y: auto; padding: 6px; border: 1px solid rgba(204, 206, 239, 0.06); border-radius: 12px; background: #0F0F14; }
 	.lc-mention[hidden] { display: none; }
@@ -1411,9 +1433,11 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 		const foot = el('div', 'lc-agent__foot');
 		const nw = el('button', 'lc-agent__new', '+ New agent'); nw.type = 'button';
 		nw.onclick = () => { agentMenu.hidden = true; vscode.postMessage({ type: 'command', command: 'lightchain.agents.new' }); };
+		const ins = el('button', 'lc-agent__manage', 'Instructions'); ins.type = 'button'; ins.title = 'What every agent keeps in mind in this project';
+		ins.onclick = () => { agentMenu.hidden = true; vscode.postMessage({ type: 'command', command: 'lightchain.rules.open' }); };
 		const m = el('button', 'lc-agent__manage', 'Agent Studio'); m.type = 'button';
 		m.onclick = () => { agentMenu.hidden = true; vscode.postMessage({ type: 'command', command: 'lightchain.agents.open' }); };
-		foot.append(nw, m);
+		foot.append(nw, ins, m);
 		agentMenu.append(foot);
 	}
 	$('agentBtn').onclick = e => { e.stopPropagation(); agentMenu.hidden = !agentMenu.hidden; };
@@ -1509,7 +1533,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	let allFiles = null, mentionIdx = 0, mentionMatches = [];
 	const labels = {}; // mention id → chip label
 	const COMMANDS = ${JSON.stringify(SLASH_COMMANDS.map(c => ({ name: c.name, hint: c.hint })))};
-	const KIND = { file: '', contract: 'contract', deployed: 'deployed', tx: 'transaction', command: '' };
+	const KIND = { file: '', contract: 'contract', deployed: 'deployed', tx: 'transaction', rule: 'instruction', command: '' };
 	const base = p => p.split('/').pop();
 	function renderChips() {
 		chipsEl.replaceChildren();
@@ -1672,7 +1696,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			case 'user': {
 				closeBubble();
 				const u = el('div', 'lc-msg-user', m.text);
-				if (m.chips && m.chips.length) { const cs = el('div', 'lc-msg-chips'); m.chips.forEach(c => cs.append(el('span', '', c))); u.append(cs); }
+				if ((m.chips && m.chips.length) || (m.found && m.found.length)) { const cs = el('div', 'lc-msg-chips'); (m.chips || []).forEach(c => cs.append(el('span', '', c))); (m.found || []).forEach(f => { const c = el('span', 'found', f.label); c.title = 'Found in your project by local search: ' + f.title; cs.append(c); }); u.append(cs); }
 				if (m.turn) {
 					u.dataset.turn = m.turn;
 					const edit = el('button', 'lc-msg-edit', 'Edit');
@@ -1878,6 +1902,10 @@ function mentionLabel(m: string): string {
 	const contract = /^contract:(\w+)@/.exec(m);
 	if (contract) {
 		return contract[1];
+	}
+	const rule = /^rule:(.+)$/.exec(m);
+	if (rule) {
+		return rule[1];
 	}
 	const hex = /^(deployed|tx):(0x[0-9a-fA-F]+)$/.exec(m);
 	if (hex) {

@@ -70,7 +70,7 @@ test('Task board script compiles', () => {
 
 test('Agent Studio script compiles', () => {
 	const profiles = { onDidChange: () => ({ dispose() { } }) } as never;
-	const st = new AgentStudio(extUri, profiles, () => [], async () => { }) as unknown as { html(w: unknown): string };
+	const st = new AgentStudio(extUri, profiles, profiles, {} as never, () => [], async () => { }, async () => '') as unknown as { html(w: unknown): string };
 	assertCompiles('agentStudio', st.html(webview));
 });
 

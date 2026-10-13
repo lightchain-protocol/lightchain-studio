@@ -9,10 +9,14 @@ Lightchain Studio is built on [Code - OSS](https://github.com/microsoft/vscode) 
 - **Lightchain AI agent.** It runs on Lightchain's decentralized inference: prompts are encrypted end to end and served by Lightchain workers. The agent reads your project, writes and edits files, and runs `forge build` and `forge test`, fixing what fails.
   - **Review in the file.** Proposed changes appear in the editor (removed lines red, added lines green). Accept or reject each change, or all at once (⌘⏎ / ⌘⌫). Every turn is a checkpoint you can undo.
   - **Inline edit** (⌘I) rewrites the selection in place; **Ask about selection** (⌘L) sends it to the chat; **Fix with Lightchain AI** appears on errors and after a failed build or test.
-  - **Context.** The open file, selection and problems go with each prompt. `@` mentions files, contracts, deployed addresses and transaction hashes; `/explain`, `/audit`, `/test`, `/fix`, `/doc`, `/plan` and `/deploy` are shortcuts. Project rules live in `.lightchain/rules.md`.
+  - **Context.** The open file, selection and problems go with each prompt. **Local project search** finds the code your request is about on your machine and attaches the best matches, shown as outlined chips under your message; nothing is uploaded to build the index. `@` mentions files, contracts, deployed addresses, transaction hashes and instructions; `/explain`, `/audit`, `/test`, `/fix`, `/doc`, `/plan` and `/deploy` are shortcuts.
   - **Models.** Pick from the agent-capable models the network serves (Qwen, Llama, DeepSeek, GLM, Mistral, Gemma…) with live worker availability. A stalled worker is retried once, and other free models are suggested.
   - **Chat history** is kept per project. Each answer links its on-chain job on Lightscan and shows its cost.
-- **Agents and Agent Studio.** Built-in agents (Contract Builder, Auditor, Test Writer, Explainer) and your own, stored in `.lightchain/agents.json`. *Lightchain: Open Agent Studio* shows each agent's flow (understand → read → plan → approval → change files → build → test → summarise) and lets you edit its role, rules, permissions and checks without code. Read-only agents cannot write files.
+- **Agents and Agent Studio.** *Lightchain: Open Agent Studio* is one tab for what Lightchain AI is and knows in your project:
+  - **Agents.** Built-in agents (Contract Builder, Auditor, Test Writer, Explainer) and your own. Each shows its flow (understand → read → plan → approval → change files → build → test → summarise), and you edit its role, rules, permissions and checks without code. Read-only agents cannot write files.
+  - **Instructions.** What every agent keeps in mind: always, only for matching files (globs), or only when you `@`-mention it. A meter shows how much of the model's small window the always-on instructions use.
+  - **Project context.** What every conversation starts with (instructions, contracts, deployed addresses), the local index, and a box to try what a request would find.
+  - **Everything is Markdown** in `.lightchain/`, so you can write it by hand and share it through git: one file per agent in `.lightchain/agents/` and per instruction in `.lightchain/rules/`. `.lightchain/rules.md` and a root `AGENTS.md` are read too.
 - **Lightchain home** (left side bar): switch projects in one click, search your chats grouped by day, and keep the project's tasks at hand.
 - **Task board.** To do / In progress / Review / Done with drag and drop, priorities and labels, stored in `.lightchain/tasks.json` so a team shares it through git. Hand a task to Lightchain AI with *Do with AI*, or let `/plan` break a goal into tasks.
 - **Commit with Lightchain AI** writes a commit message for your changes into Source Control; you review it and commit.
@@ -80,6 +84,38 @@ npm run build        # ../src → ../dist/extension.js
 
 Then reload the window (*Developer: Reload Window*).
 
+## Agents and instructions as Markdown
+
+An agent is a Markdown file in `.lightchain/agents/`. The file name is its id, the front matter holds its switches, the text is its job, and a `## Rules` list becomes its rules:
+
+```markdown
+---
+name: Gas Optimizer
+description: Finds where a contract wastes gas
+tools: [read, build]        # read, write, build, test, run
+approval: ask               # ask before changing files, or auto
+check: false                # build and test after every change
+---
+Look for storage writes in loops, repeated reads of the same slot and oversized types.
+
+## Rules
+- Never change behaviour.
+- Show the gas saved for each suggestion.
+```
+
+An instruction is a Markdown file in `.lightchain/rules/`:
+
+```markdown
+---
+title: Testing
+apply: files                # always, files or manual
+globs: [test/**, "*.t.sol"]
+---
+One behaviour per test. Test every revert with its reason.
+```
+
+Cursor-style `alwaysApply` and `globs` fields are understood as well. Always-on instructions share 2,400 characters, because Lightchain models read a small window; Agent Studio shows what fits.
+
 ## Using Lightchain Studio
 
 1. **Open or create a project.** On the Start page, choose *New Project*, *Open Folder* or *Clone Repository*.
@@ -112,9 +148,9 @@ Network settings live in `extensions/lightchain-studio/src/networks.ts`.
     - Session: sortition picks a worker, and a session key is sealed to that worker (P-256 ECDH + AES-256-GCM).
     - Each prompt is uploaded as an encrypted blob and submitted as a job paid from prepaid credits.
     - Answers stream back over the relay WebSocket and are decrypted in the IDE.
-  - `src/agent/`: the coding agent loop, its tools (read, search, write/edit with approval, `forge build`, `forge test`, commands with approval), agent profiles, prompt context and project map, slash commands, chat history and the line diff.
+  - `src/agent/`: the coding agent loop, its tools (read, search, write/edit with approval, `forge build`, `forge test`, commands with approval), agent profiles and instructions (Markdown with front matter), prompt context, the project map and the local search index (BM25 over code chunks), slash commands, chat history and the line diff.
   - `src/aiView.ts`: the Lightchain AI panel. `src/editorReview.ts` and `src/inlinePrompt.ts`: in-file review and ⌘I.
-  - `src/agentStudio.ts`: Agent Studio. `src/workspaceView.ts`: the Lightchain home side bar. `src/tasks.ts`, `src/boardPanel.ts`: tasks and the board.
+  - `src/agentStudio.ts`: Agent Studio (agents, instructions, project context). `src/workspaceView.ts`: the Lightchain home side bar. `src/tasks.ts`, `src/boardPanel.ts`: tasks and the board.
   - `src/walletView.ts`, `src/usage.ts`, `src/faucet.ts`: the Wallet section, spend read from JobRegistry events, and the testnet faucet claim.
   - `src/newProjectPanel.ts`, `src/templates.ts`, `src/deployWizard.ts`, `src/commitMessage.ts`: new project window, templates, deploy wizard and commit messages.
   - `src/ui/site.ts`: the shared Lightchain design tokens and components for the webviews.

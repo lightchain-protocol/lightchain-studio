@@ -351,6 +351,21 @@
 				"command": "lightchain.agents.open",
 				"title": "Open Agent Studio",
 				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.agents.new",
+				"title": "New Agent",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.rules.open",
+				"title": "Open Instructions",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.rules.new",
+				"title": "New Instruction",
+				"category": "Lightchain"
 			}
 		],
 		"menus": {
@@ -575,6 +590,11 @@
 					"default": 8192,
 					"minimum": 2048,
 					"markdownDescription": "How much conversation (in tokens) a Lightchain AI session may hold before Studio continues it in a fresh session with a recap. Match it to the model's context window."
+				},
+				"lightchain.ai.localContext": {
+					"type": "boolean",
+					"default": true,
+					"markdownDescription": "Search the project on this machine for code related to each request and attach the best matches to the prompt. Nothing is uploaded to build the index."
 				},
 				"lightchain.explorer.outline": {
 					"type": "boolean",

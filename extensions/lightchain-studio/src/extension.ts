@@ -24,6 +24,8 @@ import { LightchainProvider } from './lightchain/provider';
 import { EditorReview } from './editorReview';
 import { TaskStore } from './tasks';
 import { AgentProfiles } from './agent/profiles';
+import { RuleStore, renderRules } from './agent/rules';
+import { WorkspaceIndex } from './agent/workspaceIndex';
 import { AgentStudio } from './agentStudio';
 import { BoardPanel } from './boardPanel';
 import { WorkspaceView } from './workspaceView';
@@ -70,8 +72,14 @@ export function activate(context: vscode.ExtensionContext): void {
 	}
 	const profiles = new AgentProfiles();
 	ai.profiles = profiles;
-	const studio = new AgentStudio(context.extensionUri, profiles, () => ai.modelNames(), (id, prompt) => ai.useAgent(id, prompt));
-	context.subscriptions.push(profiles, studio, profiles.onDidChange(() => ai.postAgents()),
+	const rules = new RuleStore();
+	const localIndex = new WorkspaceIndex();
+	ai.rules = rules;
+	ai.localSearch = async (query, exclude) => localIndex.enabled ? localIndex.search(query, exclude) : [];
+	const studio = new AgentStudio(context.extensionUri, profiles, rules, localIndex, () => ai.modelNames(), (id, prompt) => ai.useAgent(id, prompt), () => ai.projectMap?.() ?? Promise.resolve(''));
+	context.subscriptions.push(profiles, rules, studio, profiles.onDidChange(() => ai.postAgents()),
+		vscode.commands.registerCommand('lightchain.rules.open', (id?: string) => studio.open(undefined, 'rules', typeof id === 'string' ? id : undefined)),
+		vscode.commands.registerCommand('lightchain.rules.new', () => studio.createRule()),
 		vscode.commands.registerCommand('lightchain.agents.open', (id?: string) => studio.open(typeof id === 'string' ? id : undefined)),
 		vscode.commands.registerCommand('lightchain.agents.new', () => studio.create()));
 	const tasks = new TaskStore();
@@ -152,10 +160,11 @@ export function activate(context: vscode.ExtensionContext): void {
 	ai.inline = new InlinePrompt();
 	ai.projectMap = async () => {
 		const map = projectMap(await solidityFiles(), programs.relevant, network.current.label);
-		const rules = await projectRules();
-		return [rules && `Project rules (.lightchain/rules.md — follow them):\n${rules}`, map].filter(Boolean).join('\n\n');
+		await rules.ready();
+		const always = renderRules(rules.always()).text;
+		return [always && `Project instructions (written by the team — follow them):\n${always}`, map].filter(Boolean).join('\n\n');
 	};
-	ai.mentions = () => mentionItems(programs.relevant);
+	ai.mentions = async () => [...rules.all.filter(r => r.apply !== 'always').map(r => ({ id: `rule:${r.id}`, label: r.title, detail: 'instruction', kind: 'rule' as const })), ...await mentionItems(programs.relevant)];
 	context.subscriptions.push(watchFailures((command, output) => void ai.fixFailure(command, output)));
 	ai.resolveMention = m => resolveMention(m, network.current, programs.relevant);
 	context.subscriptions.push(ai.inline);
@@ -580,23 +589,6 @@ function registerStatusBar(context: vscode.ExtensionContext, wallet: Wallet, net
 
 	context.subscriptions.push(wallet.onDidChange(update), network.onDidChange(update), credits.onDidChange(update));
 	update();
-}
-
-/** The project's own instructions for Lightchain AI (like Cursor rules), capped. */
-async function projectRules(): Promise<string> {
-	const root = vscode.workspace.workspaceFolders?.[0]?.uri;
-	if (!root) {
-		return '';
-	}
-	for (const name of ['.lightchain/rules.md', '.lightchainrules']) {
-		try {
-			const text = new TextDecoder().decode(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(root, name))).trim();
-			if (text) {
-				return text.length > 2_000 ? text.slice(0, 2_000) + '\n… (truncated)' : text;
-			}
-		} catch { /* not there */ }
-	}
-	return '';
 }
 
 export function deactivate(): void { }

@@ -1,9 +1,12 @@
 import * as vscode from 'vscode';
+import { formatFrontMatter, parseFrontMatter, slug, uniqueSlug } from './markdown';
 
 /**
  * Lightchain AI agents people can understand and shape without code: a role in
  * plain words, rules as sentences, switches for what the agent may do and when it
- * must ask. Built-in agents plus the project's own (.lightchain/agents.json).
+ * must ask. Built-in agents plus the project's own: one Markdown file per agent
+ * in .lightchain/agents/ (front matter for the switches, the text is its job),
+ * so they can be written by hand, reviewed and shared through git.
  */
 export type Approval = 'ask' | 'auto';
 
@@ -58,7 +61,64 @@ export const BUILTIN_AGENTS: AgentProfile[] = [
 	},
 ];
 
-const FILE = '.lightchain/agents.json';
+/** Agents saved before they became Markdown files; still read, moved on the next save. */
+const LEGACY_FILE = '.lightchain/agents.json';
+export const AGENTS_DIR = '.lightchain/agents';
+
+const TOOL_KEYS = ['read', 'write', 'build', 'test', 'run'] as const;
+
+/** An agent as a Markdown file: front matter for the switches, then its job and a "## Rules" list. */
+export function profileToMarkdown(p: AgentProfile): string {
+	const body = [p.role.trim(), ...(p.rules.filter(r => r.trim()).length ? ['## Rules', p.rules.filter(r => r.trim()).map(r => `- ${r.trim()}`).join('\n')] : [])].filter(Boolean).join('\n\n');
+	return formatFrontMatter({
+		name: p.name,
+		description: p.summary,
+		tools: TOOL_KEYS.filter(k => p.can[k]),
+		approval: p.approval,
+		check: p.check,
+		model: p.model,
+		color: p.color,
+		starters: p.starters.filter(Boolean).length ? p.starters.filter(Boolean) : undefined,
+	}, body);
+}
+
+/** Reads an agent from Markdown. The file name is its id; everything else has a sensible default. */
+export function profileFromMarkdown(id: string, text: string): AgentProfile | undefined {
+	const { data, body } = parseFrontMatter(text);
+	const str = (k: string) => typeof data[k] === 'string' ? data[k] as string : '';
+	const list = (k: string) => Array.isArray(data[k]) ? data[k] as string[] : str(k) ? str(k).split(',').map(x => x.trim()).filter(Boolean) : undefined;
+	// "## Rules" bullets become the agent's rules; any other text is its job
+	const lines = body.split('\n');
+	const at = lines.findIndex(l => /^#{1,6}\s+rules\s*$/i.test(l.trim()));
+	const role: string[] = at < 0 ? lines : lines.slice(0, at);
+	const rules: string[] = [];
+	if (at >= 0) {
+		let inRules = true;
+		for (const line of lines.slice(at + 1)) {
+			const bullet = /^\s*(?:[-*+]|\d+[.)])\s+(.*)$/.exec(line);
+			if (inRules && bullet) {
+				rules.push(bullet[1].trim());
+			} else if (line.trim()) {
+				inRules = false;
+				role.push(line);
+			}
+		}
+	}
+	const tools = list('tools');
+	const name = str('name') || id.replace(/[-_]+/g, ' ').replace(/^./, c => c.toUpperCase());
+	return normalizeProfile({
+		id, name,
+		summary: str('description'),
+		color: str('color'),
+		role: role.join('\n').trim(),
+		rules,
+		can: tools ? Object.fromEntries(TOOL_KEYS.map(k => [k, tools.includes(k)])) : { read: true, write: true, build: true, test: true, run: false },
+		approval: str('approval'),
+		check: data.check === undefined ? !!tools?.includes('build') || !tools : data.check === true,
+		model: str('model'),
+		starters: list('starters'),
+	});
+}
 
 /** Tool names an agent may use. */
 export function allowedTools(p: AgentProfile): string[] {
@@ -117,19 +177,25 @@ export function normalizeProfile(raw: any): AgentProfile | undefined {
 
 export class AgentProfiles implements vscode.Disposable {
 	private custom: AgentProfile[] = [];
+	private legacy = new Set<string>(); // ids still stored in agents.json
 	private readonly changed = new vscode.EventEmitter<void>();
 	readonly onDidChange = this.changed.event;
 	private readonly disposables: vscode.Disposable[] = [this.changed];
 	private writing = false;
+	private loading?: Promise<void>;
 
 	constructor() {
-		const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+		const root = this.root;
 		if (root) {
-			const w = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(root, FILE));
+			const w = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(root, '.lightchain/{agents.json,agents/*.md}'));
 			const reload = () => { if (!this.writing) { void this.load(); } };
 			this.disposables.push(w, w.onDidChange(reload), w.onDidCreate(reload), w.onDidDelete(reload));
 		}
 		void this.load();
+	}
+
+	private get root(): vscode.Uri | undefined {
+		return vscode.workspace.workspaceFolders?.[0]?.uri;
 	}
 
 	get all(): AgentProfile[] {
@@ -144,37 +210,83 @@ export class AgentProfiles implements vscode.Disposable {
 		return this.all.find(p => p.id === id) ?? BUILTIN_AGENTS[0];
 	}
 
-	private async load(): Promise<void> {
-		const root = vscode.workspace.workspaceFolders?.[0]?.uri;
-		try {
-			const raw = root ? JSON.parse(new TextDecoder().decode(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(root, FILE)))) : undefined;
-			this.custom = Array.isArray(raw?.agents) ? raw.agents.map(normalizeProfile).filter(Boolean) : [];
-		} catch {
-			this.custom = [];
-		}
-		this.changed.fire();
+	/** The agent's Markdown file (it exists once the agent has been saved for this project). */
+	fileOf(id: string): vscode.Uri | undefined {
+		return this.root && vscode.Uri.joinPath(this.root, AGENTS_DIR, `${slug(id, 'agent')}.md`);
 	}
 
-	private async save(): Promise<void> {
-		const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+	/** An id for a new agent called `name`, free among the existing ones. */
+	newId(name: string): string {
+		return uniqueSlug(name, this.all.map(p => p.id), 'agent');
+	}
+
+	/** Resolves once the project's agents have been read. */
+	ready(): Promise<void> {
+		return this.loading ?? Promise.resolve();
+	}
+
+	private load(): Promise<void> {
+		return this.loading = this.read().finally(() => this.changed.fire());
+	}
+
+	private async read(): Promise<void> {
+		const root = this.root;
+		const found = new Map<string, AgentProfile>();
+		this.legacy = new Set();
 		if (!root) {
-			throw new Error('Open a project to save agents with it.');
+			this.custom = [];
+			return;
 		}
+		try {
+			const raw = JSON.parse(new TextDecoder().decode(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(root, LEGACY_FILE))));
+			for (const p of (Array.isArray(raw?.agents) ? raw.agents.map(normalizeProfile).filter(Boolean) : []) as AgentProfile[]) {
+				found.set(p.id, p);
+				this.legacy.add(p.id);
+			}
+		} catch { /* no legacy file */ }
+		try {
+			const dir = vscode.Uri.joinPath(root, AGENTS_DIR);
+			const names = (await vscode.workspace.fs.readDirectory(dir)).filter(([n, t]) => t !== vscode.FileType.Directory && n.toLowerCase().endsWith('.md')).map(([n]) => n).sort();
+			for (const name of names) {
+				const id = slug(name.replace(/\.md$/i, ''), 'agent');
+				const p = profileFromMarkdown(id, new TextDecoder().decode(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(dir, name))));
+				if (p) {
+					found.set(id, p); // a Markdown file wins over the legacy entry
+				}
+			}
+		} catch { /* no agents folder */ }
+		this.custom = [...found.values()];
+	}
+
+	private async hold<T>(work: () => Promise<T>): Promise<T> {
 		this.writing = true;
 		try {
-			await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(root, '.lightchain'));
-			await vscode.workspace.fs.writeFile(vscode.Uri.joinPath(root, FILE), new TextEncoder().encode(JSON.stringify({ version: 1, agents: this.custom.map(({ builtin: _b, ...p }) => p) }, null, '\t') + '\n'));
+			return await work();
 		} finally {
 			setTimeout(() => { this.writing = false; }, 300);
 		}
-		this.changed.fire();
 	}
 
-	/** Saves an agent (a changed built-in becomes a project copy with the same id). */
+	/** Rewrites agents.json without the agents that now live in Markdown (removes it when empty). */
+	private async saveLegacy(root: vscode.Uri): Promise<void> {
+		const file = vscode.Uri.joinPath(root, LEGACY_FILE);
+		const left = this.custom.filter(c => this.legacy.has(c.id));
+		if (left.length) {
+			await vscode.workspace.fs.writeFile(file, new TextEncoder().encode(JSON.stringify({ version: 1, agents: left.map(({ builtin: _b, ...p }) => p) }, null, '\t') + '\n'));
+		} else {
+			await Promise.resolve(vscode.workspace.fs.delete(file)).catch(() => undefined);
+		}
+	}
+
+	/** Saves an agent as .lightchain/agents/<id>.md (a changed built-in becomes a project copy with the same id). */
 	async put(p: AgentProfile): Promise<void> {
-		const clean = normalizeProfile(p);
+		const clean = normalizeProfile({ ...p, id: slug(String(p?.id ?? ''), 'agent') });
+		const root = this.root;
 		if (!clean) {
 			return;
+		}
+		if (!root) {
+			throw new Error('Open a project to save agents with it.');
 		}
 		const i = this.custom.findIndex(c => c.id === clean.id);
 		if (i >= 0) {
@@ -182,12 +294,28 @@ export class AgentProfiles implements vscode.Disposable {
 		} else {
 			this.custom.push(clean);
 		}
-		await this.save();
+		await this.hold(async () => {
+			await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(root, AGENTS_DIR));
+			await vscode.workspace.fs.writeFile(this.fileOf(clean.id)!, new TextEncoder().encode(profileToMarkdown(clean)));
+			if (this.legacy.delete(clean.id)) {
+				await this.saveLegacy(root);
+			}
+		});
+		this.changed.fire();
 	}
 
 	async remove(id: string): Promise<void> {
+		const root = this.root;
 		this.custom = this.custom.filter(c => c.id !== id);
-		await this.save();
+		if (root) {
+			await this.hold(async () => {
+				await Promise.resolve(vscode.workspace.fs.delete(this.fileOf(id)!)).catch(() => undefined);
+				if (this.legacy.delete(id)) {
+					await this.saveLegacy(root);
+				}
+			});
+		}
+		this.changed.fire();
 	}
 
 	dispose(): void {
