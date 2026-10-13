@@ -1,7 +1,8 @@
 import * as vscode from 'vscode';
 
 /**
- * Chat history per project (workspaceState). A chat is the list of panel events
+ * Chat history per project and per wallet (workspaceState): each wallet sees its
+ * own conversations in a project. A chat is the list of panel events
  * that can be replayed (messages, answers, tool steps, checkpoints, notes), so a
  * reload restores it exactly as it looked.
  */
@@ -14,37 +15,51 @@ const MAX_CHATS = 30;
 const MAX_EVENTS = 600;
 
 /** Event types worth keeping; everything else (status, busy, models…) is live-only. */
-const REPLAYABLE = new Set(['user', 'ai', 'toolStart', 'toolEnd', 'checkpoint', 'checkpointUndone', 'info', 'notice', 'card', 'error']);
+const REPLAYABLE = new Set(['user', 'ai', 'toolStart', 'toolEnd', 'checkpoint', 'checkpointUndone', 'info', 'notice', 'card', 'error', 'jobs']);
 
 export class ChatStore {
-	constructor(private readonly state: vscode.Memento) { }
+	/** `wallet`: the active wallet's address (lower-case), or undefined without one. */
+	constructor(private readonly state: vscode.Memento, private readonly wallet: () => string | undefined = () => undefined) { }
+
+	private get listKey(): string {
+		const w = this.wallet();
+		return w ? `${KEY}:${w}` : KEY;
+	}
+
+	private get currentKey(): string {
+		const w = this.wallet();
+		return w ? `${CURRENT}:${w}` : CURRENT;
+	}
 
 	all(): Chat[] {
-		return this.state.get<Chat[]>(KEY, []);
+		// chats from before wallets had their own history stay visible until this wallet saves its own
+		const own = this.state.get<Chat[]>(this.listKey);
+		// a copy: saving this wallet's history must not change the shared one other wallets still see
+		return own ?? (this.listKey === KEY ? [] : JSON.parse(JSON.stringify(this.state.get<Chat[]>(KEY, []))) as Chat[]);
 	}
 
 	current(): Chat | undefined {
-		const id = this.state.get<string>(CURRENT);
+		const id = this.state.get<string>(this.currentKey);
 		return this.all().find(c => c.id === id);
 	}
 
 	/** Starts a new (empty, unsaved until the first event) chat. */
 	async startNew(): Promise<void> {
-		await this.state.update(CURRENT, undefined);
+		await this.state.update(this.currentKey, undefined);
 	}
 
 	async open(id: string): Promise<Chat | undefined> {
 		const chat = this.all().find(c => c.id === id);
 		if (chat) {
-			await this.state.update(CURRENT, id);
+			await this.state.update(this.currentKey, id);
 		}
 		return chat;
 	}
 
 	async remove(id: string): Promise<void> {
-		await this.state.update(KEY, this.all().filter(c => c.id !== id));
-		if (this.state.get<string>(CURRENT) === id) {
-			await this.state.update(CURRENT, undefined);
+		await this.state.update(this.listKey, this.all().filter(c => c.id !== id));
+		if (this.state.get<string>(this.currentKey) === id) {
+			await this.state.update(this.currentKey, undefined);
 		}
 	}
 
@@ -55,14 +70,14 @@ export class ChatStore {
 			return;
 		}
 		const chats = this.all();
-		let chat = chats.find(c => c.id === this.state.get<string>(CURRENT));
+		let chat = chats.find(c => c.id === this.state.get<string>(this.currentKey));
 		if (!chat) {
 			if (type !== 'user') {
 				return; // a chat starts with the user's first message
 			}
 			chat = { id: `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, title: String(msg.text ?? 'Chat').split('\n')[0].slice(0, 80), updated: Date.now(), model, events: [] };
 			chats.unshift(chat);
-			void this.state.update(CURRENT, chat.id);
+			void this.state.update(this.currentKey, chat.id);
 		}
 		const last = chat.events[chat.events.length - 1];
 		if (type === 'ai' && last?.type === 'ai' && !last.closed) {
@@ -79,17 +94,28 @@ export class ChatStore {
 		chat.model = model ?? chat.model;
 		// newest first, capped
 		const ordered = [chat, ...chats.filter(c => c.id !== chat!.id)].slice(0, MAX_CHATS);
-		void this.state.update(KEY, ordered);
+		void this.state.update(this.listKey, ordered);
+	}
+
+	/** Drops the user message of `turn` and everything after it from the current chat. */
+	rewind(turn: string): void {
+		const chats = this.all();
+		const chat = chats.find(c => c.id === this.state.get<string>(this.currentKey));
+		const at = chat?.events.findIndex(e => e.type === 'user' && e.turn === turn) ?? -1;
+		if (chat && at >= 0) {
+			chat.events.splice(at);
+			void this.state.update(this.listKey, chats);
+		}
 	}
 
 	/** Ends the current streamed answer so the next delta starts a new one. */
 	closeAnswer(): void {
 		const chats = this.all();
-		const chat = chats.find(c => c.id === this.state.get<string>(CURRENT));
+		const chat = chats.find(c => c.id === this.state.get<string>(this.currentKey));
 		const last = chat?.events[chat.events.length - 1];
 		if (last?.type === 'ai') {
 			last.closed = true;
-			void this.state.update(KEY, chats);
+			void this.state.update(this.listKey, chats);
 		}
 	}
 

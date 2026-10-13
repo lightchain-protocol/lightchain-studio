@@ -19,6 +19,9 @@ jobs:
 
       - name: Install
         run: npm ci
+        env:
+          # @vscode/ripgrep and Electron download from GitHub; unauthenticated requests get rate-limited (403)
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Lightchain extension (typecheck + bundle)
         working-directory: extensions/lightchain-studio/tools
@@ -34,12 +37,11 @@ jobs:
       - name: Package (macOS arm64)
         if: github.event_name == 'workflow_dispatch'
         run: |
-          ./scripts/package-mac.sh arm64
-          mv ../LightchainStudio-*.dmg .
+          ./build/lightchain/package-mac.sh arm64
 
       - name: Upload DMG
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: LightchainStudio-macos-arm64
-          path: LightchainStudio-*.dmg
+          path: build/lightchain/out/*.dmg

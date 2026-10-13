@@ -1,0 +1,147 @@
+name: Release
+
+# Builds the macOS DMGs and the Windows installer + zip, and attaches them to a
+# draft GitHub release. Push a tag like v1.139.1, or run it by hand.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create or update (for example v1.139.1). Leave empty to only build the artifacts.
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+          - arch: x64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      APPLE_SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install
+        run: npm ci
+        env:
+          # @vscode/ripgrep and Electron download from GitHub; unauthenticated requests get rate-limited (403)
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lightchain extension
+        working-directory: extensions/lightchain-studio/tools
+        run: |
+          npm install --no-audit --no-fund
+          npm run typecheck
+          npm test
+          npm run build
+
+      # With a Developer ID certificate the app is signed and notarized: no "unidentified developer"
+      # warning, and macOS stops asking for the keychain password after every update (an ad-hoc
+      # signature is a different identity on every build). Secrets: APPLE_CERT_P12_BASE64 (the
+      # exported .p12, base64) and APPLE_CERT_PASSWORD, plus the four APPLE_* values above.
+      - name: Import signing certificate
+        env:
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERT_P12_BASE64" ]; then
+            echo "No signing certificate configured: the build will be signed ad hoc."
+            exit 0
+          fi
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "$APPLE_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -P "$APPLE_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          rm "$RUNNER_TEMP/cert.p12"
+
+      - name: Package
+        run: ./build/lightchain/package-mac.sh ${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LightchainStudio-darwin-${{ matrix.arch }}
+          path: build/lightchain/out/*
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install
+        run: npm ci
+        env:
+          # @vscode/ripgrep and Electron download from GitHub; unauthenticated requests get rate-limited (403)
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          npm_config_arch: x64
+
+      - name: Lightchain extension
+        working-directory: extensions/lightchain-studio/tools
+        run: |
+          npm install --no-audit --no-fund
+          npm run typecheck
+          npm test
+          npm run build
+
+      - name: Package
+        shell: pwsh
+        run: .\build\lightchain\package-win.ps1 x64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LightchainStudio-win32-x64
+          path: build/lightchain/out/*
+          if-no-files-found: error
+
+  release:
+    needs: [macos, windows]
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: artifacts
+        run: cat *.sha256 > SHA256SUMS.txt && rm *.sha256 && ls -la
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: Lightchain Studio ${{ inputs.tag || github.ref_name }}
+          draft: true
+          generate_release_notes: true
+          files: artifacts/*

@@ -5,12 +5,17 @@ import { LightchainAiView } from '../src/aiView';
 import { StartPage } from '../src/startPage';
 import { InteractPanels } from '../src/interact';
 import { connectPageHtml } from '../src/connectPage';
+import { WorkspaceView } from '../src/workspaceView';
+import { BoardPanel } from '../src/boardPanel';
+import { AgentStudio } from '../src/agentStudio';
+import { NewProjectPanel } from '../src/newProjectPanel';
+import { WalletView } from '../src/walletView';
 
 // The webview pages are HTML built in TypeScript template literals; a backslash that
 // is right in TS can be wrong in the page (e.g. '\n' becomes a real line break inside
 // a string). Compile every inline script so such a page can never ship.
 const webview = { cspSource: 'vscode-resource:', asWebviewUri: (u: unknown) => u } as never;
-const stub = { onDidChange: () => ({ dispose() { } }), current: { id: 'testnet', label: 'Testnet' }, active: undefined } as never;
+const stub = { onDidChange: () => ({ dispose() { } }), bridge: { onDidChangePending: () => ({ dispose() { } }) }, current: { id: 'testnet', label: 'Testnet' }, active: undefined } as never;
 const memento = { get: (_k: string, d?: unknown) => d, update: async () => { } } as never;
 const extUri = { fsPath: '/ext', path: '/ext', toString: () => '/ext' } as never;
 
@@ -43,4 +48,43 @@ test('Interact tab script compiles', () => {
 
 test('Wallet connect page script compiles', () => {
 	assertCompiles('connectPage', connectPageHtml({ nonce: 'n', networks: [], known: { address: '0x0', wallet: 'MetaMask' } }));
+});
+
+test('Lightchain sidebar (projects, tasks, chats) script compiles', () => {
+	const host = { onDidChangeChats: () => ({ dispose() { } }) } as never;
+	const tasks = { onDidChange: () => ({ dispose() { } }) } as never;
+	const v = new WorkspaceView(extUri, host, tasks) as unknown as { html(w: unknown): string };
+	assertCompiles('workspaceView', v.html(webview));
+});
+
+test('Wallet view script compiles', () => {
+	const v = new WalletView(extUri, stub, stub, stub, memento) as unknown as { html(w: unknown): string };
+	assertCompiles('walletView', v.html(webview));
+});
+
+test('Task board script compiles', () => {
+	const tasks = { onDidChange: () => ({ dispose() { } }) } as never;
+	const b = new BoardPanel(extUri, tasks, async () => { }, async () => { }) as unknown as { html(w: unknown): string };
+	assertCompiles('boardPanel', b.html(webview));
+});
+
+test('Agent Studio script compiles', () => {
+	const profiles = { onDidChange: () => ({ dispose() { } }) } as never;
+	const st = new AgentStudio(extUri, profiles, profiles, {} as never, () => [], async () => { }, async () => '') as unknown as { html(w: unknown): string };
+	assertCompiles('agentStudio', st.html(webview));
+});
+
+test('New project window script compiles', () => {
+	const panel = new NewProjectPanel(extUri) as unknown as { html(w: unknown): string };
+	assertCompiles('newProjectPanel', panel.html(webview));
+});
+
+test('On-chain tool tabs: scripts compile', async () => {
+	const { page } = await import('../src/ui/page');
+	const tx = await import('../src/chain/txPanel');
+	const dash = await import('../src/chain/dashboardPanel');
+	const map = await import('../src/chain/mapPanel');
+	assertCompiles('txPanel', page(webview as never, extUri as never, { title: 't', lead: 'l', css: tx.TX_CSS, script: tx.TX_SCRIPT }));
+	assertCompiles('dashboardPanel', page(webview as never, extUri as never, { title: 't', lead: 'l', css: dash.DASHBOARD_CSS, script: dash.DASHBOARD_SCRIPT }));
+	assertCompiles('mapPanel', page(webview as never, extUri as never, { title: 't', lead: 'l', css: map.MAP_CSS, script: map.MAP_SCRIPT }));
 });

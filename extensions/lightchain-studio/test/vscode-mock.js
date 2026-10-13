@@ -3,8 +3,10 @@ class EventEmitter { constructor() { this.l = []; this.event = fn => { this.l.pu
 const uri = fsPath => ({ fsPath, path: fsPath, scheme: 'file', toString: () => 'file://' + fsPath });
 module.exports = {
 	EventEmitter,
+	Disposable: { from: (...d) => ({ dispose() { d.forEach(x => x.dispose()); } }) },
 	Uri: { parse: s => ({ toString: () => s, fsPath: s }), joinPath: (b, ...p) => uri([b.fsPath, ...p].join('/')), file: uri },
 	RelativePattern: class { constructor(b, p) { this.base = b; this.pattern = p; } },
+	FileType: { Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64 },
 	DiagnosticSeverity: { Error: 0, Warning: 1, Information: 2, Hint: 3 },
 	ProgressLocation: { Notification: 15, Window: 10 },
 	ThemeIcon: class { constructor(id) { this.id = id; } },

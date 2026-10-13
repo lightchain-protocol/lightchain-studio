@@ -35,12 +35,33 @@ export const SIWE_ORIGIN = 'http://localhost:3000';
 const TOKEN_SECRET = 'lightchain.bridge.token';
 const PAGE_WAIT_MS = 90_000;
 
+/** The browser wallet never answered a request: the user has to look at the wallet tab. */
+export class WalletTimeoutError extends Error {
+	constructor() {
+		super('The wallet did not respond. Check the Lightchain Studio tab in your browser.');
+		this.name = 'WalletTimeoutError';
+	}
+}
+
+/** Whether `err` (or what caused it — viem wraps wallet errors) is a wallet that never answered. */
+export function isWalletTimeout(err: unknown): boolean {
+	for (let e = err as { name?: string; message?: string; cause?: unknown } | undefined, depth = 0; e && depth < 5; e = e.cause as typeof e, depth++) {
+		if (e.name === 'WalletTimeoutError' || /wallet did not respond/i.test(String(e.message ?? ''))) {
+			return true;
+		}
+	}
+	return false;
+}
+
 export class BrowserBridge implements vscode.Disposable {
 	private server?: http.Server;
 	private origin = '';
 	private token = '';
 	private clients = new Set<http.ServerResponse>();
 	private pending = new Map<string, Pending>();
+	private readonly _onDidChangePending = new vscode.EventEmitter<{ count: number; purpose?: string }>();
+	/** Requests waiting for the user in their browser wallet (so the IDE can say so, where they are looking). */
+	readonly onDidChangePending = this._onDidChangePending.event;
 	private seq = 0;
 	private waitingForPage: Array<() => void> = [];
 	private connectWaiter?: { resolve: (i: ConnectedInfo) => void; reject: (e: Error) => void };
@@ -89,9 +110,11 @@ export class BrowserBridge implements vscode.Disposable {
 		const result = new Promise<T>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.pending.delete(id);
-				reject(new Error('The wallet did not respond. Check the Lightchain Studio tab in your browser.'));
+				this._onDidChangePending.fire({ count: this.pending.size });
+				reject(new WalletTimeoutError());
 			}, REQUEST_TIMEOUT_MS);
 			this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
+			this._onDidChangePending.fire({ count: this.pending.size, purpose });
 		});
 		this.broadcast({ type: 'request', id, method, params, expectedAddress, purpose, chain: chainParams(network) });
 		return result;
@@ -171,7 +194,7 @@ export class BrowserBridge implements vscode.Disposable {
 				'Referrer-Policy': 'no-referrer',
 				'Content-Security-Policy': `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'self' 'nonce-${nonce}'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
 			});
-			res.end(connectPageHtml({ nonce, networks: Object.values(NETWORKS).map(chainParams), known: this.context.globalState.get<{ address: string; wallet: string }>('lightchain.wallet.browser') }));
+			res.end(connectPageHtml({ nonce, networks: Object.values(NETWORKS).map(chainParams), known: this.context.globalState.get<{ address: string; wallet: string }>('lightchain.wallet.browser'), ideUrl: `${vscode.env.uriScheme}://lightchain.lightchain-studio/return` }));
 			return;
 		}
 		if (action === 'events' && req.method === 'GET') {
@@ -241,6 +264,7 @@ export class BrowserBridge implements vscode.Disposable {
 					return;
 				}
 				this.pending.delete(String(msg.id));
+				this._onDidChangePending.fire({ count: this.pending.size });
 				clearTimeout(p.timer);
 				if (msg.type === 'result') {
 					p.resolve(msg.result);
@@ -270,6 +294,7 @@ export class BrowserBridge implements vscode.Disposable {
 		this.clients.forEach(c => c.end());
 		this.server?.close();
 		this._onDidChangeAccount.dispose();
+		this._onDidChangePending.dispose();
 	}
 }
 

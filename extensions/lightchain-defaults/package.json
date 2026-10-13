@@ -11,10 +11,31 @@
 	"contributes": {
 		"configurationDefaults": {
 			"workbench.tips.enabled": false,
-			"workbench.enableExperiments": false,
-			"workbench.welcomePage.walkthroughs.openOnInstall": false,
 			"workbench.editor.empty.hint": "hidden",
-			"chat.commandCenter.enabled": false
+			"chat.commandCenter.enabled": false,
+			"files.exclude": {
+				"**/out": {
+					"when": "foundry.toml"
+				},
+				"**/cache": {
+					"when": "foundry.toml"
+				}
+			},
+			"breadcrumbs.enabled": false,
+			"editor.smoothScrolling": true,
+			"editor.cursorSmoothCaretAnimation": "on",
+			"editor.cursorBlinking": "smooth",
+			"editor.renderLineHighlight": "gutter",
+			"editor.overviewRulerBorder": false,
+			"editor.hideCursorInOverviewRuler": true,
+			"editor.padding.top": 14,
+			"editor.lineHeight": 1.65,
+			"editor.guides.indentation": false,
+			"workbench.list.smoothScrolling": true,
+			"workbench.tree.renderIndentGuides": "none",
+			"terminal.integrated.smoothScrolling": true,
+			"terminal.integrated.enablePersistentSessions": false,
+			"workbench.reduceMotion": "off"
 		}
 	}
 }

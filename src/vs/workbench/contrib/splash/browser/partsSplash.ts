@@ -52,6 +52,12 @@ export class PartsSplash {
 			lastIdleSchedule.value = dom.runWhenWindowIdle(mainWindow, () => this._savePartsSplash(), 2500);
 		};
 		lifecycleService.when(LifecyclePhase.Restored).then(() => {
+			// eslint-disable-next-line no-restricted-syntax
+			const lcLoader = mainWindow.document.getElementById('lightchain-loader');
+			if (lcLoader) {
+				lcLoader.style.opacity = '0';
+				setTimeout(() => lcLoader.remove(), 300);
+			}
 			Event.any(Event.filter(onDidChangeFullscreen, windowId => windowId === mainWindow.vscodeWindowId), editorGroupsService.mainPart.onDidLayout, _themeService.onDidColorThemeChange)(savePartsSplashSoon, undefined, this._disposables);
 			savePartsSplashSoon();
 		});

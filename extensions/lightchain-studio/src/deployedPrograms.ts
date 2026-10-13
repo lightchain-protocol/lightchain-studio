@@ -29,7 +29,9 @@ interface ProjectNetworkState {
 const ADDRESS_RE = /0x[0-9a-fA-F]{40}/g;
 const MAX_SCAN_BYTES = 1_000_000;
 
-export class DeployedProgramsProvider implements vscode.TreeDataProvider<ProgramNode | ReferenceNode>, vscode.Disposable {
+type TreeNode = ProgramNode | ReferenceNode | OtherNode;
+
+export class DeployedProgramsProvider implements vscode.TreeDataProvider<TreeNode>, vscode.Disposable {
 	private readonly _onDidChangeTreeData = new vscode.EventEmitter<void>();
 	readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
@@ -39,7 +41,7 @@ export class DeployedProgramsProvider implements vscode.TreeDataProvider<Program
 	private loading?: Promise<void>;
 	private readonly disposables: vscode.Disposable[] = [];
 	private rescanTimer?: ReturnType<typeof setTimeout>;
-	view?: vscode.TreeView<ProgramNode | ReferenceNode>;
+	view?: vscode.TreeView<TreeNode>;
 
 	constructor(
 		private readonly context: vscode.ExtensionContext,
@@ -73,6 +75,16 @@ export class DeployedProgramsProvider implements vscode.TreeDataProvider<Program
 
 	private async saveState(update: Partial<ProjectNetworkState>): Promise<void> {
 		await this.context.workspaceState.update(this.stateKey(), { ...this.state, ...update });
+	}
+
+	/** Every program known on the current network. */
+	get all(): Program[] {
+		return this.programs;
+	}
+
+	/** Programs this project names or references (the folded "Other deployments" are left out). */
+	get relevant(): Program[] {
+		return this.programs.filter(p => p.name || this.references.has(p.address.toLowerCase()));
 	}
 
 	get deployer(): `0x${string}` | undefined {
@@ -227,13 +239,21 @@ export class DeployedProgramsProvider implements vscode.TreeDataProvider<Program
 
 	// ---- tree ----------------------------------------------------------------
 
-	getTreeItem(node: ProgramNode | ReferenceNode): vscode.TreeItem {
+	getTreeItem(node: TreeNode): vscode.TreeItem {
 		return node;
 	}
 
-	getChildren(node?: ProgramNode | ReferenceNode): (ProgramNode | ReferenceNode)[] {
+	getChildren(node?: TreeNode): (TreeNode)[] {
+		const make = (p: Program) => new ProgramNode(p, this.network.current, this.references.get(p.address.toLowerCase()) ?? []);
+		// unnamed contracts this project never mentions are rarely what you look for: keep them folded away
+		const minor = (p: Program) => !p.name && !this.references.has(p.address.toLowerCase());
 		if (!node) {
-			return this.programs.map(p => new ProgramNode(p, this.network.current, this.references.get(p.address.toLowerCase()) ?? []));
+			const main = this.programs.filter(p => !minor(p)).map(make);
+			const other = this.programs.filter(minor);
+			return other.length ? [...main, new OtherNode(other.length, main.length === 0)] : main;
+		}
+		if (node instanceof OtherNode) {
+			return this.programs.filter(minor).map(make);
 		}
 		if (node instanceof ProgramNode) {
 			return node.refs.map(r => new ReferenceNode(r));
@@ -277,6 +297,16 @@ export class ProgramNode extends vscode.TreeItem {
 		}
 		this.tooltip = md;
 		this.command = { command: 'lightchain.programs.openInExplorer', title: 'Open in Lightscan', arguments: [this] };
+	}
+}
+
+class OtherNode extends vscode.TreeItem {
+	constructor(count: number, expanded: boolean) {
+		super('Other deployments', expanded ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed);
+		this.id = 'other-deployments';
+		this.description = String(count);
+		this.tooltip = 'Contracts deployed from your account that this project does not reference.';
+		this.contextValue = 'otherDeployments';
 	}
 }
 

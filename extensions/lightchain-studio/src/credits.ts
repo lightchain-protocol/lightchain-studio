@@ -25,6 +25,17 @@ const JOB_REGISTRY_ABI = parseAbi([
 	'function setDelegateAllowance(address delegate, uint256 allowance)',
 ]);
 
+/** Escrowed per Lightchain AI job on testnet today (JobRegistry fee). */
+export const JOB_FEE_LCAI = 0.02;
+
+/**
+ * What one request costs in credits on a network. The registry has no getter for it, so these are
+ * measured: testnet 0.02; mainnet 0.05 (5 jobs took 0.25 LCAI on 2026-10-13).
+ */
+export function jobFee(network: { id: string }): number {
+	return network.id === 'mainnet' ? 0.05 : JOB_FEE_LCAI;
+}
+
 export interface CreditsSnapshot {
 	credits: bigint;      // prepaid LCAI (wei)
 	walletBalance: bigint;  // native LCAI (wei)
@@ -51,7 +62,7 @@ export class Credits implements vscode.Disposable {
 			to: network.jobRegistry,
 			data: encodeFunctionData({ abi: JOB_REGISTRY_ABI, functionName: 'deposit' }),
 			value: parseEther(amountLcai),
-		});
+		}, `Add ${amountLcai} LCAI of Lightchain AI credits`);
 		this._onDidChange.fire();
 		return hash;
 	}
@@ -67,13 +78,13 @@ export class Credits implements vscode.Disposable {
 			await this.wallet.sendTransaction(account, network, {
 				to: network.jobRegistry,
 				data: encodeFunctionData({ abi: JOB_REGISTRY_ABI, functionName: 'setDelegateAuthorization', args: [delegate, true] }),
-			});
+			}, 'Allow Lightchain AI to pay for your requests from your credits (one time)');
 		}
 		const balance = await client.readContract({ address: network.jobRegistry, abi: JOB_REGISTRY_ABI, functionName: 'prepaidBalanceOf', args: [account.address] });
 		await this.wallet.sendTransaction(account, network, {
 			to: network.jobRegistry,
 			data: encodeFunctionData({ abi: JOB_REGISTRY_ABI, functionName: 'setDelegateAllowance', args: [delegate, balance] }),
-		});
+		}, 'Set how much Lightchain AI may spend: your current credits, never more');
 		this._onDidChange.fire();
 	}
 
@@ -81,7 +92,7 @@ export class Credits implements vscode.Disposable {
 		const hash = await this.wallet.sendTransaction(account, network, {
 			to: network.jobRegistry,
 			data: encodeFunctionData({ abi: JOB_REGISTRY_ABI, functionName: 'withdrawBalance', args: [parseEther(amountLcai)] }),
-		});
+		}, `Move ${amountLcai} LCAI of credits back to your wallet`);
 		this._onDidChange.fire();
 		return hash;
 	}

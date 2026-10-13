@@ -1,3 +1,4 @@
+import type { Finding } from './chain/security';
 import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { execFile } from 'node:child_process';
@@ -44,7 +45,7 @@ async function artifacts(root: vscode.Uri): Promise<Artifact[]> {
 	return result.sort((x, y) => x.name.localeCompare(y.name));
 }
 
-export async function deployWizard(wallet: Wallet, network: NetworkState, programs: DeployedProgramsProvider, contractName?: string): Promise<void> {
+export async function deployWizard(wallet: Wallet, network: NetworkState, programs: DeployedProgramsProvider, contractName?: string, findings?: (file: string) => Promise<Finding[]>): Promise<void> {
 	const folder = vscode.workspace.workspaceFolders?.[0];
 	if (!folder) {
 		vscode.window.showErrorMessage('Open a Foundry project to deploy a contract.');
@@ -104,12 +105,47 @@ export async function deployWizard(wallet: Wallet, network: NetworkState, progra
 		}
 		value = parseEther(raw.trim() || '0') || undefined;
 	}
+	// the security check's serious findings stop a deploy until the user has seen them
+	const serious = (await findings?.(chosen.source).catch(() => []) ?? []).filter(f => f.severity === 'high');
+	if (serious.length) {
+		const fix = 'Fix with Lightchain AI';
+		const anyway = net.id === 'mainnet' ? 'Deploy Anyway (Real Funds at Risk)' : 'Deploy Anyway';
+		const pick = await vscode.window.showWarningMessage(`${chosen.name} has ${serious.length} serious security problem${serious.length === 1 ? '' : 's'}`, {
+			modal: true,
+			detail: `${serious.slice(0, 4).map(f => `Line ${f.line + 1}: ${f.message}`).join('\n\n')}${serious.length > 4 ? `\n\n…and ${serious.length - 4} more in Problems.` : ''}${net.id === 'mainnet' ? '\n\nOn mainnet these can lose real LCAI, and a deployed contract usually cannot be changed.' : ''}`,
+		}, fix, anyway);
+		if (pick === fix) {
+			await vscode.commands.executeCommand('lightchain.security.fixAll', chosen.source);
+			return;
+		}
+		if (pick !== anyway) {
+			return;
+		}
+	}
+	// offer a Lightchain AI security review first (on mainnet before the real-money confirmation)
+	const audit = 'Audit with Lightchain AI First';
 	if (net.id !== 'mainnet') {
 		const ok = await vscode.window.showInformationMessage(`Deploy ${chosen.name} to Lightchain ${net.label}?`, {
 			modal: true,
 			detail: [`From ${account.name} (${account.address})`, ...shown, ...(value ? [`Value: ${formatEther(value)} LCAI`] : [])].join('\n'),
-		}, 'Deploy');
+		}, 'Deploy', audit);
+		if (ok === audit) {
+			await vscode.commands.executeCommand('lightchain.ai.audit', chosen.source);
+			return;
+		}
 		if (ok !== 'Deploy') {
+			return;
+		}
+	} else {
+		const ok = await vscode.window.showWarningMessage(`Review ${chosen.name} before deploying to mainnet?`, {
+			modal: true,
+			detail: 'Mainnet contracts hold real LCAI and usually cannot be changed after deployment. Lightchain AI can do a security review of the source first.',
+		}, audit, 'Deploy Without Review');
+		if (ok === audit) {
+			await vscode.commands.executeCommand('lightchain.ai.audit', chosen.source);
+			return;
+		}
+		if (ok !== 'Deploy Without Review') {
 			return;
 		}
 	}

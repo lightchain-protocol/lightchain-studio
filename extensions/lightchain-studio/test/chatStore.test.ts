@@ -49,3 +49,16 @@ test('new chat, history and recap', async () => {
 	assert.equal(store.all().length, 1);
 	assert.equal(store.current(), undefined);
 });
+
+test('rewind drops a user message and everything after it', () => {
+	const store = new ChatStore(memento());
+	store.record({ type: 'user', text: 'first', turn: 't1' });
+	store.record({ type: 'delta', text: 'answer one' });
+	store.closeAnswer();
+	store.record({ type: 'user', text: 'second', turn: 't2' });
+	store.record({ type: 'delta', text: 'answer two' });
+	store.rewind('t2');
+	assert.deepEqual(store.current()!.events.map(e => e.text), ['first', 'answer one']);
+	store.rewind('nope');
+	assert.equal(store.current()!.events.length, 2);
+});

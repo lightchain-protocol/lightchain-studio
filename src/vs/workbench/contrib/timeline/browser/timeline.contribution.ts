@@ -36,7 +36,7 @@ export class TimelinePaneDescriptor implements IViewDescriptor {
 	readonly canToggleVisibility = true;
 	readonly hideByDefault = true;
 	readonly canMoveView = true;
-	readonly when = TimelineHasProviderContext;
+	readonly when = ContextKeyExpr.and(TimelineHasProviderContext, ContextKeyExpr.equals('config.lightchain.explorer.timeline', true));
 
 	focusCommand = { id: 'timeline.focus' };
 }

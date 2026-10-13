@@ -21,7 +21,8 @@ import { bytesToBase64, base64ToBytes } from './base64';
  * the session's earlier jobs on-chain.
  */
 export class DelegateNotAuthorizedError extends Error {
-	constructor(readonly delegate?: string) { super('Lightchain AI is not yet allowed to spend your credits.'); }
+	/** `limit`: it is allowed, but the amount it may spend is used up (credits were added since). */
+	constructor(readonly delegate?: string, readonly limit = false) { super(limit ? 'Lightchain AI has used up the amount it may spend from your credits.' : 'Lightchain AI is not yet allowed to spend your credits.'); }
 }
 /** The worker accepted the job but failed or went silent — another model may answer. */
 export class WorkerError extends Error {
@@ -60,6 +61,9 @@ export class LightchainInference {
 	private modelId?: string;
 
 	get sessionModelId(): string | undefined { return this.modelId; }
+
+	/** Called for every job submitted on-chain (one per model reply). */
+	onJob?: (job: { jobId: string; txHash?: string }) => void;
 
 	constructor(
 		private readonly wallet: Wallet,
@@ -273,6 +277,7 @@ export class LightchainInference {
 				throw new Error(`Prompt submission failed (${sub.status}): ${sub.data?.message ?? ''}`);
 			}
 			const jobId = String(sub.data.jobId);
+			this.onJob?.({ jobId, txHash: typeof sub.data.txHash === 'string' ? sub.data.txHash : undefined });
 			this.status(`Job ${jobId} submitted — waiting for the worker…`);
 
 			let acc = '';

@@ -11,7 +11,8 @@
 	"main": "./dist/extension.js",
 	"activationEvents": [
 		"onStartupFinished",
-		"workspaceContains:foundry.toml"
+		"workspaceContains:foundry.toml",
+		"onUri"
 	],
 	"capabilities": {
 		"untrustedWorkspaces": {
@@ -28,22 +29,37 @@
 					"title": "Lightchain",
 					"icon": "media/lightchain.svg"
 				}
+			],
+			"activitybar": [
+				{
+					"id": "lightchain-home",
+					"title": "Lightchain",
+					"icon": "media/lightchain.svg"
+				}
+			],
+			"panel": [
+				{
+					"id": "lightchain-panel",
+					"title": "Lightchain AI",
+					"icon": "media/lightchain.svg"
+				}
 			]
 		},
 		"views": {
 			"lightchain": [
 				{
 					"id": "lightchain.deployedPrograms",
-					"name": "Deployed Programs",
+					"name": "Deployed contracts",
 					"icon": "media/lightchain.svg",
-					"initialSize": 1
+					"initialSize": 1,
+					"visibility": "collapsed"
 				},
 				{
 					"id": "lightchain.ai",
 					"type": "webview",
 					"name": "Lightchain AI",
 					"icon": "media/lightchain.svg",
-					"initialSize": 2
+					"initialSize": 3
 				}
 			],
 			"extensions": [
@@ -51,12 +67,28 @@
 					"id": "lightchain.marketplace",
 					"name": "Lightchain Marketplace"
 				}
+			],
+			"lightchain-home": [
+				{
+					"type": "webview",
+					"id": "lightchain.workspace",
+					"name": "Lightchain"
+				}
+			],
+			"lightchain-panel": [],
+			"explorer": [
+				{
+					"type": "webview",
+					"id": "lightchain.walletView",
+					"name": "Wallet",
+					"icon": "media/lightchain.svg"
+				}
 			]
 		},
 		"viewsWelcome": [
 			{
 				"view": "lightchain.deployedPrograms",
-				"contents": "No deployed programs on this network yet.\nPrograms appear here from your Foundry deployments (broadcast/), from contracts created by your deployer address, or added by hand.\n[Add Contract](command:lightchain.programs.add)\n[Set Deployer Address](command:lightchain.programs.setDeployer)"
+				"contents": "No contracts on this network yet. Deploy one and it appears here, or [add a contract](command:lightchain.programs.add) by address. You can also [set your deployer address](command:lightchain.programs.setDeployer) to list what it created."
 			}
 		],
 		"commands": [
@@ -260,6 +292,127 @@
 				"command": "lightchain.ai.inlineEdit",
 				"title": "Edit with Lightchain AI",
 				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.review.acceptAll",
+				"title": "Accept All Lightchain AI Changes",
+				"category": "Lightchain",
+				"enablement": "lightchain.reviewing"
+			},
+			{
+				"command": "lightchain.review.rejectAll",
+				"title": "Reject All Lightchain AI Changes",
+				"category": "Lightchain",
+				"enablement": "lightchain.reviewing"
+			},
+			{
+				"command": "lightchain.review.accept",
+				"title": "Accept",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.review.reject",
+				"title": "Reject",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.inline.submit",
+				"title": "Generate",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.inline.cancel",
+				"title": "Close",
+				"icon": "$(close)",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.ai.audit",
+				"title": "Audit with Lightchain AI",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.tasks.board",
+				"title": "Open Task Board",
+				"category": "Lightchain",
+				"icon": "$(project)"
+			},
+			{
+				"command": "lightchain.tasks.add",
+				"title": "New Task",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.ai.commit",
+				"title": "Commit with Lightchain AI",
+				"category": "Lightchain",
+				"icon": "$(sparkle)"
+			},
+			{
+				"command": "lightchain.agents.open",
+				"title": "Open Agent Studio",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.agents.new",
+				"title": "New Agent",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.tx.debug",
+				"title": "Debug a Transaction",
+				"category": "Lightchain",
+				"icon": "$(bug)"
+			},
+			{
+				"command": "lightchain.map.open",
+				"title": "Open Contract Map",
+				"category": "Lightchain",
+				"icon": "$(type-hierarchy)"
+			},
+			{
+				"command": "lightchain.dashboard.open",
+				"title": "Open Dashboard",
+				"category": "Lightchain",
+				"icon": "$(pulse)"
+			},
+			{
+				"command": "lightchain.tasks.background",
+				"title": "Do a Task in the Background",
+				"category": "Lightchain",
+				"icon": "$(git-pull-request)"
+			},
+			{
+				"command": "lightchain.tasks.backgroundMenu",
+				"title": "Background Work",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.launcher",
+				"title": "What Do You Want to Do?",
+				"category": "Lightchain",
+				"icon": "$(search)"
+			},
+			{
+				"command": "lightchain.app.preview",
+				"title": "Make an App for a Contract",
+				"category": "Lightchain",
+				"icon": "$(browser)"
+			},
+			{
+				"command": "lightchain.security.fixAll",
+				"title": "Fix Security Problems with Lightchain AI",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.rules.open",
+				"title": "Open Instructions",
+				"category": "Lightchain"
+			},
+			{
+				"command": "lightchain.rules.new",
+				"title": "New Instruction",
+				"category": "Lightchain"
 			}
 		],
 		"menus": {
@@ -322,6 +475,16 @@
 					"group": "inline@2"
 				},
 				{
+					"command": "lightchain.dashboard.open",
+					"when": "view == lightchain.deployedPrograms && viewItem =~ /^program/",
+					"group": "1_actions@0"
+				},
+				{
+					"command": "lightchain.app.preview",
+					"when": "view == lightchain.deployedPrograms && viewItem =~ /^program/",
+					"group": "1_actions@0"
+				},
+				{
 					"command": "lightchain.programs.findReferences",
 					"when": "view == lightchain.deployedPrograms && viewItem =~ /^program/",
 					"group": "1_actions@1"
@@ -373,6 +536,26 @@
 				{
 					"command": "lightchain.programs.interactAddress",
 					"when": "false"
+				},
+				{
+					"command": "lightchain.review.accept",
+					"when": "false"
+				},
+				{
+					"command": "lightchain.review.reject",
+					"when": "false"
+				},
+				{
+					"command": "lightchain.inline.submit",
+					"when": "false"
+				},
+				{
+					"command": "lightchain.inline.cancel",
+					"when": "false"
+				},
+				{
+					"command": "lightchain.ai.audit",
+					"when": "false"
 				}
 			],
 			"editor/title": [
@@ -399,6 +582,27 @@
 					"command": "lightchain.ai.inlineEdit",
 					"when": "editorTextFocus && !editorReadonly",
 					"group": "0_lightchain@0"
+				}
+			],
+			"comments/commentThread/context": [
+				{
+					"command": "lightchain.inline.submit",
+					"group": "inline",
+					"when": "commentController == lightchain.inline"
+				}
+			],
+			"comments/commentThread/title": [
+				{
+					"command": "lightchain.inline.cancel",
+					"group": "navigation",
+					"when": "commentController == lightchain.inline"
+				}
+			],
+			"scm/title": [
+				{
+					"command": "lightchain.ai.commit",
+					"group": "navigation@0",
+					"when": "scmProvider == git"
 				}
 			]
 		},
@@ -437,6 +641,44 @@
 					"default": "",
 					"markdownDescription": "Path to `forge`. Empty = `~/.foundry/bin/forge` or PATH.",
 					"scope": "machine"
+				},
+				"lightchain.ai.contextTokens": {
+					"type": "number",
+					"default": 8192,
+					"minimum": 2048,
+					"markdownDescription": "How much conversation (in tokens) a Lightchain AI session may hold before Studio continues it in a fresh session with a recap. Match it to the model's context window."
+				},
+				"lightchain.ai.localContext": {
+					"type": "boolean",
+					"default": true,
+					"markdownDescription": "Search the project on this machine for code related to each request and attach the best matches to the prompt. Nothing is uploaded to build the index."
+				},
+				"lightchain.simulate.before": {
+					"type": "string",
+					"enum": ["mainnet", "always", "never"],
+					"enumDescriptions": ["Preview every mainnet transaction before you confirm it", "Preview testnet transactions too", "Never preview"],
+					"default": "mainnet",
+					"markdownDescription": "Try each transaction on a private copy of the network first and show what it would change (balances, contract values, events) before you confirm it."
+				},
+				"lightchain.security.check": {
+					"type": "boolean",
+					"default": true,
+					"markdownDescription": "Check Solidity files for common security mistakes while you type (reentrancy, missing access control, unchecked payments, predictable randomness…) and show them as problems."
+				},
+				"lightchain.gas.lens": {
+					"type": "boolean",
+					"default": true,
+					"markdownDescription": "Show what each contract costs to deploy and each function costs to call (gas and LCAI) above the code in `src/`."
+				},
+				"lightchain.explorer.outline": {
+					"type": "boolean",
+					"default": false,
+					"description": "Show the Outline section (the symbols of the open file) under Files."
+				},
+				"lightchain.explorer.timeline": {
+					"type": "boolean",
+					"default": false,
+					"description": "Show the Timeline section (the file's local history) under Files."
 				}
 			}
 		},
@@ -495,6 +737,20 @@
 				"win": "ctrl+i",
 				"linux": "ctrl+i",
 				"when": "editorTextFocus && !editorReadonly"
+			},
+			{
+				"command": "lightchain.review.acceptAll",
+				"key": "cmd+enter",
+				"win": "ctrl+enter",
+				"linux": "ctrl+enter",
+				"when": "editorTextFocus && lightchain.reviewing"
+			},
+			{
+				"command": "lightchain.review.rejectAll",
+				"key": "cmd+backspace",
+				"win": "ctrl+backspace",
+				"linux": "ctrl+backspace",
+				"when": "editorTextFocus && lightchain.reviewing"
 			}
 		]
 	}
