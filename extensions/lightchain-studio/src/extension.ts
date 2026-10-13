@@ -170,6 +170,15 @@ export function activate(context: vscode.ExtensionContext): void {
 	context.subscriptions.push(ai.inline);
 	const programsView = vscode.window.createTreeView('lightchain.deployedPrograms', { treeDataProvider: programs, showCollapseAll: true });
 	programs.view = programsView;
+	// The list stays folded while it is empty so Lightchain AI has the side bar; it opens once there is something to show.
+	let known = 0;
+	context.subscriptions.push(programs.onDidChangeTreeData(() => {
+		const count = programs.relevant.length;
+		if (!known && count && !programsView.visible) {
+			void vscode.commands.executeCommand('lightchain.deployedPrograms.focus', { preserveFocus: true });
+		}
+		known = count;
+	}));
 
 	context.subscriptions.push(
 		network, bridge, wallet, credits, programs, marketplace, ai, programsView,

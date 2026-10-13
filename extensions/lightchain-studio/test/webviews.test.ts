@@ -15,7 +15,7 @@ import { WalletView } from '../src/walletView';
 // is right in TS can be wrong in the page (e.g. '\n' becomes a real line break inside
 // a string). Compile every inline script so such a page can never ship.
 const webview = { cspSource: 'vscode-resource:', asWebviewUri: (u: unknown) => u } as never;
-const stub = { onDidChange: () => ({ dispose() { } }), current: { id: 'testnet', label: 'Testnet' }, active: undefined } as never;
+const stub = { onDidChange: () => ({ dispose() { } }), bridge: { onDidChangePending: () => ({ dispose() { } }) }, current: { id: 'testnet', label: 'Testnet' }, active: undefined } as never;
 const memento = { get: (_k: string, d?: unknown) => d, update: async () => { } } as never;
 const extUri = { fsPath: '/ext', path: '/ext', toString: () => '/ext' } as never;
 

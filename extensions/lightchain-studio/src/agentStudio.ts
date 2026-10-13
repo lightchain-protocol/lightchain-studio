@@ -66,7 +66,8 @@ export class AgentStudio implements vscode.Disposable {
 		const base = this.profiles.get(from ?? 'builder');
 		const name = from ? `${base.name} copy` : 'New agent';
 		const id = this.profiles.newId(name);
-		await this.profiles.put({ ...base, id, name, glyph: from ? base.glyph : 'NA', builtin: undefined });
+		const blank = { summary: '', role: '', rules: [], starters: [], glyph: 'NA' };
+		await this.profiles.put({ ...base, ...(from ? {} : blank), id, name, builtin: undefined });
 		this.open(id);
 	}
 
@@ -201,7 +202,7 @@ export class AgentStudio implements vscode.Disposable {
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource}; font-src ${webview.cspSource}; style-src ${webview.cspSource} 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
 <style nonce="${nonce}">
 	${siteCss(String(media('Inter-latin.woff2')))}
-	html, body { height: 100%; }
+	html, body { height: 100%; overflow-x: hidden; }
 	body { display: flex; flex-direction: column; overflow: hidden; animation: fadeIn var(--lc-motion) ease; }
 	@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 	.grow { flex: 1; }
@@ -229,7 +230,8 @@ export class AgentStudio implements vscode.Disposable {
 	.saved { color: var(--lc-text-tertiary); font-size: 12px; opacity: 0; transition: opacity .2s; }
 	.saved.show { opacity: 1; }
 
-	.s-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 260px minmax(340px, 1fr) 380px; }
+	.s-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 240px minmax(0, 1fr) minmax(300px, 380px); }
+	.s-body > *, .c-body > * { min-width: 0; }
 
 	/* agents: P2P nav-items with identicons */
 	.s-list { padding: 16px 10px; border-right: 1px solid var(--lc-rule); overflow-y: auto; }
@@ -315,7 +317,7 @@ export class AgentStudio implements vscode.Disposable {
 	.row .num { color: var(--lc-text-tertiary); font-size: 12px; font-variant-numeric: tabular-nums; }
 
 	/* project context */
-	.c-body { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(360px, 1fr) minmax(320px, 460px); }
+	.c-body { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 460px); }
 	.c-main { display: flex; flex-direction: column; gap: 12px; padding: 22px 28px 40px; overflow-y: auto; }
 	.c-lead { margin: 0 0 12px; color: var(--lc-text-tertiary); font-size: 13px; line-height: 1.6; }
 	.stats { display: flex; gap: 28px; margin-bottom: 4px; }
@@ -327,6 +329,28 @@ export class AgentStudio implements vscode.Disposable {
 	.hit__head .where { color: var(--lc-text-tertiary); font-size: 12px; }
 	.hit pre, .map { margin: 6px 0 0; color: var(--lc-text-tertiary); font-family: Menlo, Monaco, "Courier New", monospace; font-size: 11.5px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; overflow: hidden; }
 	.map { max-height: none; color: var(--lc-text-secondary); }
+
+	/* a narrow tab (both side bars open): the settings move under the main column and the page scrolls as one */
+	@media (max-width: 1000px) {
+		.s-top { padding: 18px 20px 12px; flex-wrap: wrap; }
+		.s-tabs { padding: 0 20px; }
+		.s-body { grid-template-columns: 200px minmax(0, 1fr); grid-auto-rows: min-content; align-content: start; overflow-y: auto; }
+		.s-body > .s-list { grid-row: 1 / span 2; overflow: visible; }
+		.s-body > .s-flow, .s-body > .r-edit, .s-body > .s-props { grid-column: 2; overflow: visible; }
+		.s-body > .s-flow { padding: 20px 20px 8px; }
+		.s-body > .r-edit { padding: 18px 20px 8px; }
+		.s-body > .s-props { border-left: 0; padding: 12px 20px 40px; }
+		.r-body { min-height: 300px; }
+		.c-body { grid-template-columns: minmax(0, 1fr); grid-auto-rows: min-content; align-content: start; overflow-y: auto; }
+		.c-body > * { overflow: visible; }
+		.c-main { padding: 18px 20px 8px; }
+		.c-body > .s-props { border-left: 0; padding: 12px 20px 40px; }
+	}
+	@media (max-width: 640px) {
+		.s-body { grid-template-columns: minmax(0, 1fr); }
+		.s-body > .s-list { grid-row: auto; border-right: 0; border-bottom: 1px solid var(--lc-rule); }
+		.s-body > .s-flow, .s-body > .r-edit, .s-body > .s-props { grid-column: 1; }
+	}
 </style>
 </head>
 <body>
@@ -404,7 +428,7 @@ export class AgentStudio implements vscode.Disposable {
 		state.agents.forEach(a => {
 			const c = el('button', 's-card' + (a.id === state.selected ? ' sel' : ''));
 			const g = el('span', 'glyph'); g.innerHTML = lcIdenticon('agent:' + a.id);
-			const t = el('span', 's-card__text'); t.append(el('span', 's-card__name', a.name), el('span', 's-card__sum', a.summary));
+			const t = el('span', 's-card__text'); t.append(el('span', 's-card__name', a.name), el('span', 's-card__sum', a.summary || 'No description yet'));
 			const k = el('span', 's-card__kind'); k.append(el('span', 'pill', a.kind === 'builtin' ? 'Built-in' : a.kind === 'customized' ? 'Edited' : 'This project')); t.append(k);
 			c.append(g, t);
 			c.onclick = () => { if (a.id !== state.selected) { focusSec = null; vscode.postMessage({ type: 'select', id: a.id }); } };
@@ -429,7 +453,7 @@ export class AgentStudio implements vscode.Disposable {
 		const box = $('flow'); box.replaceChildren();
 		const p = draft; if (!p) return;
 		const head = el('div', 's-flow__head'); const g = el('span', 'glyph'); g.innerHTML = lcIdenticon('agent:' + p.id);
-		const ht = el('div'); ht.append(el('div', 's-flow__name', p.name), el('div', 's-flow__role', p.role));
+		const ht = el('div'); ht.append(el('div', 's-flow__name', p.name), el('div', 's-flow__role', p.role || 'Describe its job on the right to tell this agent what it is for.'));
 		head.append(g, ht); box.append(head);
 		const steps = computeFlow(p);
 		steps.forEach((s, i) => {
@@ -462,11 +486,11 @@ export class AgentStudio implements vscode.Disposable {
 		// identity
 		const id = section('identity', 'About this agent');
 		const fn = el('div', 'field'); fn.append(el('label', '', 'Name')); const ni = el('input', 'input'); ni.value = p.name; ni.maxLength = 40; ni.oninput = () => change(d => { d.name = ni.value || 'Agent'; }); fn.append(ni);
-		const fs = el('div', 'field'); fs.append(el('label', '', 'Short description')); const si = el('input', 'input'); si.value = p.summary; si.maxLength = 120; si.oninput = () => change(d => { d.summary = si.value; }); fs.append(si);
+		const fs = el('div', 'field'); fs.append(el('label', '', 'Short description')); const si = el('input', 'input'); si.value = p.summary; si.maxLength = 120; si.placeholder = 'One line shown under its name'; si.oninput = () => change(d => { d.summary = si.value; }); fs.append(si);
 		id.append(fn, fs);
 		// job
 		const job = section('job', 'Its job', 'Describe in plain words what this agent is for. It reads this before every request.');
-		const ta = el('textarea', 'input'); ta.value = p.role; ta.maxLength = 2000; ta.oninput = () => change(d => { d.role = ta.value; }); job.append(ta);
+		const ta = el('textarea', 'input'); ta.value = p.role; ta.maxLength = 2000; ta.placeholder = 'e.g. Find where contracts waste gas and explain each saving in plain words.'; ta.oninput = () => change(d => { d.role = ta.value; }); job.append(ta);
 		// rules
 		const rules = section('rules', 'Rules it always follows', 'One sentence each, e.g. "Never use tx.origin."');
 		p.rules.forEach((r, i) => {

@@ -7,6 +7,8 @@ Scripts that turn this repository into the files people download. Everything the
 | macOS (Apple silicon, Intel) | `./build/lightchain/package-mac.sh [arm64\|x64]` | `LightchainStudio-<version>-darwin-<arch>.dmg` |
 | Windows (x64, arm64) | `.\build\lightchain\package-win.ps1 [x64\|arm64]` | `LightchainStudioSetup-<version>-win32-<arch>.exe` (installer) and `LightchainStudio-<version>-win32-<arch>.zip` (portable) |
 
+The DMG opens as a branded install window (drag the app onto Applications), laid out by Finder from `dmg-background.png`; regenerate that with `dmg-background.py`. If Finder cannot be scripted on the build machine, the image is still valid, just unstyled. Without a signing identity the app is re-signed ad hoc, so a downloaded copy opens after one confirmation instead of reading as damaged.
+
 Each file gets a `.sha256` next to it. The version comes from the root `package.json`.
 
 Build each platform on that platform: the native modules are compiled for the machine that runs `npm ci`, so a Windows build made on a Mac would not start. Run `npm ci` first, and rebuild the Lightchain extension if its sources changed (see the main README).

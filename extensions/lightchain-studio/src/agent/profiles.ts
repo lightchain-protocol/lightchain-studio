@@ -72,7 +72,7 @@ export function profileToMarkdown(p: AgentProfile): string {
 	const body = [p.role.trim(), ...(p.rules.filter(r => r.trim()).length ? ['## Rules', p.rules.filter(r => r.trim()).map(r => `- ${r.trim()}`).join('\n')] : [])].filter(Boolean).join('\n\n');
 	return formatFrontMatter({
 		name: p.name,
-		description: p.summary,
+		description: p.summary || undefined,
 		tools: TOOL_KEYS.filter(k => p.can[k]),
 		approval: p.approval,
 		check: p.check,

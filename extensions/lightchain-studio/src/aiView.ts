@@ -21,6 +21,7 @@ import { AgentStuckError } from './agent/agent';
 import * as fs from 'node:fs';
 import { NetworkState } from './networkState';
 import { Wallet } from './wallet';
+import { isWalletTimeout } from './browserBridge';
 import { shortAddress } from './deployedPrograms';
 import { txUrl } from './networks';
 import { Credits, formatLcai, JOB_FEE_LCAI } from './credits';
@@ -108,6 +109,18 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	) {
 		this.chats = new ChatStore(workspaceState);
 		this.stuck = new StuckJobs(memento, wallet);
+		// A request waiting in the browser wallet is easy to miss from the IDE: say so in the chat, with the way there.
+		this.disposables.push(wallet.bridge.onDidChangePending(({ count, purpose }) => {
+			if (count) {
+				this.post({
+					type: 'cardUpdate', id: 'wallet-wait', title: 'Approve in your wallet', state: 'Waiting for you', stateKind: 'wait',
+					detail: `${purpose ? `${purpose}. ` : ''}The request is open in the Lightchain Studio tab of your browser.`,
+					actions: [{ label: 'Open wallet tab', command: 'lightchain.wallet.openPage' }],
+				});
+			} else {
+				this.post({ type: 'cardRemove', id: 'wallet-wait' });
+			}
+		}));
 		this.disposables.push(wallet.onDidChange(() => this.postState()), network.onDidChange(() => { this.resetChat(); this.refreshModels(); this.postState(); }), credits.onDidChange(() => this.postState()));
 	}
 
@@ -276,6 +289,25 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			case 'ready':
 				this.postAgents();
 				return this.replay();
+			case 'topUp': {
+				// add credits from the chat header
+				const account = this.wallet.active;
+				const amount = String(msg.amount ?? '').trim().replace(',', '.');
+				if (!account) {
+					return this.post({ type: 'creditResult', ok: false, text: 'Connect a wallet first.' });
+				}
+				if (!/^\d+(\.\d{1,18})?$/.test(amount) || Number(amount) <= 0) {
+					return this.post({ type: 'creditResult', ok: false, text: 'Enter an LCAI amount, for example 1 or 0.5.' });
+				}
+				this.post({ type: 'creditResult', busy: true, text: account.kind === 'browser' ? `Approve ${amount} LCAI in your browser wallet…` : `Adding ${amount} LCAI…` });
+				try {
+					await this.credits.topUp(account, this.network.current, amount);
+					this.post({ type: 'creditResult', ok: true, text: `Added ${amount} LCAI to your credits.` });
+				} catch (err) {
+					this.post({ type: 'creditResult', ok: false, text: friendlyError(err, account) });
+				}
+				return this.postState();
+			}
 			case 'history':
 				this.post({ type: 'historyList', chats: this.chats.all().map(c => ({ id: c.id, title: c.title, updated: c.updated, current: c.id === this.chats.current()?.id })) });
 				return;
@@ -508,6 +540,14 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			} else if (err instanceof InsufficientCreditsError) {
 				this.retryText = text;
 				this.post({ type: 'card', title: 'Not enough credits', state: 'Top up needed', stateKind: 'wait', detail: err.message, actions: [{ label: 'Top up credits', command: 'lightchain.credits.topUp' }, { label: 'Send again', command: 'retry', ghost: true }] });
+			} else if (isWalletTimeout(err)) {
+				// nothing failed: the request is still waiting for the user in their browser
+				this.retryText = text;
+				this.post({
+					type: 'card', title: 'Your wallet is waiting for you', state: 'Not sent', stateKind: 'wait',
+					detail: 'Lightchain AI needs a signature, and the request sat unanswered in the Lightchain Studio tab of your browser. Open it and approve, then send again. Your message is kept.',
+					actions: [{ label: 'Open wallet tab', command: 'lightchain.wallet.openPage' }, { label: 'Try again', command: 'retry', ghost: true }],
+				});
 			} else {
 				this.post({ type: 'card', title: friendlyError(err, this.wallet.active), state: 'Failed', stateKind: 'err', actions: [{ label: 'Try again', command: 'retry', ghost: true }] });
 				this.retryText = text;
@@ -1040,7 +1080,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 <style nonce="${nonce}">
 	@font-face { font-family: "Inter"; src: url("${media('Inter-latin.woff2')}") format("woff2"); font-weight: 100 900; unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
 	@font-face { font-family: "Inter"; src: url("${media('Inter-latin-ext.woff2')}") format("woff2"); font-weight: 100 900; unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF; }
-	body { margin: 0; font-family: "Inter", sans-serif; font-size: 16px; line-height: 1.6; color: #7376aa; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+	body { margin: 0; padding: 0; /* the webview default is 20px a side: too much for a side bar */ font-family: "Inter", sans-serif; font-size: 16px; line-height: 1.6; color: #7376aa; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 	*, *::before, *::after { box-sizing: border-box; }
 	p { margin: 0; }
 	/* site base 16px -> IDE 13px (13/16) */
@@ -1049,7 +1089,27 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	/* .lc-sm-title.border-left eyebrow + credits */
 	.lc-top { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 14px 16px; border-bottom: 1px solid rgba(255, 255, 255, 0.1); }
 	.lc-sm-title { margin: 0; padding-left: 10px; border-left: 3px solid #dd00ac; color: #b1b3d0; font-size: 16px; font-weight: 500; line-height: 19.2px; letter-spacing: -0.096px; text-transform: uppercase; white-space: nowrap; }
-	.lc-top__credits { color: #f5f6ff; font-size: 14px; white-space: nowrap; cursor: pointer; }
+	.lc-top__credits { display: inline-flex; align-items: center; gap: 4px; height: 26px; padding: 0 8px; margin-right: 2px; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 8px; background: transparent; color: #f5f6ff; font: inherit; font-size: 14px; white-space: nowrap; cursor: pointer; transition: border-color .2s ease, background .2s ease; }
+	.lc-top__credits:hover, .lc-top__credits.open { border-color: #5b4bff; background: rgba(91, 75, 255, 0.12); }
+	.lc-top__credits .plus { color: #7376aa; font-size: 15px; line-height: 1; }
+	.lc-top__credits:hover .plus { color: #f5f6ff; }
+	/* add credits, in place */
+	.lc-credit { width: 264px; padding: 12px; overflow: visible; }
+	.lc-credit__title { color: #f5f6ff; font-size: 14px; font-weight: 600; }
+	.lc-credit__sub { margin-top: 2px; color: #7376aa; font-size: 12.5px; line-height: 1.45; }
+	.lc-credit__row { display: flex; gap: 6px; margin-top: 10px; }
+	.lc-credit__row button, .lc-credit__go { flex: 1; height: 32px; border: 1px solid rgba(255, 255, 255, 0.2); border-radius: 8px; background: rgba(255, 255, 255, 0.06); color: #ccceef; font: inherit; font-size: 13px; cursor: pointer; transition: all .2s ease; }
+	.lc-credit__row button:hover:not(:disabled) { border-color: #5b4bff; background: #5b4bff; color: #fff; }
+	.lc-credit__row input { flex: 2; min-width: 0; height: 32px; padding: 0 10px; border: 2px solid rgba(255, 255, 255, 0.1); border-radius: 10px; background: transparent; color: #ccceef; font: inherit; font-size: 13px; outline: none; }
+	.lc-credit__row input:focus { border-color: #5b4bff; }
+	.lc-credit__row .lc-credit__go { flex: 1; border: 0; background: linear-gradient(90deg, #df04ae 0%, #412ffd 100%); color: #fff; letter-spacing: .5px; text-transform: uppercase; font-size: 12px; }
+	.lc-credit__row button:disabled { opacity: .5; cursor: not-allowed; }
+	.lc-credit__note { margin-top: 10px; color: #b1b3d0; font-size: 12.5px; line-height: 1.45; }
+	.lc-credit__note.err { color: #ff8f3c; }
+	.lc-credit__note.ok { color: #3eb75e; }
+	.lc-credit__foot { display: flex; gap: 14px; margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255, 255, 255, 0.1); }
+	.lc-credit__foot button { padding: 0; border: 0; background: none; color: #7376aa; font: inherit; font-size: 12.5px; cursor: pointer; }
+	.lc-credit__foot button:hover { color: #f5f6ff; }
 	.lc-top__credits span { color: #b1b3d0; }
 	.lc-sm-title[hidden] { display: none; }
 	.lc-edit__where { padding: 6px 12px; border-bottom: 1px solid rgba(255, 255, 255, 0.06); color: #b1b3d0; font-size: 12px; }
@@ -1135,8 +1195,8 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	.lc-banner span { flex: 1; min-width: 0; }
 	.lc-thread { flex: 1; min-height: 0; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
 	.lc-empty { margin: auto 0; text-align: center; }
-	.lc-empty h2 { margin: 0 0 6px; color: #ccceef; font-size: 24px; font-weight: 600; letter-spacing: -0.02em; }
-	.lc-empty img { width: 40px; height: auto; display: block; margin: 0 auto 16px; }
+	.lc-empty h2 { margin: 0 0 6px; color: #ccceef; font-size: 20px; font-weight: 600; letter-spacing: -0.02em; }
+	.lc-empty img { width: 32px; height: auto; display: block; margin: 0 auto 12px; }
 	.lc-empty p { color: #7376aa; font-size: 14px; line-height: 1.6; }
 	/* first-run checklist */
 	.lc-setup { margin-top: 24px; padding: 14px 16px; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 10px; background: #0f0f14; text-align: left; }
@@ -1286,8 +1346,9 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 <body>
 	<div class="lc-top">
 		<h4 class="lc-sm-title" id="eyebrow" hidden>Testnet</h4>
-		<div class="lc-top__right"><div class="lc-top__credits" id="credits" title="Lightchain AI credits"></div><button class="lc-link" id="historyBtn">History</button><button class="lc-link" id="new">New chat</button></div>
+		<div class="lc-top__right"><button class="lc-top__credits" id="credits" type="button" title="Add Lightchain AI credits"></button><button class="lc-link" id="historyBtn">History</button><button class="lc-link" id="new">New chat</button></div>
 		<div class="lc-history" id="history" hidden></div>
+		<div class="lc-history lc-credit" id="creditMenu" hidden></div>
 	</div>
 	<div class="lc-banner" id="banner" hidden></div>
 	<div class="lc-flow" id="flowStrip" hidden></div>
@@ -1622,7 +1683,33 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	vscode.postMessage({ type: 'ready' }); // the extension replays the saved chat
 	$('new').onclick = () => vscode.postMessage({ type: 'new' });
 	const historyEl = $('history');
-	$('historyBtn').onclick = e => { e.stopPropagation(); if (historyEl.hidden) vscode.postMessage({ type: 'history' }); else historyEl.hidden = true; };
+	// ---- credits: click the balance to add more, without leaving the chat ----
+	const creditMenu = $('creditMenu');
+	let hasAccount = false, isTestnet = true, creditBusy = false, creditNote = null;
+	function renderCredit() {
+		creditMenu.replaceChildren(el('div', 'lc-credit__title', 'Add credits'), el('div', 'lc-credit__sub', 'Credits pay for Lightchain AI. 1 LCAI is about ${Math.round(1 / JOB_FEE_LCAI)} requests, taken from your wallet' + (isTestnet ? ' on testnet.' : ' on mainnet.')));
+		const add = amount => { if (creditBusy) return; creditBusy = true; creditNote = { kind: '', text: 'Adding ' + amount + ' LCAI…' }; renderCredit(); vscode.postMessage({ type: 'topUp', amount: String(amount) }); };
+		const presets = el('div', 'lc-credit__row');
+		[1, 5, 10].forEach(n => { const b = el('button', '', n + ' LCAI'); b.type = 'button'; b.disabled = creditBusy; b.onclick = () => add(n); presets.append(b); });
+		const custom = el('div', 'lc-credit__row'); const inp = el('input'); inp.placeholder = 'Other amount'; inp.inputMode = 'decimal'; inp.disabled = creditBusy;
+		const go = el('button', 'lc-credit__go', 'Add'); go.type = 'button'; go.disabled = creditBusy; go.onclick = () => { if (inp.value.trim()) add(inp.value.trim()); else inp.focus(); };
+		inp.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); go.click(); } };
+		custom.append(inp, go); creditMenu.append(presets, custom);
+		if (creditNote) creditMenu.append(el('div', 'lc-credit__note ' + creditNote.kind, creditNote.text));
+		const foot = el('div', 'lc-credit__foot');
+		const link = (label, command) => { const b = el('button', '', label); b.type = 'button'; b.onclick = () => { creditMenu.hidden = true; $('credits').classList.remove('open'); vscode.postMessage({ type: 'command', command }); }; return b; };
+		foot.append(link('Withdraw', 'lightchain.credits.withdraw'), link('Wallet', 'lightchain.wallet.menu'));
+		creditMenu.append(foot);
+	}
+	$('credits').onclick = e => {
+		e.stopPropagation();
+		if (!hasAccount) { vscode.postMessage({ type: 'command', command: 'lightchain.wallet.menu' }); return; }
+		creditMenu.hidden = !creditMenu.hidden; $('credits').classList.toggle('open', !creditMenu.hidden); historyEl.hidden = true;
+		if (!creditMenu.hidden) { if (!creditBusy) creditNote = null; renderCredit(); }
+	};
+	creditMenu.onclick = e => e.stopPropagation();
+	document.addEventListener('click', () => { creditMenu.hidden = true; $('credits').classList.remove('open'); });
+	$('historyBtn').onclick = e => { creditMenu.hidden = true; e.stopPropagation(); if (historyEl.hidden) vscode.postMessage({ type: 'history' }); else historyEl.hidden = true; };
 	document.addEventListener('click', e => { if (!historyEl.contains(e.target)) historyEl.hidden = true; });
 	const ago = t => { const m = Math.round((Date.now() - t) / 60000); return m < 1 ? 'now' : m < 60 ? m + 'm' : m < 1440 ? Math.round(m / 60) + 'h' : Math.round(m / 1440) + 'd'; };
 	function renderHistory(chats) {
@@ -1690,8 +1777,9 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				$('eyebrow').textContent = m.network; // the view header already says "Lightchain AI"
 				$('eyebrow').hidden = m.testnet; // only flag mainnet (real LCAI); the status bar shows the network
 				$('credits').replaceChildren();
-				if (m.account) { $('credits').append(m.credits ?? '—', Object.assign(document.createElement('span'), { textContent: m.credits === '1' ? ' credit' : ' credits' })); }
-				else { $('credits').append(Object.assign(document.createElement('span'), { textContent: 'Connect wallet' })); }
+				hasAccount = !!m.account; isTestnet = !!m.testnet;
+				if (m.account) { $('credits').append(m.credits ?? '—', Object.assign(document.createElement('span'), { textContent: m.credits === '1' ? ' credit' : ' credits' }), Object.assign(document.createElement('span'), { className: 'plus', textContent: '+' })); }
+				else { $('credits').append(Object.assign(document.createElement('span'), { textContent: 'Connect wallet' })); creditMenu.hidden = true; }
 				break;
 			case 'user': {
 				closeBubble();
@@ -1869,6 +1957,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				break;
 			}
 			case 'status': setStatus(m.text, m.walletPrompt); break;
+			case 'creditResult': creditBusy = !!m.busy; creditNote = { kind: m.busy ? '' : m.ok ? 'ok' : 'err', text: m.text }; if (!creditMenu.hidden) renderCredit(); break;
 			case 'busy': setBusy(m.busy); if (m.busy) startFlow(); else { closeBubble(); clearStatus(); if (flowSteps.length) { flowIdx = flowSteps.length; drawFlow(true); } } break;
 			case 'agents': agentState = m; renderAgent(); break;
 			case 'error': card({ title: m.message, state: 'Failed', stateKind: 'err' }); break;

@@ -4,6 +4,17 @@ The official IDE for Lightchain AI. Write, test and deploy smart contracts, with
 
 Lightchain Studio is built on [Code - OSS](https://github.com/microsoft/vscode) (MIT). It keeps the editor you know and adds a Lightchain workspace. The only AI built in is Lightchain AI; no Copilot or other assistants ship with it.
 
+## Download
+
+Installers are attached to each [release](https://github.com/lightchain-protocol/lightchain-studio/releases):
+
+| Platform | File | How to install |
+|---|---|---|
+| macOS (Apple silicon / Intel) | `LightchainStudio-<version>-darwin-arm64.dmg` / `-x64.dmg` | Open it and drag Lightchain Studio into Applications. |
+| Windows (64-bit) | `LightchainStudioSetup-<version>-win32-x64.exe` | Run it once: it installs for your user without administrator rights, with a Start-menu shortcut and an uninstaller. A portable `.zip` is there too. |
+
+The builds are not signed yet. On first launch macOS asks via System Settings → Privacy & Security → **Open Anyway**, and Windows SmartScreen via **More info** → **Run anyway**.
+
 ## Features
 
 - **Lightchain AI agent.** It runs on Lightchain's decentralized inference: prompts are encrypted end to end and served by Lightchain workers. The agent reads your project, writes and edits files, and runs `forge build` and `forge test`, fixing what fails.
@@ -11,6 +22,7 @@ Lightchain Studio is built on [Code - OSS](https://github.com/microsoft/vscode) 
   - **Inline edit** (⌘I) rewrites the selection in place; **Ask about selection** (⌘L) sends it to the chat; **Fix with Lightchain AI** appears on errors and after a failed build or test.
   - **Context.** The open file, selection and problems go with each prompt. **Local project search** finds the code your request is about on your machine and attaches the best matches, shown as outlined chips under your message; nothing is uploaded to build the index. `@` mentions files, contracts, deployed addresses, transaction hashes and instructions; `/explain`, `/audit`, `/test`, `/fix`, `/doc`, `/plan` and `/deploy` are shortcuts.
   - **Models.** Pick from the agent-capable models the network serves (Qwen, Llama, DeepSeek, GLM, Mistral, Gemma…) with live worker availability. A stalled worker is retried once, and other free models are suggested.
+  - **Wallet and credits in the chat.** Click your credits to add more (1, 5, 10 LCAI or any amount) without leaving the panel. When a signature is waiting in your browser wallet, the chat says so and takes you there.
   - **Chat history** is kept per project. Each answer links its on-chain job on Lightscan and shows its cost.
 - **Agents and Agent Studio.** *Lightchain: Open Agent Studio* is one tab for what Lightchain AI is and knows in your project:
   - **Agents.** Built-in agents (Contract Builder, Auditor, Test Writer, Explainer) and your own. Each shows its flow (understand → read → plan → approval → change files → build → test → summarise), and you edit its role, rules, permissions and checks without code. Read-only agents cannot write files.

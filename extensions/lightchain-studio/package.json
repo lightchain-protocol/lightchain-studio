@@ -51,7 +51,8 @@
 					"id": "lightchain.deployedPrograms",
 					"name": "Deployed contracts",
 					"icon": "media/lightchain.svg",
-					"initialSize": 1
+					"initialSize": 1,
+					"visibility": "collapsed"
 				},
 				{
 					"id": "lightchain.ai",
@@ -87,7 +88,7 @@
 		"viewsWelcome": [
 			{
 				"view": "lightchain.deployedPrograms",
-				"contents": "No deployed programs on this network yet.\nPrograms appear here from your Foundry deployments (broadcast/), from contracts created by your deployer address, or added by hand.\n[Add Contract](command:lightchain.programs.add)\n[Set Deployer Address](command:lightchain.programs.setDeployer)"
+				"contents": "No contracts on this network yet. Deploy one and it appears here, or [add a contract](command:lightchain.programs.add) by address. You can also [set your deployer address](command:lightchain.programs.setDeployer) to list what it created."
 			}
 		],
 		"commands": [
