@@ -1,0 +1,2 @@
+# Release artifacts (DMG, installer, zip) are built here, never committed
+out/

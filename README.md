@@ -53,18 +53,18 @@ To open a project directly, run `./scripts/code.sh path/to/project`.
 ### Packaged app
 
 ```sh
-./scripts/package-mac.sh arm64         # → ../LightchainStudio-<version>-arm64.dmg (x64 for Intel Macs)
-npm run gulp vscode-linux-x64-min      # Linux build (also: vscode-win32-x64-min for Windows)
+./build/lightchain/package-mac.sh arm64      # macOS DMG (x64 for Intel Macs)
+.\build\lightchain\package-win.ps1 x64        # Windows installer + portable zip (run on Windows)
+npm run gulp vscode-linux-x64-min            # Linux build
 ```
 
-The DMG is unsigned unless these are set; macOS then asks users to right-click → **Open** the first time:
+The files land in `build/lightchain/out/`. Build each platform on that platform. Both are unsigned by default: macOS asks users to right-click → **Open** the first time, and Windows SmartScreen asks them to confirm. Signing and the release steps are described in [`build/lightchain/README.md`](build/lightchain/README.md).
 
-```sh
-export APPLE_SIGN_IDENTITY="Developer ID Application: <Org> (<TEAMID>)"
-export APPLE_ID=… APPLE_TEAM_ID=… APPLE_APP_PASSWORD=…   # notarization (app-specific password)
-```
+### Releases
 
-GitHub Actions (`.github/workflows/build.yml`) installs, typechecks and compiles every push. Run the workflow manually to also build a macOS DMG artifact.
+Pushing a tag like `v1.139.1` runs the **Release** workflow (`.github/workflows/release.yml`). It builds macOS arm64, macOS x64 and Windows x64 and creates a draft GitHub release with the DMGs, the Windows installer and zip, and their checksums.
+
+GitHub Actions (`.github/workflows/build.yml`) installs, typechecks and compiles every push. Run it manually to also build a macOS DMG artifact.
 
 ### Lightchain extension
 

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Builds Lightchain Studio for macOS and wraps it in a DMG.
 #
-#   ./scripts/package-mac.sh [arm64|x64]
+#   ./build/lightchain/package-mac.sh [arm64|x64]
+#
+# Output: build/lightchain/out/LightchainStudio-<version>-darwin-<arch>.dmg (+ .sha256)
 #
 # Signing and notarization run only when these are set (otherwise the DMG is
 # unsigned and macOS asks users to right-click → Open the first time):
@@ -10,11 +12,13 @@
 set -euo pipefail
 
 ARCH="${1:-$(uname -m | sed 's/x86_64/x64/')}"
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
 OUT="$(dirname "$ROOT")/VSCode-darwin-$ARCH"
 APP="$OUT/Lightchain Studio.app"
 VERSION="$(node -p "require('$ROOT/package.json').version")"
-DMG="$(dirname "$ROOT")/LightchainStudio-$VERSION-$ARCH.dmg"
+DMG="$HERE/out/LightchainStudio-$VERSION-darwin-$ARCH.dmg"
+mkdir -p "$HERE/out"
 
 cd "$ROOT"
 npm run gulp "vscode-darwin-$ARCH-min"
@@ -42,4 +46,5 @@ if [[ -n "${APPLE_SIGN_IDENTITY:-}" ]]; then
 	fi
 fi
 
+(cd "$HERE/out" && shasum -a 256 "$(basename "$DMG")" > "$(basename "$DMG").sha256")
 echo "Done: $DMG"

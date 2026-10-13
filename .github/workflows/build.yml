@@ -34,12 +34,11 @@ jobs:
       - name: Package (macOS arm64)
         if: github.event_name == 'workflow_dispatch'
         run: |
-          ./scripts/package-mac.sh arm64
-          mv ../LightchainStudio-*.dmg .
+          ./build/lightchain/package-mac.sh arm64
 
       - name: Upload DMG
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: LightchainStudio-macos-arm64
-          path: LightchainStudio-*.dmg
+          path: build/lightchain/out/*.dmg
