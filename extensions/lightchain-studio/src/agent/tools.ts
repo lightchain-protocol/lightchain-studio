@@ -158,6 +158,10 @@ export const TOOLS: Tool[] = [
 			}
 			const existing = await fs.readFile(p, 'utf8').catch(() => undefined);
 			const before = existing ?? '';
+			if (existing !== undefined && existing === args.content) {
+				// a model stuck on an error tends to write the same file again: tell it, instead of asking the user to approve nothing
+				return { ok: false, output: `No change: ${rel(ctx, p)} already has exactly this content. If a build or test still fails, read the error again and change the lines it points at.` };
+			}
 			const shrink = truncatedRewrite(before, args.content);
 			if (shrink) {
 				return { ok: false, output: shrink };

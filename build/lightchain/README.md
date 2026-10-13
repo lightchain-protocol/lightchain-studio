@@ -27,5 +27,7 @@ The workflow can also be run by hand (*Actions → Release → Run workflow*). W
 
 ## Signing
 
-- **macOS.** Set the repository secrets `APPLE_SIGN_IDENTITY`, `APPLE_ID`, `APPLE_TEAM_ID` and `APPLE_APP_PASSWORD` to sign and notarize (the certificate must be in the runner's keychain). Without them the DMG is unsigned and macOS asks users to right-click → **Open** the first time.
+- **macOS.** Add these repository secrets and the Release workflow signs and notarizes the app: `APPLE_CERT_P12_BASE64` (your Developer ID Application certificate exported as .p12, base64-encoded), `APPLE_CERT_PASSWORD`, `APPLE_SIGN_IDENTITY` (`Developer ID Application: <Org> (<TEAMID>)`), `APPLE_ID`, `APPLE_TEAM_ID` and `APPLE_APP_PASSWORD` (an app-specific password). Without them the app is signed ad hoc, which has two visible costs:
+  - macOS asks users to confirm the first launch (System Settings → Privacy & Security → **Open Anyway**).
+  - Wallet keys live in the macOS keychain, and an ad-hoc signature is a new identity on every build, so after each update macOS asks for the login password before Lightchain Studio may read its own keychain entry (*"wants to use your confidential information stored in Lightchain Studio Safe Storage"*). **Always Allow** silences it until the next update; a Developer ID signature removes it for good.
 - **Windows.** The installer is not signed yet, so SmartScreen shows *Windows protected your PC*; users choose *More info → Run anyway*. Signing needs a code signing certificate.

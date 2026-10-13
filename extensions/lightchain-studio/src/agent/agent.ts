@@ -161,6 +161,8 @@ const MAX_FIX_ROUNDS = 2;
 
 export class Agent {
 	private history: ChatMessage[];
+	/** The latest forge build / forge test of the running or last turn (undefined: none ran). */
+	lastCheck?: { command: string; ok: boolean; output: string };
 
 	constructor(private provider: InferenceProvider, private readonly ctx: ToolContext, private profile?: AgentProfile) {
 		this.history = [{ role: 'system', content: systemPrompt(vscode.workspace.name ?? 'workspace', profile) }];
@@ -213,6 +215,7 @@ export class Agent {
 
 	async run(userText: string, events: AgentEvents, signal: AbortSignal, request?: string): Promise<void> {
 		const mark = this.history.length;
+		this.lastCheck = undefined;
 		try {
 			await this.loop(userText, events, signal, request ?? userText);
 		} catch (err) {
@@ -257,6 +260,7 @@ export class Agent {
 						events.onToolStart(call);
 						const result = await build.run({}, this.ctx).catch(err => ({ ok: false, output: (err as Error).message }));
 						events.onToolEnd(call, result);
+						this.lastCheck = { command: 'forge build', ...result };
 						unbuilt = !result.ok;
 						if (!result.ok && fixRounds < MAX_FIX_ROUNDS) {
 							fixRounds++;
@@ -271,6 +275,7 @@ export class Agent {
 							events.onToolStart(tcall);
 							const tres = await test.run({}, this.ctx).catch(err => ({ ok: false, output: (err as Error).message }));
 							events.onToolEnd(tcall, tres);
+							this.lastCheck = { command: 'forge test', ...tres };
 							if (!tres.ok && fixRounds < MAX_FIX_ROUNDS) {
 								fixRounds++;
 								unbuilt = true; // check again after the fix
@@ -312,6 +317,9 @@ export class Agent {
 				}
 				if (call.name === 'forge_build') {
 					unbuilt = !result.ok;
+				}
+				if (call.name === 'forge_build' || call.name === 'forge_test') {
+					this.lastCheck = { command: call.name.replace('_', ' '), ok: result.ok, output: result.output };
 				}
 				results.push(`Result of ${call.name}${result.ok ? '' : ' (error)'}:\n${result.output}`);
 			}

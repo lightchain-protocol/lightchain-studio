@@ -314,3 +314,21 @@ test('agents from a description: local draft is safe, AI reply is parsed strictl
 		assert.ok(t.name && t.summary && t.role && t.starters.length, t.id);
 	}
 });
+
+test('write_file: writing the same content again is refused without asking the user', async () => {
+	const { TOOLS } = await import('../src/agent/tools');
+	const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'lc-tools-')));
+	try {
+		let asked = 0;
+		const ctx = { root, approve: async () => { asked++; return true; } } as never;
+		const write = TOOLS.find(t => t.name === 'write_file')!;
+		assert.ok((await write.run({ path: 'src/A.sol', content: 'contract A {}\n' }, ctx)).ok);
+		const again = await write.run({ path: 'src/A.sol', content: 'contract A {}\n' }, ctx);
+		assert.equal(again.ok, false);
+		assert.match(again.output, /No change: src\/A\.sol already has exactly this content/);
+		assert.equal(asked, 1);
+		assert.ok((await write.run({ path: 'src/A.sol', content: 'contract A { uint256 x; }\n' }, ctx)).ok);
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});

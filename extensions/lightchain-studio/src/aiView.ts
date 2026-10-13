@@ -83,6 +83,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	tasks?: TaskStore;
 	private plannedTasks: { title: string; description?: string }[] = [];
 	private lastTurnOk = false;
+	private brokenTurn?: { id: string; command: string; output: string }; // the last turn left the build or tests failing
 	private readonly chatsChanged = new vscode.EventEmitter<void>();
 	readonly onDidChangeChats = this.chatsChanged.event;
 	private turnJobs: { jobId: string; txHash?: string }[] = []; // on-chain jobs of the running turn
@@ -289,6 +290,22 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			case 'ready':
 				this.postAgents();
 				return this.replay();
+			case 'fixLast':
+				if (this.brokenTurn) {
+					const { command, output } = this.brokenTurn;
+					this.brokenTurn = undefined;
+					this.post({ type: 'cardRemove', id: 'broken' });
+					return this.fixFailure(command, output);
+				}
+				return;
+			case 'undoLast':
+				if (this.brokenTurn) {
+					const { id } = this.brokenTurn;
+					this.brokenTurn = undefined;
+					this.post({ type: 'cardRemove', id: 'broken' });
+					return this.undoTurn(id);
+				}
+				return;
 			case 'topUp': {
 				// add credits from the chat header
 				const account = this.wallet.active;
@@ -565,7 +582,19 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 			const changed = this.checkpoints.get(turnId);
 			if (changed?.size) {
 				const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
-				this.post({ type: 'checkpoint', id: turnId, files: [...changed.keys()].map(f => path.relative(root, f)) });
+				// files changed but the last build or test run failed: say so, and don't invite a deploy
+				const check = this.agent?.lastCheck;
+				const broken = !!check && !check.ok && !this.abort?.signal.aborted;
+				this.post({ type: 'checkpoint', id: turnId, files: [...changed.keys()].map(f => path.relative(root, f)), broken });
+				if (broken && check) {
+					this.brokenTurn = { id: turnId, command: check.command, output: check.output };
+					const first = check.output.split('\n').map(l => l.trim()).find(l => /error|fail/i.test(l)) ?? check.output.trim().split('\n')[0] ?? '';
+					this.post({
+						type: 'card', id: 'broken', title: check.command === 'forge test' ? 'The tests fail after these changes' : 'The project does not build after these changes', state: 'Needs a fix', stateKind: 'err',
+						detail: `${first.slice(0, 200)}${first ? '\n' : ''}Lightchain AI stopped before it was fixed. Let it try again, or undo the changes from this request.`,
+						actions: [{ label: 'Fix it', command: 'fixLast' }, { label: 'Undo the changes', command: 'undoLast', ghost: true }],
+					});
+				}
 			} else {
 				this.checkpoints.delete(turnId);
 			}
@@ -1812,7 +1841,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 				const b = smallBtn('Undo', false, () => { b.disabled = true; vscode.postMessage({ type: 'undoTurn', id: m.id }); setTimeout(() => { b.disabled = false; }, 1500); });
 				b.title = 'Restore these files to how they were before this turn';
 				// a contract was written: offer to deploy it straight from the chat
-				if (m.files.some(f => /^src\\/.*\\.sol$/.test(f))) {
+				if (!m.broken && m.files.some(f => /^src\\/.*\\.sol$/.test(f))) {
 					const d = smallBtn('Deploy', false, () => vscode.postMessage({ type: 'command', command: 'lightchain.deployContract' }));
 					d.title = 'Deploy a contract from this project (build, constructor arguments, confirm)';
 					row.append(d);
