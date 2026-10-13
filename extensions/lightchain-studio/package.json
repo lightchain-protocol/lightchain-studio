@@ -377,6 +377,17 @@
 				"icon": "$(pulse)"
 			},
 			{
+				"command": "lightchain.tasks.background",
+				"title": "Do a Task in the Background",
+				"category": "Lightchain",
+				"icon": "$(git-pull-request)"
+			},
+			{
+				"command": "lightchain.tasks.backgroundMenu",
+				"title": "Background Work",
+				"category": "Lightchain"
+			},
+			{
 				"command": "lightchain.launcher",
 				"title": "What Do You Want to Do?",
 				"category": "Lightchain",

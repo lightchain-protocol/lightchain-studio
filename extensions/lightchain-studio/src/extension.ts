@@ -14,6 +14,8 @@ import { DashboardPanel } from './chain/dashboardPanel';
 import { MapPanel } from './chain/mapPanel';
 import { AppPanel } from './chain/appPanel';
 import { showLauncher } from './launcher';
+import { BackgroundAgents } from './backgroundRunner';
+import { JOB_FEE_LCAI } from './credits';
 import { describeSimulation, simulate } from './chain/simulate';
 import { findForge } from './foundry';
 import * as nodePath from 'node:path';
@@ -114,7 +116,12 @@ export function activate(context: vscode.ExtensionContext): void {
 		vscode.commands.registerCommand('lightchain.agents.new', () => studio.startNew()));
 	const tasks = new TaskStore();
 	ai.tasks = tasks;
-	const board = new BoardPanel(context.extensionUri, tasks, t => ai.runTask(t), goal => ai.plan(goal));
+	const background = new BackgroundAgents(context, tasks, () => ai.sideProvider(), () => profiles.get('builder'), JOB_FEE_LCAI);
+	const board = new BoardPanel(context.extensionUri, tasks, t => ai.runTask(t), goal => ai.plan(goal), id => background.stateOf(id));
+	context.subscriptions.push(background, background.onDidChange(() => board.refresh()),
+		vscode.commands.registerCommand('lightchain.tasks.background', (id?: string) => background.start(typeof id === 'string' ? id : undefined)),
+		vscode.commands.registerCommand('lightchain.tasks.backgroundMenu', () => background.menu()),
+		vscode.commands.registerCommand('lightchain.tasks.backgroundReview', (id: string) => background.review(id)));
 	const home = new WorkspaceView(context.extensionUri, ai, tasks);
 	// "Your first dApp": build → test → deploy → interact → ask Lightchain AI
 	const startKey = (k: string) => `lightchain.start.${k}`;

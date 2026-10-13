@@ -133,3 +133,77 @@ test('profiles are enforced: a read-only agent cannot write, even if the model t
 	assert.match(m.seen[1], /not available to this agent/);
 	assert.equal(fs.existsSync(path.join(root, 'src/Evil.sol')), false);
 });
+
+// ---- background work: its own branch and working copy --------------------------------------
+import { spawnSync } from 'node:child_process';
+import { branchFor, discardWork, git, mergeWork, notReady, runInBackground } from '../src/agent/background';
+
+function repo() {
+	const { root, forge } = project();
+	const run = (...args: string[]) => { const r = spawnSync('git', args, { cwd: root }); if (r.status !== 0) { throw new Error(String(r.stderr)); } };
+	run('init', '-q', '-b', 'main');
+	run('config', 'user.name', 'Tester'); run('config', 'user.email', 'tester@example.invalid'); run('config', 'commit.gpgsign', 'false');
+	fs.writeFileSync(path.join(root, 'src', 'Counter.sol'), 'pragma solidity ^0.8.24;\ncontract Counter { uint256 public number; }\n');
+	fs.writeFileSync(path.join(root, '.gitignore'), 'lib/\nfake-forge.sh\n');
+	fs.mkdirSync(path.join(root, 'lib', 'forge-std'), { recursive: true });
+	fs.writeFileSync(path.join(root, 'lib', 'forge-std', 'Test.sol'), '// dependency\n');
+	run('add', '-A'); run('commit', '-q', '-m', 'first');
+	return { root, forge, work: fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'lc-work-'))) };
+}
+
+test('background work: a task is done on its own branch; the project is untouched until it is merged', async () => {
+	const { root, forge, work } = repo();
+	assert.equal(await notReady(root), undefined);
+	assert.equal(branchFor('LC-3', 'Add a decrement function!'), 'lightchain/lc-3-add-a-decrement-function');
+	const next = 'pragma solidity ^0.8.24;\ncontract Counter { uint256 public number; function decrement() external { number--; } }\n';
+	const m = fakeModel([tool({ name: 'write_file', args: { path: 'src/Counter.sol', content: next } }), tool({ name: 'run_command', args: { command: 'rm -rf /' } }), 'I added decrement() to Counter.']);
+	const progress: string[] = [];
+	const result = await runInBackground({ root, workDir: work, key: 'LC-3', title: 'Add a decrement function', prompt: 'Add decrement', provider: m.provider, forgePath: forge, profile: { ...BUILTIN_AGENTS[0], can: { ...BUILTIN_AGENTS[0].can, run: true } }, signal: new AbortController().signal, onProgress: t => progress.push(t) });
+	assert.equal(result.ok, true, result.problem);
+	assert.deepEqual(result.files, ['src/Counter.sol']);
+	assert.equal(result.branch, 'lightchain/lc-3-add-a-decrement-function');
+	assert.equal(result.summary, 'I added decrement() to Counter.');
+	assert.ok(progress.includes('Writing src/Counter.sol') && progress.includes('Checking that it compiles'), progress.join(' | '));
+	assert.ok(m.seen.some(s => /rejected|not approved|declined/i.test(s)), 'a terminal command is never run unattended');
+	// the user's files and branch are as they were
+	assert.ok(!fs.readFileSync(path.join(root, 'src', 'Counter.sol'), 'utf8').includes('decrement'));
+	assert.equal((await git(root, ['rev-parse', '--abbrev-ref', 'HEAD'])).trim(), 'main');
+	assert.equal((await git(root, ['status', '--porcelain'])).trim(), '');
+	// dependencies were linked for the build, and not committed
+	assert.ok(fs.lstatSync(path.join(result.worktree, 'lib')).isSymbolicLink());
+	assert.equal((await git(root, ['log', '-1', '--format=%s', result.branch])).trim(), 'LC-3: Add a decrement function');
+	assert.equal((await git(root, ['show', '--name-only', '--format=', result.branch])).trim(), 'src/Counter.sol');
+
+	const merged = await mergeWork(root, result);
+	assert.equal(merged.ok, true, merged.message);
+	assert.ok(fs.readFileSync(path.join(root, 'src', 'Counter.sol'), 'utf8').includes('decrement'));
+	assert.ok(!fs.existsSync(result.worktree));
+	assert.equal((await git(root, ['branch', '--list', result.branch])).trim(), '');
+});
+
+test('background work: a broken result is reported, a conflict is not forced, discarding leaves no trace', async () => {
+	const { root, forge, work } = repo();
+	const bad = 'pragma solidity ^0.8.24;\ncontract Counter { uint x = 1 }\n';
+	const m = fakeModel([tool({ name: 'write_file', args: { path: 'src/Counter.sol', content: bad } }), 'Done.', 'Still done.', 'Done again.']);
+	const result = await runInBackground({ root, workDir: work, key: 'LC-4', title: 'Break it', prompt: 'x', provider: m.provider, forgePath: forge, profile: BUILTIN_AGENTS[0], signal: new AbortController().signal });
+	assert.equal(result.ok, false);
+	assert.equal(result.problem, 'The project does not build with these changes.');
+	// meanwhile the user changed the same file: the merge must not go through, and nothing is lost
+	fs.writeFileSync(path.join(root, 'src', 'Counter.sol'), 'pragma solidity ^0.8.24;\ncontract Counter { uint256 public total; }\n');
+	spawnSync('git', ['commit', '-qam', 'mine'], { cwd: root });
+	const merged = await mergeWork(root, result);
+	assert.equal(merged.ok, false);
+	assert.match(merged.message, /Nothing in your project was changed/);
+	assert.ok(fs.readFileSync(path.join(root, 'src', 'Counter.sol'), 'utf8').includes('total'));
+	assert.equal((await git(root, ['status', '--porcelain'])).trim(), '');
+	await discardWork(root, result);
+	assert.ok(!fs.existsSync(result.worktree));
+	assert.equal((await git(root, ['branch', '--list', 'lightchain/*'])).trim(), '');
+
+	// a second task with the same name gets its own branch; one that changes nothing says so
+	const idle = await runInBackground({ root, workDir: work, key: 'LC-5', title: 'Nothing', prompt: 'x', provider: fakeModel(['Nothing to do.']).provider, forgePath: forge, signal: new AbortController().signal });
+	assert.deepEqual([idle.ok, idle.problem, idle.files], [false, 'It finished without changing any file.', []]);
+	await discardWork(root, idle);
+	const plain = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-plain-'));
+	assert.match((await notReady(plain))!, /not a git repository/);
+});

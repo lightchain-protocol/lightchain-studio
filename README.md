@@ -41,6 +41,7 @@ The builds are not signed yet. On first launch macOS asks via System Settings â†
 - **Launcher.** The search box in the title bar opens *What do you want to do?*: Lightchain actions in plain words, with files and every editor command still one step away.
 - **Lightchain home** (left side bar): switch projects in one click, search your chats grouped by day, and keep the project's tasks at hand.
 - **Task board.** To do / In progress / Review / Done with drag and drop, priorities and labels, stored in `.lightchain/tasks.json` so a team shares it through git. Hand a task to Lightchain AI with *Do with AI*, or let `/plan` break a goal into tasks.
+- **Background agents.** *Do it in the background* on a task (or *Lightchain: Do a Task in the Background*) lets Lightchain AI work while you keep going: on its own git branch in a separate working copy, so your files are untouched. It never runs terminal commands and has a request limit. When it is done you see the changes side by side, then merge or discard them.
 - **Commit with Lightchain AI** writes a commit message for your changes into Source Control; you review it and commit.
 - **Credits.** Top up and withdraw Lightchain AI credits (LCAI held in the JobRegistry contract) from the Wallet section in the Explorer, which also shows what you have spent and roughly how many requests are left. Fees of stalled jobs can be reclaimed once their window opens.
 - **Wallet.**
@@ -177,6 +178,7 @@ Network settings live in `extensions/lightchain-studio/src/networks.ts`.
   - `src/newProjectPanel.ts`, `src/templates.ts`, `src/deployWizard.ts`, `src/commitMessage.ts`: new project window, templates, deploy wizard and commit messages.
   - `src/chain/`: the on-chain tools â€” `security.ts` (the checks), `simulate.ts` (private fork), `txDebug.ts`, `abiIndex.ts` (decoding calls, events and reverts), `gas.ts`, `graph.ts` (contract map), `appTemplate.ts`, and their tabs.
   - `src/launcher.ts`: the title bar launcher.
+  - `src/agent/background.ts`, `src/backgroundRunner.ts`: background work on a git worktree, and its review / merge / discard flow.
   - `src/ui/site.ts`: the shared Lightchain design tokens and components for the webviews.
   - `test/`: unit tests, run with `npm test` in `tools/`.
   - `src/wallet.ts`, `src/browserBridge.ts`, `src/connectPage.ts`, `src/keystore.ts`: local accounts in SecretStorage, and the browser wallet bridge. The bridge is a loopback page that discovers wallets through EIP-6963 and relays requests over SSE/POST, protected by a token plus Host and Origin checks.

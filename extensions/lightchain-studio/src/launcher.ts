@@ -26,6 +26,7 @@ const ACTIONS: (Entry | { group: string })[] = [
 	{ label: '$(shield) Fix security problems', description: 'In the file you have open', command: 'lightchain.security.fixAll' },
 	{ group: 'Project' },
 	{ label: '$(checklist) Task board', command: 'lightchain.tasks.board' },
+	{ label: '$(git-pull-request) Do a task in the background', description: 'On its own branch; you review and merge', command: 'lightchain.tasks.background' },
 	{ label: '$(key) Wallet', description: 'Accounts and credits', command: 'lightchain.wallet.menu' },
 	{ group: 'Go to' },
 	{ label: '$(file) Open a file…', description: 'By name', command: 'workbench.action.quickOpen' },

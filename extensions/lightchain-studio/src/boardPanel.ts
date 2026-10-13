@@ -12,6 +12,8 @@ export class BoardPanel implements vscode.Disposable {
 		private readonly tasks: TaskStore,
 		private readonly runTask: (task: Task) => Promise<void>,
 		private readonly plan: (goal: string) => Promise<void>,
+		/** Whether Lightchain AI is doing (or has done) a task in the background. */
+		private readonly background: (taskId: string) => 'running' | 'ready' | 'problem' | undefined = () => undefined,
 	) {
 		this.disposables.push(tasks.onDidChange(() => this.push()));
 	}
@@ -31,11 +33,17 @@ export class BoardPanel implements vscode.Disposable {
 		this.push(focusId);
 	}
 
+	/** Redraws the board (background work changed). */
+	refresh(): void {
+		this.push();
+	}
+
 	private push(focusId?: string): void {
 		const folder = vscode.workspace.workspaceFolders?.[0];
 		void this.panel?.webview.postMessage({
 			type: 'state', project: folder?.name ?? null, prefix: this.tasks.prefix, focus: focusId,
 			tasks: this.tasks.all, statuses: STATUSES,
+			background: Object.fromEntries(this.tasks.all.map(t => [t.id, this.background(t.id)]).filter(([, v]) => v)),
 		});
 	}
 
@@ -79,6 +87,8 @@ export class BoardPanel implements vscode.Disposable {
 				}
 				return;
 			}
+			case 'background':
+				return void vscode.commands.executeCommand(m.review ? 'lightchain.tasks.backgroundReview' : 'lightchain.tasks.background', String(m.id));
 			case 'ai': {
 				const t = this.tasks.all.find(x => x.id === m.id);
 				if (t) {
@@ -244,9 +254,13 @@ export class BoardPanel implements vscode.Disposable {
 		li.onchange = () => save({ labels: li.value.split(',').map(s => s.trim()).filter(Boolean) }); lf.append(li);
 		const actions = el('div', 'b-detail__actions');
 		const ai = el('button', 'cta', 'Do with Lightchain AI'); ai.onclick = () => vscode.postMessage({ type: 'ai', id: t.id });
+		const bgState = (state.background || {})[t.id];
+		const bg = el('button', 'btn', bgState === 'running' ? 'Working in the background…' : bgState ? 'Review its work' : 'Do it in the background'); bg.disabled = bgState === 'running';
+		bg.title = bgState ? 'Look at what Lightchain AI changed, then merge or discard it' : 'Lightchain AI works on its own git branch while you keep going; you review and merge';
+		bg.onclick = () => vscode.postMessage({ type: 'background', id: t.id, review: !!bgState });
 		const del = el('button', 'btn', 'Delete'); del.onclick = () => vscode.postMessage({ type: 'delete', id: t.id });
-		actions.append(ai, del);
-		const hint = el('div', 'b-hint', 'Lightchain AI gets the title and description, makes the changes, builds and tests them. The task moves to In progress.');
+		actions.append(ai, bg, del);
+		const hint = el('div', 'b-hint', bgState === 'problem' ? 'Lightchain AI finished in the background, but the result needs a look before you take it.' : 'With you: it works in the chat and you approve each change. In the background: it works on a separate git branch and you review the result.');
 		d.append(top, title, desc, row, lf, actions, hint);
 	}
 

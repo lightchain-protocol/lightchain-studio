@@ -41,6 +41,24 @@
 
 /* Linux: add `system-ui` as first font and not `Ubuntu` to allow other distribution pick their standard OS font */
 .monaco-workbench.linux { font-family: "Inter", system-ui, "Ubuntu", "Droid Sans", sans-serif; }
+/* Lightchain: the launcher and every quick pick use the app's menu look (lightchain-p2p: surface-2 panel,
+   hairline edge, 2px input edge that turns accent on focus, rows that light up on the active item). */
+.monaco-workbench .quick-input-widget { padding: 6px 6px 8px; border: 1px solid rgba(255, 255, 255, 0.14) !important; border-radius: 14px !important; background: #0f0f14 !important; box-shadow: 0 24px 80px rgba(0, 0, 0, 0.55), 0 0 20px 5px rgba(112, 100, 233, 0.1) !important; }
+.monaco-workbench .quick-input-widget .quick-input-header { padding: 6px 6px 8px; }
+.monaco-workbench .quick-input-widget .quick-input-filter .monaco-inputbox { border: 2px solid rgba(255, 255, 255, 0.1) !important; border-radius: 10px !important; background: transparent !important; outline: none !important; transition: border-color 300ms ease; }
+.monaco-workbench .quick-input-widget .quick-input-filter .monaco-inputbox.synthetic-focus { border-color: #5b4bff !important; }
+.monaco-workbench .quick-input-widget .quick-input-filter .monaco-inputbox input { height: 34px; padding: 0 12px; font-size: 14px; }
+.monaco-workbench .quick-input-widget .quick-input-list .monaco-list-row { border-radius: 8px; }
+.monaco-workbench .quick-input-widget .quick-input-list .monaco-list-row.focused { background: #14152c !important; outline: none !important; }
+.monaco-workbench .quick-input-widget .quick-input-list .monaco-list-row .codicon { color: #7376aa; }
+.monaco-workbench .quick-input-widget .quick-input-list .monaco-list-row.focused .codicon { color: #5b4bff; }
+.monaco-workbench .quick-input-widget .quick-input-list .monaco-list-row .label-name { color: #ccceef; font-weight: 500; }
+.monaco-workbench .quick-input-widget .quick-input-list .monaco-list-row.focused .label-name { color: #f5f6ff; }
+.monaco-workbench .quick-input-widget .quick-input-list .monaco-list-row .label-description { color: #7376aa !important; opacity: 1 !important; }
+.monaco-workbench .quick-input-widget .quick-input-list .quick-input-list-separator { color: #7376aa !important; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase; }
+.monaco-workbench .quick-input-widget .quick-input-list .quick-input-list-entry.quick-input-list-separator-border { border-top-color: rgba(255, 255, 255, 0.08) !important; }
+.monaco-workbench .quick-input-widget .quick-input-list .monaco-list, .monaco-workbench .quick-input-widget .quick-input-list .monaco-list-rows { background: transparent !important; }
+
 .monaco-workbench.linux:lang(zh-Hans) { font-family: system-ui, "Ubuntu", "Droid Sans", "Source Han Sans SC", "Source Han Sans CN", "Source Han Sans", sans-serif; }
 .monaco-workbench.linux:lang(zh-Hant) { font-family: system-ui, "Ubuntu", "Droid Sans", "Source Han Sans TC", "Source Han Sans TW", "Source Han Sans", sans-serif; }
 .monaco-workbench.linux:lang(ja) { font-family: system-ui, "Ubuntu", "Droid Sans", "Source Han Sans J", "Source Han Sans JP", "Source Han Sans", sans-serif; }
