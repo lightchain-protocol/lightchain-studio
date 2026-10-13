@@ -87,7 +87,7 @@ Then reload the window (*Developer: Reload Window*).
    - *Connect Browser Wallet* opens a local page (`http://localhost:3000`) where you pick your browser wallet once. Keep the tab open; signing requests from the IDE appear there and in your wallet.
    - Or *Create Account*, *Import Private Key* or *Import Recovery Phrase* for a local account.
 3. **Get testnet LCAI.** Claim it from the Wallet section in the Explorer or the checklist in the Lightchain AI panel (or use the [Lightchain faucet](https://lightfaucet.ai) directly).
-4. **Top up credits.** Use *Top Up* in the Wallet section, or run *Lightchain: Top Up Credits*. On your first prompt, Lightchain AI asks once for permission to spend your credits; approve it and your message is sent automatically.
+4. **Top up credits.** Use *Add credits* in the Wallet section, or run *Lightchain: Top Up Credits*. On your first prompt, Lightchain AI asks once for permission to spend your credits; approve it and your message is sent automatically.
 5. **Ask Lightchain AI.** Type in the panel on the right, for example: *Create an ERC-20 token with a deploy script*. Pick an agent next to the model if you want a specific one (for example the Auditor). Review each proposed change in the file and accept or reject it.
 6. **Build, test, deploy.** Use *Lightchain: Build*, *Lightchain: Test* and *Lightchain: Deploy Script* from the Command Palette (⇧⌘P). Deployed contracts appear in **Deployed Programs**; use **Interact** to call them.
 7. **Plan the work.** Run *Lightchain: Open Task Board* to track tasks, and *Lightchain: Open Agent Studio* to see or change how the agents work.
