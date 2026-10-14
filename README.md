@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="resources/linux/code.png" width="112" alt="Lightchain Studio">
+  <img src="docs/images/lightchain-mark.png" width="128" alt="Lightchain Studio">
 </p>
 
 <h1 align="center">Lightchain Studio</h1>
