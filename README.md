@@ -112,6 +112,7 @@ Pass a folder to open it directly: `./scripts/code.sh path/to/project`.
 ./scripts/package-mac.sh arm64                 # macOS DMG (x64 for Intel)
 npm run gulp vscode-linux-x64-min              # Linux   → ../VSCode-linux-x64
 npm run gulp vscode-win32-x64-min              # Windows → ../VSCode-win32-x64
+npm run gulp vscode-win32-x64-inno-updater     # then the installer:
 npm run gulp vscode-win32-x64-user-setup       # Windows installer (.build/win32-x64/user-setup)
 ```
 

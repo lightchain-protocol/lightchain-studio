@@ -133,6 +133,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Force dist | Out-Null
           Compress-Archive -Path "..\VSCode-win32-x64\*" -DestinationPath "dist\LightchainStudio-$v-win32-x64.zip"
+          npm run gulp vscode-win32-x64-inno-updater
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npm run gulp vscode-win32-x64-user-setup
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $setup = Get-ChildItem ".build\win32-x64\user-setup" -Filter *.exe | Select-Object -First 1
