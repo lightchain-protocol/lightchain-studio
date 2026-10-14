@@ -11,6 +11,10 @@ on:
       version:
         description: Version to label the packages with (for example 0.1.0)
         required: true
+      only:
+        description: Build a single platform (macos, linux, windows) or leave empty for all
+        required: false
+        default: ''
 
 env:
   NODE_OPTIONS: --max-old-space-size=8192
@@ -31,6 +35,7 @@ jobs:
 
   macos:
     needs: version
+    if: ${{ !inputs.only || inputs.only == 'macos' }}
     strategy:
       fail-fast: false
       matrix:
@@ -67,10 +72,18 @@ jobs:
 
   linux:
     needs: version
+    if: ${{ !inputs.only || inputs.only == 'linux' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+      - name: Add swap (the minifier needs more than the runner's RAM)
+        run: |
+          sudo fallocate -l 10G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
@@ -95,6 +108,7 @@ jobs:
 
   windows:
     needs: version
+    if: ${{ !inputs.only || inputs.only == 'windows' }}
     runs-on: windows-2022
     timeout-minutes: 120
     steps:
@@ -125,7 +139,7 @@ jobs:
 
   publish:
     needs: [version, macos, linux, windows]
-    if: always() && needs.version.result == 'success'
+    if: always() && needs.version.result == 'success' && contains(needs.*.result, 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: write
