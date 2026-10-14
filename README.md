@@ -22,12 +22,12 @@ Lightchain Studio is built on [Code - OSS](https://github.com/microsoft/vscode),
 
 ## Download
 
-| Platform | Package |
-|---|---|
-| macOS (Apple Silicon) | `LightchainStudio-<version>-darwin-arm64.dmg` |
-| macOS (Intel) | `LightchainStudio-<version>-darwin-x64.dmg` |
-| Windows (x64) | `LightchainStudio-<version>-win32-x64-setup.exe` or the portable `.zip` |
-| Linux (x64) | `LightchainStudio-<version>-linux-x64.tar.gz` |
+| | Platform | Package |
+|:-:|---|---|
+| 🍎 | macOS, Apple Silicon | `LightchainStudio-<version>-macOS-AppleSilicon.dmg` |
+| 🍎 | macOS, Intel | `LightchainStudio-<version>-macOS-Intel.dmg` |
+| 🪟 | Windows 10 / 11, x64 | `LightchainStudio-<version>-Windows-x64-Setup.exe` (installer) or `-Portable.zip` |
+| 🐧 | Linux, x64 | `LightchainStudio-<version>-Linux-x64.tar.gz` |
 
 All builds are on the [Releases](https://github.com/lightchain-protocol/lightchain-studio/releases) page. The macOS DMG is unsigned unless a release was signed with an Apple Developer ID. If macOS blocks it, right-click the app and choose **Open** once.
 

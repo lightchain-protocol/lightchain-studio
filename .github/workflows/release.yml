@@ -42,8 +42,10 @@ jobs:
         include:
           - arch: arm64
             runner: macos-14
+            label: AppleSilicon
           - arch: x64
             runner: macos-15-intel
+            label: Intel
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     steps:
@@ -63,7 +65,7 @@ jobs:
         run: |
           ./scripts/package-mac.sh ${{ matrix.arch }}
           mkdir -p dist
-          mv ../LightchainStudio-*-${{ matrix.arch }}.dmg "dist/LightchainStudio-${{ needs.version.outputs.version }}-darwin-${{ matrix.arch }}.dmg"
+          mv ../LightchainStudio-*-${{ matrix.arch }}.dmg "dist/LightchainStudio-${{ needs.version.outputs.version }}-macOS-${{ matrix.label }}.dmg"
       - uses: actions/upload-artifact@v4
         with:
           name: darwin-${{ matrix.arch }}
@@ -104,7 +106,7 @@ jobs:
         run: |
           npm run gulp vscode-linux-x64-min
           mkdir -p dist
-          tar -C .. --transform 's|^VSCode-linux-x64|lightchain-studio|' -czf "dist/LightchainStudio-${{ needs.version.outputs.version }}-linux-x64.tar.gz" VSCode-linux-x64
+          tar -C .. --transform 's|^VSCode-linux-x64|lightchain-studio|' -czf "dist/LightchainStudio-${{ needs.version.outputs.version }}-Linux-x64.tar.gz" VSCode-linux-x64
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x64
@@ -131,13 +133,13 @@ jobs:
           npm run gulp vscode-win32-x64-min
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Force dist | Out-Null
-          Compress-Archive -Path "..\VSCode-win32-x64\*" -DestinationPath "dist\LightchainStudio-$v-win32-x64.zip"
+          Compress-Archive -Path "..\VSCode-win32-x64\*" -DestinationPath "dist\LightchainStudio-$v-Windows-x64-Portable.zip"
           npm run gulp vscode-win32-x64-inno-updater
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npm run gulp vscode-win32-x64-user-setup
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $setup = Get-ChildItem ".build\win32-x64\user-setup" -Filter *.exe | Select-Object -First 1
-          Move-Item $setup.FullName "dist\LightchainStudio-$v-win32-x64-setup.exe"
+          Move-Item $setup.FullName "dist\LightchainStudio-$v-Windows-x64-Setup.exe"
       - uses: actions/upload-artifact@v4
         with:
           name: win32-x64
@@ -167,11 +169,46 @@ jobs:
           { cat new.sums; grep -v -F -f <(cut -c67- new.sums) old.sums || true; } | sort -k2 > SHA256SUMS.txt
           rm -f new.sums old.sums
           cat SHA256SUMS.txt
+      - name: Release notes
+        env:
+          V: ${{ needs.version.outputs.version }}
+          TAG: ${{ github.event_name == 'push' && github.ref_name || format('v{0}', needs.version.outputs.version) }}
+        run: |
+          D="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          cat > notes.md <<EOF
+          ## Download
+
+          | | Platform | Download |
+          |:-:|---|---|
+          | 🍎 | **macOS** Apple Silicon (M1 and newer) | [LightchainStudio-${V}-macOS-AppleSilicon.dmg](${D}/LightchainStudio-${V}-macOS-AppleSilicon.dmg) |
+          | 🍎 | **macOS** Intel | [LightchainStudio-${V}-macOS-Intel.dmg](${D}/LightchainStudio-${V}-macOS-Intel.dmg) |
+          | 🪟 | **Windows** 10 / 11, x64 installer | [LightchainStudio-${V}-Windows-x64-Setup.exe](${D}/LightchainStudio-${V}-Windows-x64-Setup.exe) |
+          | 🪟 | **Windows** x64 portable (no install) | [LightchainStudio-${V}-Windows-x64-Portable.zip](${D}/LightchainStudio-${V}-Windows-x64-Portable.zip) |
+          | 🐧 | **Linux** x64 | [LightchainStudio-${V}-Linux-x64.tar.gz](${D}/LightchainStudio-${V}-Linux-x64.tar.gz) |
+
+          Not sure which Mac you have? Apple menu → *About This Mac*: "Apple M1/M2/M3/M4" means Apple Silicon, "Intel" means Intel.
+
+          ## Install
+
+          **macOS.** Open the DMG and drag **Lightchain Studio** to Applications. If the build is not notarized, the first time right-click the app and choose **Open**, then **Open** again.
+
+          **Windows.** Run the Setup installer, or unzip the portable build anywhere and start \`Lightchain Studio.exe\`. If SmartScreen appears, choose *More info* → *Run anyway*.
+
+          **Linux.** \`tar -xzf LightchainStudio-${V}-Linux-x64.tar.gz\` then run \`lightchain-studio/lc-studio\`.
+
+          ## Verify
+
+          \`SHA256SUMS.txt\` lists the checksum of every file above. On macOS or Linux: \`sha256sum -c SHA256SUMS.txt --ignore-missing\`.
+
+          ## Changes
+          EOF
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event_name == 'push' && github.ref_name || format('v{0}', needs.version.outputs.version) }}
           name: Lightchain Studio ${{ needs.version.outputs.version }}
+          body_path: notes.md
           generate_release_notes: true
+          make_latest: true
           files: packages/*
           fail_on_unmatched_files: true
