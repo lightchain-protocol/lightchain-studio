@@ -453,7 +453,8 @@ function packageTask(type: string, platform: string, arch: string, sourceFolderN
 function hasAuthenticodeSignature(filePath: string): Promise<boolean> {
 	return new Promise((resolve, reject) => {
 		const proc = cp.spawn('signtool.exe', ['verify', '/pa', filePath]);
-		proc.on('error', reject);
+		// Lightchain Studio: no signtool on the build machine means the binary is unsigned.
+		proc.on('error', (err: NodeJS.ErrnoException) => err.code === 'ENOENT' ? resolve(false) : reject(err));
 		proc.on('exit', code => resolve(code === 0));
 	});
 }

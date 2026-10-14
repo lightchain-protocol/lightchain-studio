@@ -47,6 +47,8 @@ jobs:
         with:
           node-version-file: .nvmrc
       - run: npm ci
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Package DMG
         env:
           APPLE_SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
@@ -77,6 +79,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxkbfile-dev libsecret-1-dev libkrb5-dev
       - run: npm ci
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Package tar.gz
         run: |
           npm run gulp vscode-linux-x64-min
@@ -99,6 +103,8 @@ jobs:
         with:
           node-version-file: .nvmrc
       - run: npm ci
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Package zip and installer
         shell: pwsh
         run: |
