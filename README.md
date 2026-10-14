@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/lightchain-protocol/lightchain-studio/releases/latest"><img src="https://img.shields.io/github/v/release/lightchain-protocol/lightchain-studio?label=download&color=7C3AED" alt="Latest release"></a>
+  <a href="https://github.com/lightchain-protocol/lightchain-studio/releases/latest"><img src="https://img.shields.io/badge/download-v0.1.0-7C3AED?logo=github&logoColor=white" alt="Download v0.1.0"></a>
   <a href="https://github.com/lightchain-protocol/lightchain-studio/actions/workflows/build.yml"><img src="https://github.com/lightchain-protocol/lightchain-studio/actions/workflows/build.yml/badge.svg" alt="Build"></a>
   <a href="LICENSE.txt"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT"></a>
   <a href="https://docs.lightchain.ai"><img src="https://img.shields.io/badge/docs-lightchain.ai-F020E0" alt="Docs"></a>
