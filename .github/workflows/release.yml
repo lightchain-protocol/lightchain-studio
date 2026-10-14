@@ -77,9 +77,14 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+      - name: Free disk space (unused preinstalled toolchains)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/share/swift
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h / /mnt
       - name: Add swap (the minifier needs more than the runner's RAM)
         run: |
-          sudo fallocate -l 10G /mnt/swapfile
+          sudo fallocate -l 8G /mnt/swapfile
           sudo chmod 600 /mnt/swapfile
           sudo mkswap /mnt/swapfile
           sudo swapon /mnt/swapfile
@@ -94,6 +99,7 @@ jobs:
       - run: npm ci
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
       - name: Package tar.gz
         run: |
           npm run gulp vscode-linux-x64-min
