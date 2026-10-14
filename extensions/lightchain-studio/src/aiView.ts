@@ -735,7 +735,7 @@ export class LightchainAiView implements vscode.WebviewViewProvider, vscode.Disp
 	.lc-setup__row.done .lc-setup__n { border-color: #3eb75e; color: #3eb75e; }
 	.lc-setup__row .t { flex: 1; min-width: 0; }
 	.lc-setup__row .t small { display: block; color: #7376aa; font-size: 11px; }
-	/* Chat layout in the style of Cursor / Claude, with lightchain.ai colours and type */
+	/* Chat layout with lightchain.ai colours and type */
 	.lc-thread > * { flex: none; } /* never squash blocks; the thread scrolls instead */
 	.lc-msg-user { align-self: stretch; padding: 10px 14px; background: rgba(204, 206, 239, 0.06); border: 1px solid rgba(255, 255, 255, 0.06); border-radius: 10px; color: #f5f6ff; font-size: 15px; white-space: pre-wrap; word-break: break-word; }
 	.lc-msg-ai { color: #ccceef; font-size: 15px; word-break: break-word; }

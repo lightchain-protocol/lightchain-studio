@@ -8,8 +8,8 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
-    timeout-minutes: 90
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -17,29 +17,28 @@ jobs:
         with:
           node-version-file: .nvmrc
 
+      - name: Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxkbfile-dev libsecret-1-dev libkrb5-dev
+
       - name: Install
         run: npm ci
 
-      - name: Lightchain extension (typecheck + bundle)
+      - name: Lightchain extension (typecheck, test, bundle)
         working-directory: extensions/lightchain-studio/tools
         run: |
-          npm install --no-audit --no-fund
+          npm ci --no-audit --no-fund
           npm run typecheck
           npm test
           npm run build
 
+      - name: Bundle is up to date
+        run: |
+          if ! git diff --quiet --ignore-cr-at-eol -- extensions/lightchain-studio/dist/extension.js; then
+            echo "::error::extensions/lightchain-studio/dist/extension.js is out of date. Run 'npm run build' in extensions/lightchain-studio/tools and commit the result."
+            exit 1
+          fi
+
       - name: Compile
         run: npm run compile
-
-      - name: Package (macOS arm64)
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          ./scripts/package-mac.sh arm64
-          mv ../LightchainStudio-*.dmg .
-
-      - name: Upload DMG
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
-        with:
-          name: LightchainStudio-macos-arm64
-          path: LightchainStudio-*.dmg
