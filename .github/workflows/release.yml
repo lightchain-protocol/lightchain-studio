@@ -155,9 +155,18 @@ jobs:
         with:
           path: packages
           merge-multiple: true
-      - name: Checksums
+      - name: Checksums (merged with packages already on the release)
         working-directory: packages
-        run: sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event_name == 'push' && github.ref_name || format('v{0}', needs.version.outputs.version) }}
+        run: |
+          sha256sum * > new.sums
+          # Keep checksums of assets published by earlier runs for this tag, unless we rebuilt them now.
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.assets[] | select(.name != "SHA256SUMS.txt") | "\(.digest // "")  \(.name)"' 2>/dev/null             | sed 's/^sha256://' | grep -v '^ ' > old.sums || true
+          { cat new.sums; grep -v -F -f <(cut -c67- new.sums) old.sums || true; } | sort -k2 > SHA256SUMS.txt
+          rm -f new.sums old.sums
+          cat SHA256SUMS.txt
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
